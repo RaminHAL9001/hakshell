@@ -19,7 +19,7 @@ import           Data.Dynamic
 import qualified Data.Map               as Map
 import qualified Data.IntMap            as IMap
 import           Data.String
-import qualified Data.Text              as Strict
+import qualified Data.ByteString.Char8  as Strict
 --import qualified Data.Text.Lazy         as Lazy
 --import           Data.Typeable
 
@@ -36,7 +36,7 @@ import qualified Foreign.C.Error        as Sys
 data HakshellState
   = HakshellState
     { isInitialized        :: Bool
-    , theChildProcessTable :: Map.Map Strict.Text (IMap.IntMap ProcessHandle)
+    , theChildProcessTable :: Map.Map Strict.ByteString (IMap.IntMap ProcessHandle)
       -- ^ Necessary to keep track of which child proccesses are running, especially to control
       -- their input/output and to manage OS events that occur when the child process changes
       -- status, for example when a child process halts itself, or when a child process is waiting
@@ -89,8 +89,8 @@ data FSPath
 
 data DirectoryPath
   = EmptyPath
-  | DirectoryPath{ targetDirectoryName :: Strict.Text, targetNextChild  :: DirectoryPath }
-  | FilePath     { targetFileName      :: Strict.Text, targetFileObject :: FileObject }
+  | DirectoryPath{ targetDirectoryName :: Strict.ByteString, targetNextChild  :: DirectoryPath }
+  | FilePath     { targetFileName      :: Strict.ByteString, targetFileObject :: FileObject }
   deriving (Eq, Typeable)
 
 data FileObject
@@ -119,7 +119,7 @@ directoryPath end path' =
 
 ----------------------------------------------------------------------------------------------------
 
-newtype FSPathString = FSPathString { fsPathStringText :: Strict.Text }
+newtype FSPathString = FSPathString { fsPathStringText :: Strict.ByteString }
   deriving (Eq, Ord)
 instance IsString FSPathString where { fromString = FSPathString . Strict.pack; }
 instance Show FSPathString where { show = show . fsPathStringText; }

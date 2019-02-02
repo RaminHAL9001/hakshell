@@ -31,7 +31,7 @@ import           Data.Char
 import           Data.List                   (partition)
 import qualified Data.Map                    as Map
 import           Data.Semigroup
-import qualified Data.Text                   as Strict
+import qualified Data.ByteString.Char8       as Strict
 import           Data.Typeable
 import qualified Data.Vector                 as Vec
 import qualified Data.Vector.Unboxed         as UVec
@@ -43,7 +43,7 @@ import           Data.Word
 
 -- | An atom is essentially a string that does not need to be quoted in the context of a Lisp
 -- expression.
-newtype Atom = Atom{ atomToText :: Strict.Text }
+newtype Atom = Atom{ atomToText :: Strict.ByteString }
   deriving (Eq, Ord)
 
 instance Show Atom where { show (Atom a) = Strict.unpack a; }
@@ -98,8 +98,8 @@ _charTable = UVec.create
 -- structure behaves as the sequence of square-bracketed indicies.
 data StructIndex
   = StructLeaf
-  | StructIndexList Int         StructIndex
-  | StructIndexDict Strict.Text StructIndex
+  | StructIndexList Int               StructIndex
+  | StructIndexDict Strict.ByteString StructIndex
   deriving (Eq, Typeable)
 
 -- | A simple data type for structured data, which can be both parsed and printed to/from JSON,
@@ -108,11 +108,11 @@ data Struct
   = ObjInt    !Int
   | ObjChar   !Char
   | ObjFloat  !Double
-  | ObjString !Strict.Text
-  | ObjAtom   !Strict.Text
+  | ObjString !Strict.ByteString
+  | ObjAtom   !Strict.ByteString
     -- ^ same as 'ObjString' but is known to contain no whitespace in the string
   | ObjList   !(Vec.Vector Struct)
-  | ObjDict   !(Map.Map Strict.Text Struct)
+  | ObjDict   !(Map.Map Strict.ByteString Struct)
   deriving (Eq, Ord)
 
 -- | The class of data types that can be converted to and from a 'Struct'.
@@ -138,7 +138,7 @@ instance Structured String where
   toStruct    = ObjString . Strict.pack
   parseStruct = \ case { ObjString a -> return (Strict.unpack a); _ -> mzero; }
 
-instance Structured Strict.Text where
+instance Structured Strict.ByteString where
   toStruct    = ObjString
   parseStruct = \ case { ObjString a -> return a; _ -> mzero; }
 
@@ -148,7 +148,7 @@ instance Structured a => Structured (Vec.Vector a) where
     ObjList a -> objSizedVector (Vec.length a) <$> mapM parseStruct (Vec.toList a)
     _         -> mzero
 
-instance Structured a => Structured (Map.Map Strict.Text a) where
+instance Structured a => Structured (Map.Map Strict.ByteString a) where
   toStruct    = ObjDict . fmap toStruct
   parseStruct = \ case
     ObjDict a -> Map.fromList <$> forM (Map.assocs a) (\ (key, val) -> (,) key <$> parseStruct val)
@@ -176,13 +176,13 @@ instance Structured StructIndex where
 
 -- | A synonym for the 'ObjString' constructor, provided for consistent naming with the other
 -- function names starting with @obj...@.
-objString :: Strict.Text -> Struct
+objString :: Strict.ByteString -> Struct
 objString = ObjString
 
 -- | Takes as many alpha-numeric characters as it can to construct a string. Any character matching
 -- the 'isAlphaNum' predicate can be included. All characters beyond the first non-alpha-numeric are
 -- dropped.
-objAtom :: Strict.Text -> Struct
+objAtom :: Strict.ByteString -> Struct
 objAtom = ObjAtom . Strict.takeWhile isAtomChar
 
 -- | A synonym for the 'ObjList' constructor, provided for consisteng naming with the other
@@ -210,7 +210,7 @@ objSizedVector size elems = Vec.create list where
 -- list. If the list is empty, it is not included in the dictionary, if the dictionary contains only
 -- one element, the element is stored as the value alone, if the dictionary contains more than one
 -- element, the elements are stored into a list.
-objAccumDict :: Structured a => [(Strict.Text, [a])] -> Struct
+objAccumDict :: Structured a => [(Strict.ByteString, [a])] -> Struct
 objAccumDict = ObjDict . fmap (\ case { [a] -> a; lst -> objList lst; }) .
   Map.fromListWith (++) . fmap (fmap (fmap toStruct)) . filter (not . null . snd)
 
@@ -245,14 +245,14 @@ instance Semigroup a => Semigroup (ParseStruct a) where { a <> b = (<>) <$> a <*
 data StructParserError
   = StructParserBacktrack
   | StructParserError
-    { structParserErrorInfo :: !Strict.Text
+    { structParserErrorInfo :: !Strict.ByteString
     , structParserErrorPath :: !StructIndex
     }
 
-_key_backtracked :: Strict.Text
+_key_backtracked :: Strict.ByteString
 _key_backtracked = "backtracked"
 
-_key_error :: Strict.Text
+_key_error :: Strict.ByteString
 _key_error = "error"
 
 instance Structured StructParserError where
@@ -311,7 +311,7 @@ fromStruct = runParseStruct . parseStruct
 data FromLispExpression a
   = LispYieldedValue      a
   | LispAwaitingInput    (String -> [(FromLispExpression a, String)])
-  | LispExpressionSyntax !Strict.Text
+  | LispExpressionSyntax !Strict.ByteString
     -- ^ Thrown when the string is invalid Lisp syntax.
   | LispExpressionBad    !StructParserError
     -- ^ Thrown when the string is valid syntax but cannot be constructed by 'fromStruct'.
@@ -330,6 +330,22 @@ forceFromLispExpr = uncurry (++) . partition (lispYieldedValue . fst) >>> \ case
   where
     waiting rem = error $ "Waiting for more input ("++show (take 20 rem)++")"
 
+charTo3CharCode :: Vec.Vector Strict.ByteString
+charTo3CharCode = Vec.fromList $
+  [ "NUL", "SOH", "STX", "ETX", "EOT", "ENQ", "ACK", "a"
+  , "b"  , "t"  , "n"  , "v"  , "f"  , "r"  , "SO" , "SI"
+  , "DLE", "DC1", "DC2", "DC3", "DC4", "NAK", "SYN", "ETB"
+  , "CAN", "EM" , "SUB", "ESC", "FS" , "GS" , "RS" , "US"
+  , "space"
+  ]
+
+charFrom3CharCode :: Map.Map Strict.ByteString Char
+charFrom3CharCode =
+  Map.insert "space"    ' ' .
+  Map.insert "newline" '\n' .
+  Map.insert "tab"     '\t' $
+  Map.fromList (Vec.toList charTo3CharCode `zip` (chr <$> [0 ..]))
+
 -- | The class of data types that can be converted to and from a Lisp-like "S-Expression".
 class LispExpression a where
   toLispExpr   :: a -> String -> String
@@ -340,7 +356,7 @@ instance LispExpression Int         where
   fromLispExpr = error "TODO -- fromLispExpr :: String -> (Int)"
 
 instance LispExpression Char        where
-  toLispExpr   = shows
+  toLispExpr c = ("#\\" ++) . maybe (c :) ((++) . Strict.unpack) (charTo3CharCode Vec.!? ord c)
   fromLispExpr = error "TODO -- fromLispExpr :: Char -> (Char)"
 
 instance LispExpression Double      where
@@ -351,9 +367,9 @@ instance LispExpression String      where
   toLispExpr   = shows
   fromLispExpr = error "TODO -- fromLispExpr :: String -> (String)"
 
-instance LispExpression Strict.Text where
+instance LispExpression Strict.ByteString where
   toLispExpr   = shows
-  fromLispExpr = error "TODO -- fromLispExpr :: String -> (Strict.Text)"
+  fromLispExpr = error "TODO -- fromLispExpr :: String -> (Strict.ByteString)"
 
 instance LispExpression Atom        where
   toLispExpr   = shows
@@ -370,14 +386,14 @@ instance Structured a => LispExpression (Vec.Vector a) where
   toLispExpr   = Vec.toList >>> toLispExpr
   fromLispExpr = error "TODO -- fromLispExpr :: String -> (Struct)"
 
-instance Structured a => LispExpression (Map.Map Strict.Text a) where
+instance Structured a => LispExpression (Map.Map Strict.ByteString a) where
   toLispExpr   = let cons = (:) in Map.assocs . fmap toStruct >>> \ case
     []   -> ("{}" ++)
     a:ax -> 
       let pair (key, val) = cons colon . toLispExpr key . cons ' ' . toLispExpr val . loop ax
           loop = \ case{ [] -> cons '}'; a:ax -> pair a . loop ax; }
       in  cons '{' . pair a . cons ' ' . loop ax
-  fromLispExpr = error "TODO -- Structured a => fromLispExpr :: String -> (Map.Map Strict.Text a)"
+  fromLispExpr = error "TODO -- Structured a => fromLispExpr :: String -> (Map.Map Strict.ByteString a)"
 
 colon :: Char
 colon = ':'
