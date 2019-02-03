@@ -352,16 +352,25 @@ class LispExpression a where
   fromLispExpr :: Int -> String -> [(FromLispExpression a, String)]
 
 instance LispExpression Int         where
-  toLispExpr   = shows
-  fromLispExpr = error "TODO -- fromLispExpr :: String -> (Int)"
+  toLispExpr     = shows
+  fromLispExpr p = readsPrec p >=> \ (a, rem) -> [(LispYieldedValue a, rem)]
 
 instance LispExpression Char        where
   toLispExpr c = ("#\\" ++) . maybe (c :) ((++) . Strict.unpack) (charTo3CharCode Vec.!? ord c)
-  fromLispExpr = error "TODO -- fromLispExpr :: Char -> (Char)"
+  fromLispExpr _p = \ case
+    '#':'\\':str -> case span (not . isSpace) str of
+      (""  , _  )  -> []
+      (key', rem)  -> let key = Strict.pack key' in case Map.lookup key charFrom3CharCode of
+        Nothing      -> case key' of
+          [c]          -> [(LispYieldedValue c, rem)]
+          _            ->
+            [(LispExpressionSyntax $ Strict.pack $ "unknown character label: "++show key', rem)]
+        Just c       -> [(LispYieldedValue c, rem)]
+    _            -> []
 
 instance LispExpression Double      where
-  toLispExpr   = shows
-  fromLispExpr = error "TODO -- fromLispExpr :: String -> (Double)"
+  toLispExpr     = shows
+  fromLispExpr p = readsPrec p >=> \ (a, rem) -> [(LispYieldedValue a, rem)]
 
 instance LispExpression String      where
   toLispExpr   = shows
