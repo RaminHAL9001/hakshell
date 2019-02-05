@@ -4,7 +4,8 @@ module Hakshell.Struct
   ( -- * The Struct Data Type
     StructIndex(..), Struct(..),
     -- * The Class of 'Structured' Data Types
-    Structured(..), LispExpression(..), fromStruct, objString, objAtom,
+    Structured(..), LispExpression(..),
+    strToLispExpr, strFromLispExpr, fromStruct, objString, objAtom,
     objList, objSizedList, objAccumDict,
     -- * The 'Atom' data type
     Atom, toAtom, atomToText, isAtomChar,
@@ -32,6 +33,7 @@ import           Data.List                   (partition)
 import qualified Data.Map                    as Map
 import           Data.Semigroup
 import qualified Data.ByteString.Char8       as Strict
+import qualified Data.ByteString.UTF8        as UTF8
 import           Data.Typeable
 import qualified Data.Vector                 as Vec
 import qualified Data.Vector.Unboxed         as UVec
@@ -50,7 +52,7 @@ instance Show Atom where { show (Atom a) = Strict.unpack a; }
 instance Read Atom where
   readsPrec _ str = case span isAtomChar str of
     ("", _ ) -> []
-    (a, str) -> [(Atom $ Strict.pack a, str)]
+    (a, str) -> [(Atom $ UTF8.fromString a, str)]
 
 instance Semigroup Atom where { (Atom a) <> (Atom b) = Atom (a <> b); }
 
@@ -109,7 +111,7 @@ data Struct
   | ObjChar   !Char
   | ObjFloat  !Double
   | ObjString !Strict.ByteString
-  | ObjAtom   !Strict.ByteString
+  | ObjAtom   !Atom
     -- ^ same as 'ObjString' but is known to contain no whitespace in the string
   | ObjList   !(Vec.Vector Struct)
   | ObjDict   !(Map.Map Strict.ByteString Struct)
@@ -136,7 +138,7 @@ instance Structured Double where
 
 instance Structured String where
   toStruct    = ObjString . Strict.pack
-  parseStruct = \ case { ObjString a -> return (Strict.unpack a); _ -> mzero; }
+  parseStruct = \ case { ObjString a -> return (UTF8.toString a); _ -> mzero; }
 
 instance Structured Strict.ByteString where
   toStruct    = ObjString
@@ -183,7 +185,7 @@ objString = ObjString
 -- the 'isAlphaNum' predicate can be included. All characters beyond the first non-alpha-numeric are
 -- dropped.
 objAtom :: Strict.ByteString -> Struct
-objAtom = ObjAtom . Strict.takeWhile isAtomChar
+objAtom = ObjAtom . Atom . Strict.takeWhile isAtomChar
 
 -- | A synonym for the 'ObjList' constructor, provided for consisteng naming with the other
 -- function names starting with @obj...@.
@@ -286,7 +288,12 @@ structuredFromLisp p = fromLispExpr p >=> loop where
       Right  a -> [(LispYieldedValue  a  , rem)]
 
 instance Show StructParserError where { showsPrec _ = toLispExpr . toStruct; }
-instance Read StructParserError where { readsPrec _ = error "TODO"; }
+instance Read StructParserError where
+  readsPrec p = fromLispExpr p >=> \ (a, str) -> case a of
+    LispExpressionSyntax err -> fail (UTF8.toString err)
+    LispExpressionBad      _ -> fail "Failed to parse StructParseError"
+    LispAwaitingInput{}      -> fail "Parser for 'StructParseError' failed, input string incomplete"
+    LispYieldedValue       a -> [(a, str)]
 
 data StructParserState
   = StructParserState
@@ -315,6 +322,7 @@ data FromLispExpression a
     -- ^ Thrown when the string is invalid Lisp syntax.
   | LispExpressionBad    !StructParserError
     -- ^ Thrown when the string is valid syntax but cannot be constructed by 'fromStruct'.
+  deriving Functor
 
 lispYieldedValue :: FromLispExpression a -> Bool
 lispYieldedValue = \ case { LispYieldedValue{} -> True; _ -> False; }
@@ -346,66 +354,137 @@ charFrom3CharCode =
   Map.insert "tab"     '\t' $
   Map.fromList (Vec.toList charTo3CharCode `zip` (chr <$> [0 ..]))
 
+----------------------------------------------------------------------------------------------------
+
 -- | The class of data types that can be converted to and from a Lisp-like "S-Expression".
 class LispExpression a where
   toLispExpr   :: a -> String -> String
-  fromLispExpr :: Int -> String -> [(FromLispExpression a, String)]
+  fromLispExpr :: Int -> ReadS (FromLispExpression a)
+
+-- Instances for 'LispExpression' are constructed below from the following combinators.
+
+-- | Instantiate the 'fromLispExpr' function of the 'LispExpression' typeclass automatically using
+-- the instance for 'Prelude.readsPrec' in the 'Prelude.Read' typeclass.
+readsPrecLisp :: Read a => Int -> String -> [(FromLispExpression a, String)]
+readsPrecLisp p = readsPrec p >=> \ (a, rem) -> [(LispYieldedValue a, rem)]
+
+-- Since I'm not using a proper parser function, I'll need a map-like function for the 'ReadS' data
+-- type.
+rmap :: (a -> b) -> ReadS a -> ReadS b
+rmap f m str = (\ (a, rem) -> (f a, rem)) <$> m str
+
+rfmap :: Functor f => (a -> b) -> ReadS (f a) -> ReadS (f b)
+rfmap f = rmap (fmap f)
+
+-- | The 'Prelude.String' type cannot instantiate the 'LispExpression' type because it overlaps
+-- instances with the list type. You can use the 'LispExpression' instance for 'Strict.ByteString',
+-- or you can use this function to convert a string directly to a lisp expression.
+strToLispExpr :: String -> (String -> String)
+strToLispExpr = shows
+
+-- | The 'Prelude.String' type cannot instantiate the 'LispExpression' type because it overlaps
+-- instances with the list type. You can use the 'LispExpression' instance for 'Strict.ByteString',
+-- or you can use this function to convert a string directly to a lisp expression.
+strFromLispExpr :: Int -> ReadS (FromLispExpression String)
+strFromLispExpr p = readsPrecLisp p
+
+seqToLisp :: Char -> Char -> (b -> [a]) -> (a -> String -> String) -> b -> String -> String
+seqToLisp open close toList step = let cons = (:) in toList >>> \ case
+  []   -> cons open . cons close
+  a:ax -> let loop ax = case ax of { [] -> cons close; a:ax -> step a . loop ax; } in
+    cons open . step a . loop ax
+  
+seqFromLisp
+  :: Char -> Char
+  -> ([a] -> b)
+  -> (Int -> String -> [(FromLispExpression a, String)])
+  -> Int -> String -> [(FromLispExpression b, String)]
+seqFromLisp open close constr parse p = \ case { c:str | c == open -> loop id str; _ -> []; } where
+  next stk (elem, str) = case elem of
+    LispYieldedValue       a -> loop (stk . (a :)) str
+    LispExpressionSyntax err -> [(LispExpressionSyntax err, str)]
+    LispExpressionBad    err -> [(LispExpressionBad    err, str)]
+    LispAwaitingInput   cont -> [(LispAwaitingInput $ cont >=> next stk, str)]
+  loop stk = sp >>> \ case
+    c:str | c == close -> [(LispYieldedValue $ constr $ stk [], sp str)]
+    str -> parse p str >>= next stk
+
+colon :: Char
+colon = ':'
+
+sp :: String -> String
+sp = dropWhile isSpace
+
+-- Above were the 'LispExpression' combinators, now for the instances.
 
 instance LispExpression Int         where
-  toLispExpr     = shows
-  fromLispExpr p = readsPrec p >=> \ (a, rem) -> [(LispYieldedValue a, rem)]
+  toLispExpr   = shows
+  fromLispExpr = readsPrecLisp
 
 instance LispExpression Char        where
-  toLispExpr c = ("#\\" ++) . maybe (c :) ((++) . Strict.unpack) (charTo3CharCode Vec.!? ord c)
+  toLispExpr c = ("#\\" ++) . maybe (c :) ((++) . UTF8.toString) (charTo3CharCode Vec.!? ord c)
   fromLispExpr _p = \ case
     '#':'\\':str -> case span (not . isSpace) str of
       (""  , _  )  -> []
-      (key', rem)  -> let key = Strict.pack key' in case Map.lookup key charFrom3CharCode of
+      (key', rem)  -> let key = UTF8.fromString key' in case Map.lookup key charFrom3CharCode of
         Nothing      -> case key' of
           [c]          -> [(LispYieldedValue c, rem)]
           _            ->
-            [(LispExpressionSyntax $ Strict.pack $ "unknown character label: "++show key', rem)]
+            [(LispExpressionSyntax $ UTF8.fromString $ "unknown character label: "++show key', rem)]
         Just c       -> [(LispYieldedValue c, rem)]
     _            -> []
 
 instance LispExpression Double      where
-  toLispExpr     = shows
-  fromLispExpr p = readsPrec p >=> \ (a, rem) -> [(LispYieldedValue a, rem)]
-
-instance LispExpression String      where
   toLispExpr   = shows
-  fromLispExpr = error "TODO -- fromLispExpr :: String -> (String)"
+  fromLispExpr = readsPrecLisp
 
 instance LispExpression Strict.ByteString where
   toLispExpr   = shows
-  fromLispExpr = error "TODO -- fromLispExpr :: String -> (Strict.ByteString)"
+  fromLispExpr = rfmap UTF8.fromString .
+    (readsPrecLisp :: Int -> ReadS (FromLispExpression String))
 
 instance LispExpression Atom        where
-  toLispExpr   = shows
-  fromLispExpr = error "TODO -- fromLispExpr :: String -> (Atom)"
+  toLispExpr     = shows
+  fromLispExpr _ = pure . span (not . isSpace) >=> \ (a, rem) ->
+    [(LispYieldedValue $ Atom $ UTF8.fromString a, rem)]
 
 instance Structured a => LispExpression [a] where
-  toLispExpr   = fmap toStruct >>> \ case
-    []         -> ("()" ++)
-    a:ax       -> let cons = (:) in cons '(' . toLispExpr a .
-      let loop ax = case ax of { [] -> cons ')'; a:ax -> toLispExpr a . loop ax; } in loop ax
-  fromLispExpr = error "TODO -- fromLispExpr :: String -> (Struct)"
+  toLispExpr   = seqToLisp   '(' ')' id (toLispExpr . toStruct)
+  fromLispExpr = seqFromLisp '(' ')' id $ \ p str -> do
+    let next (a, rem) = case a of
+          LispYieldedValue       a -> case fromStruct a of
+                            Right  a -> [(LispYieldedValue      a, rem)]
+                            Left err -> [(LispExpressionBad   err, rem)]
+          LispExpressionBad    err -> [(LispExpressionBad    err, rem)]
+          LispExpressionSyntax err -> [(LispExpressionSyntax err, rem)]
+          LispAwaitingInput   cont -> [(LispAwaitingInput $ cont >=> next, rem)]
+    fromLispExpr p str >>= next
 
 instance Structured a => LispExpression (Vec.Vector a) where
-  toLispExpr   = Vec.toList >>> toLispExpr
-  fromLispExpr = error "TODO -- fromLispExpr :: String -> (Struct)"
+  toLispExpr   = toLispExpr . Vec.toList
+  fromLispExpr = rfmap Vec.fromList . fromLispExpr
 
 instance Structured a => LispExpression (Map.Map Strict.ByteString a) where
-  toLispExpr   = let cons = (:) in Map.assocs . fmap toStruct >>> \ case
-    []   -> ("{}" ++)
-    a:ax -> 
-      let pair (key, val) = cons colon . toLispExpr key . cons ' ' . toLispExpr val . loop ax
-          loop = \ case{ [] -> cons '}'; a:ax -> pair a . loop ax; }
-      in  cons '{' . pair a . cons ' ' . loop ax
-  fromLispExpr = error "TODO -- Structured a => fromLispExpr :: String -> (Map.Map Strict.ByteString a)"
-
-colon :: Char
-colon = ':'
+  toLispExpr   = seqToLisp   '{' '}' Map.assocs $ \ (key, a) ->
+    shows (UTF8.toString key) . (colon :) . toLispExpr (toStruct a)
+  fromLispExpr = seqFromLisp '{' '}' (Map.fromListWith (flip const)) $ \ p -> sp >>> \ case
+    c:str | c == colon -> do
+      (key, str) <-
+        rmap ObjAtom (readsPrec p) <> rmap (ObjString . UTF8.fromString) (readsPrec p) $ sp str
+      key <- case key of
+        ObjAtom (Atom key) -> [key]
+        ObjString     key  -> [key]
+        obj                -> error $ "internal: cannot be used as key: " ++
+          toLispExpr obj "\nbefore string: " ++ show (take 20 str)
+      let next (a, str) = case a of
+            LispYieldedValue       a -> case fromStruct a of
+                             Right   a -> [(LispYieldedValue (key, a), str)]
+                             Left  err -> [(LispExpressionBad err, str)]
+            LispAwaitingInput   cont -> [(LispAwaitingInput $ cont >=> next, str)]
+            LispExpressionBad    err -> [(LispExpressionBad    err, str)]
+            LispExpressionSyntax err -> [(LispExpressionSyntax err, str)]
+      fromLispExpr p str >>= next
+    _ -> []
 
 instance LispExpression Struct      where
   toLispExpr = \ case
@@ -416,4 +495,11 @@ instance LispExpression Struct      where
     ObjAtom   o -> toLispExpr o
     ObjList   o -> toLispExpr o
     ObjDict   o -> toLispExpr o
-  fromLispExpr = error "TODO -- fromLispExpr :: String -> (Struct)"
+  fromLispExpr =
+         rfmap ObjInt    . fromLispExpr
+      <> rfmap ObjChar   . fromLispExpr
+      <> rfmap ObjFloat  . fromLispExpr
+      <> rfmap ObjString . fromLispExpr
+      <> rfmap ObjAtom   . fromLispExpr
+      <> rfmap ObjList   . fromLispExpr
+      <> rfmap ObjDict   . fromLispExpr
