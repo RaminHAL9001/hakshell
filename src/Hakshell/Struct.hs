@@ -107,7 +107,9 @@ data StructIndex
 -- | A simple data type for structured data, which can be both parsed and printed to/from JSON,
 -- Lisp-like S-Expressions, or XML.
 data Struct
-  = ObjInt    !Int
+  = ObjFalse
+  | ObjTrue
+  | ObjInt    !Int
   | ObjChar   !Char
   | ObjFloat  !Double
   | ObjString !Strict.ByteString
@@ -123,6 +125,13 @@ class Structured a where
   parseStruct :: Struct -> ParseStruct a
 
 instance Structured Struct where { toStruct = id; parseStruct = return; }
+
+instance Structured Bool   where
+  toStruct true = if true then ObjTrue else ObjFalse
+  parseStruct = \ case
+    ObjFalse -> return False
+    ObjTrue  -> return True
+    _        -> mzero
 
 instance Structured Int where
   toStruct    = ObjInt
@@ -499,6 +508,8 @@ instance Structured a => LispPrim (Map.Map Strict.ByteString a) where
 
 instance LispPrim Struct      where
   toLispPrim = \ case
+    ObjFalse    -> toLispPrim False
+    ObjTrue     -> toLispPrim True
     ObjInt    o -> toLispPrim o
     ObjChar   o -> toLispPrim o
     ObjFloat  o -> toLispPrim o
@@ -506,8 +517,8 @@ instance LispPrim Struct      where
     ObjAtom   o -> toLispPrim o
     ObjList   o -> toLispPrim o
     ObjDict   o -> toLispPrim o
-  fromLispPrim =
-         rfmap ObjInt    . fromLispPrim
+  fromLispPrim = rfmap (\ true -> if true then ObjTrue else ObjFalse) . fromLispPrim
+      <> rfmap ObjInt    . fromLispPrim
       <> rfmap ObjChar   . fromLispPrim
       <> rfmap ObjFloat  . fromLispPrim
       <> rfmap ObjString . fromLispPrim
