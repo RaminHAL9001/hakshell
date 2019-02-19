@@ -1,5 +1,7 @@
--- | Hakshell tries to avoid passing all information around as flat strings. Instead a JSON-like
--- structured data type is used wherever possible.
+-- | Hakshell tries to avoid passing all information around as flat strings. Instead a structured
+-- data type 'Struct' is used wherever possible. 'Struct' approximates the Abstract Syntax Tree
+-- (AST) of a Lisp expression (specificially the Scheme dialect of Lisp), and in fact a 'Struct' can
+-- be converted to and parsed from Lisp-like code.
 module Hakshell.Struct
   ( -- * The Struct Data Type
     StructIndex(..), Struct(..),

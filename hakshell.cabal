@@ -60,6 +60,8 @@ Library {
 
   EXPOSED-MODULES:
     Hakshell
+    Hakshell.Struct
+    Hakshell.Text
 
   BUILD-DEPENDS:
     bytestring           >=0.10.0.0 && <0.11.0.0,
