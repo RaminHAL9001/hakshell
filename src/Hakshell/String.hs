@@ -1,5 +1,5 @@
 -- | Automatic text processing, scripting tools.
-module Hakshell.Text
+module Hakshell.String
   ( StrictBytes, LazyBytes, ToByteString(..),
     Packable(..), Unpackable(..), IntSized(..),
     SizePackable, -- <-NO (..), members are unsafe.
