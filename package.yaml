@@ -17,7 +17,7 @@
 
 name:        hakshell
 version:     0.1.0.0
-synopsis:    "Haskell Applets" provides an event handler and a canvas for building simple GUI apps.
+synopsis:    Import Hakshell in GHCI to more easily launch processes, manipulate the filesystem.
 license:     AGPL
 copyright:   "2019 Ramin Honary, all rights reserved"
 author:      "Ramin Honary"
