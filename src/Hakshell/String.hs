@@ -49,6 +49,12 @@ instance Unpackable LazyBytes   where { unpack = Lazy.unpack; }
 ----------------------------------------------------------------------------------------------------
 
 -- | Immutable objects that have an integer size or length that can be determined in O(1) time.
+--
+-- Note that 'StrictBytes' (strict 'Data.ByteString.ByteString') instantiates this 'IntSized' class
+-- using the byte string length, and not the number of encoded UTF8 characters in the string, so
+-- using 'intSize' to find the number of characters in an 'ExactString' may give results you are not
+-- expecting. Use 'unpack' and then 'length' to get the number of characters, which is an O(n)
+-- operation since the string needs to be decoded from UTF8 when this happens.
 class IntSized obj where { intSize :: obj -> Int }
 instance IntSized StrictBytes where { intSize = Strict.length; }
 
@@ -145,7 +151,15 @@ splitBy = error "TODO"
 
 ----------------------------------------------------------------------------------------------------
 
--- | A string that instantiates the 'StringPattern' class. Use the 'str' constructor.
+-- | A string that instantiates the 'StringPattern' class. Use the 'str' constructor to create an
+-- 'ExactString' value.
+--
+-- Note that this data type instantiates 'IntSized' using the byte string length, and not the number
+-- of encoded UTF8 characters in the string, meaning characters that require more than one byte to
+-- be encoded in UTF8 will count as two elements. The bottom line is that using 'intSize' to find
+-- the number of characters in an 'ExactString' may give results you are not expecting. Use 'unpack'
+-- and then 'length' to get the number of characters, which is an O(n) operation since the string
+-- needs to be decoded from UTF8 when this happens.
 newtype ExactString = ExactString Strict.ByteString
   deriving (Eq, Ord, Typeable)
 
@@ -170,6 +184,7 @@ instance Monoid       ExactString where
   mconcat = ExactString . mconcat . fmap (\ (ExactString a) -> a)
 
 instance StringPattern ExactString where
+  smallestMatch = intSize
   matchHead capt (ExactString pat) str =
     if Strict.isPrefixOf pat str then case capt of
         NoMatch           -> PatternNoMatch
@@ -179,3 +194,4 @@ instance StringPattern ExactString where
       else case capt of
         NoMatch           -> PatternMatch mempty
         _                 -> PatternNoMatch
+  findSubstring capt (ExactString pat) str = error "TODO"
