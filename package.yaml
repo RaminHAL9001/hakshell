@@ -1,0 +1,74 @@
+# "hakshell.cabal" build configuration for this project.
+#
+# Copyright (C) 2019  Ramin Honary.
+#
+# "hakshell" is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License (AGPL)
+# as published by the Free Software Foundation.
+#
+# "hakshell" is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+# See the GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program (see the file called "LICENSE"). If not, see
+# <http://www.gnu.org/licenses/agpl.html>.
+
+name:        hakshell
+version:     0.1.0.0
+synopsis:    "Haskell Applets" provides an event handler and a canvas for building simple GUI apps.
+license:     AGPL
+copyright:   "2019 Ramin Honary, all rights reserved"
+author:      "Ramin Honary"
+maintainer:  "ramin.honary@gmail.com"
+github:      "RaminHAL9001/happlets"
+category:    Shell
+
+extra-source-files:
+- README.md
+
+dependencies:
+- bytestring
+- containers
+- directory
+- filepath
+- lens
+- linear
+- mtl
+- process
+- semigroups
+- time
+- transformers
+- unix
+- utf8-string
+- vector
+- base
+
+default-extensions:
+- DeriveDataTypeable
+- DeriveFunctor
+- ExistentialQuantification
+- FlexibleContexts
+- FlexibleInstances
+- FunctionalDependencies
+- GeneralizedNewtypeDeriving
+- ImplicitParams
+- LambdaCase
+- MultiParamTypeClasses
+- OverloadedStrings
+- RankNTypes
+- ScopedTypeVariables
+- StandaloneDeriving
+
+ghc-options:
+-   -Wall
+-   -fno-warn-name-shadowing
+-   -fno-warn-unused-do-bind
+
+library:
+  source-dirs: src
+  exposed-modules:
+  - Hakshell
+  - Hakshell.Struct
+  - Hakshell.Text
