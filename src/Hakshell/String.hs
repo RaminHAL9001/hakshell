@@ -1,6 +1,7 @@
 -- | Automatic text processing, scripting tools.
 module Hakshell.String
-  ( StrictBytes, LazyBytes, ToByteString(..),
+  ( tempTest,
+    StrictBytes, LazyBytes, ToByteString(..),
     Packable(..), Unpackable(..), IntSized(..),
     SizePackable, -- <-NO (..), members are unsafe.
     -- * Pattern Matching
@@ -12,8 +13,6 @@ module Hakshell.String
   ) where
 
 import           Hakshell.Struct
-
-import           Control.Lens
 
 import           Data.String
 import qualified Data.ByteString.Char8          as Strict
@@ -79,19 +78,29 @@ instance SizePackable StrictBytes where
 class StringPattern pat where
   -- | Match the beginning of a target string.
   matchHead     :: Capture -> pat -> StrictBytes -> PatternMatch
-  -- | Match somewhere in the middle of a target string.
-  findSubstring :: Capture -> pat -> StrictBytes -> PatternMatch
+  -- | Match once somewhere in the middle of a target string, searching from beginning.
+  findSubstringFrom :: Capture -> pat -> Offset -> StrictBytes -> PatternMatch
   -- | Returns the smallest possible string that can be matched by the @pat@ pattern.
   smallestMatch :: pat -> Int
 
 type Label  = StrictBytes
 type Offset = Int
 
+-- | This is a way of commanding the 'findSubstringFrom' function
 data Capture
-  = NoMatch            -- ^ if 'StringPattern' matches, evaluate to 'PatternNoMatch'
-  | Match              -- ^ if 'StringPattern' matches, evaluate to 'PatternMatch'
-  | Capture            -- ^ if 'StringPattern' matches, evaluate to 'PatternMatch' with 'Captured'
-  | CaptureName !Label -- ^ like 'Capture' but evaluate to 'PatternMatch' with 'CapturedName'
+  = NoMatch
+    -- ^ if 'StringPattern' matches, evaluate to 'PatternNoMatch'
+  | CaptureNoMatch
+    -- ^ Return a capture group containing the whole string if the given pattern does not match.
+  | CaptureNamedNoMatch !Label
+    -- ^ Return a named capture group containing the whole string if the given pattern does not
+    -- match.
+  | Match
+    -- ^ if 'StringPattern' matches, evaluate to 'PatternMatch'
+  | Capture
+    -- ^ if 'StringPattern' matches, evaluate to 'PatternMatch' with 'Captured'
+  | CaptureNamed !Label
+    -- ^ like 'Capture' but evaluate to 'PatternMatch' with 'CapturedName'
   deriving (Eq, Ord, Typeable)
 
 -- | A value determining whether a 'StringPattern' has matched a string input. This value
@@ -137,7 +146,7 @@ matchVector = \ case
 -- | An index into a 'StrictBytes' string. This data type is usually the result of a pattern match.
 data StringSlice
   = StringSlice
-    { sliceStart  :: !Int
+    { sliceStart  :: !Offset
       -- ^ The starting index of the slice.
     , sliceSize   :: !Int
       -- ^ The number of bytes after the 'sliceStart' index.
@@ -187,11 +196,73 @@ instance StringPattern ExactString where
   smallestMatch = intSize
   matchHead capt (ExactString pat) str =
     if Strict.isPrefixOf pat str then case capt of
-        NoMatch           -> PatternNoMatch
-        Match             -> PatternMatch mempty
-        Capture           -> PatternMatch $ Vec.singleton $ Captured 0 pat
-        CaptureName label -> PatternMatch $ Vec.singleton $ NamedCaptured label 0 pat
+        NoMatch            -> PatternNoMatch
+        Match              -> PatternMatch mempty
+        Capture            -> PatternMatch $ Vec.singleton $ Captured 0 pat
+        CaptureNamed label -> PatternMatch $ Vec.singleton $ NamedCaptured label 0 pat
       else case capt of
-        NoMatch           -> PatternMatch mempty
+        NoMatch            -> PatternMatch mempty
+        _                  -> PatternNoMatch
+  findSubstringFrom = findExactSubstringFrom
+
+findExactSubstringFrom :: Capture -> ExactString -> Offset -> StrictBytes -> PatternMatch
+findExactSubstringFrom capt (ExactString pat) offset str =
+  if offset < 0 then noMatch else loop offset where
+    strlen           = Strict.length str
+    patlen           = Strict.length pat
+    strmatch  constr = PatternMatch $ Vec.singleton $ constr offset str
+    patscan mark c i = if i <= 0 then mark else
+      if Strict.index pat i == c then mark - i else patscan mark c $! i - 1
+    scan  i0 offset0 = seq offset $! if i0 == 0 then Right () else
+      let { i = i0 - 1; offset = offset0 - 1; c = Strict.index str offset; } in
+      if Strict.index pat i == c then scan i offset else Left $ patscan i c $! i - 1
+    noMatch          = case capt of
+      NoMatch                  -> PatternMatch mempty
+      CaptureNoMatch           -> strmatch Captured
+      CaptureNamedNoMatch name -> strmatch (NamedCaptured name)
+      _                        -> PatternNoMatch
+    loop      offset = if offset > strlen then noMatch else case scan patlen offset of
+      Left  i  -> loop $! offset + i
+      Right () -> case capt of
+        Match             -> PatternMatch mempty
+        Capture           -> strmatch Captured
+        CaptureNamed name -> strmatch (NamedCaptured name)
         _                 -> PatternNoMatch
-  findSubstring capt (ExactString pat) str = error "TODO"
+
+-- | Temporary test.
+tempTest :: IO ()
+tempTest = mapM_ match tests where
+  showCapture = \ case
+    Captured{ capturedOffset=off } -> show off
+    NamedCaptured{ capturedLabel=lbl, capturedOffset=off } -> unpack lbl++"="++show off
+  match (haystack, needle, expected) = do
+    let end result msg = (if result expected then putStrLn else error) $ msg
+    putStr $ "in "++show haystack++" find "++show needle++" -> "
+    case findExactSubstringFrom Capture (ExactString needle) 0 haystack of
+      PatternNoMatch   -> end not "NOT FOUND"
+      PatternMatch vec -> end id $ "FOUND " ++ unwords (showCapture <$> Vec.toList vec)
+  tests =
+    [ ("", "", True)
+    , ("a", "a", True)
+    , ("a", "b", False)
+    , ("a", "", False)
+    , ("ab", "a", True)
+    , ("ab", "b", True)
+    , ("ab", "c", False)
+    , ("ab", "", True)
+    , ("abc", "a", True)
+    , ("abc", "b", True)
+    , ("abc", "c", True)
+    , ("abc", "ab", True)
+    , ("abc", "bc", True)
+    , ("abc", "abc", True)
+    , ("abc", "xbc", False)
+    , ("abc", "abx", False)
+    , ("abc", "ax", False)
+    , ("abc", "xb", False)
+    , ("abc", "xc", False)
+    , ("abc", "x", False)
+    , ("aaaabaaa", "abaaa", True)
+    , ("abcdefghijklmno", "hijkl", True)
+    , ("abcdeabcdeabcdef", "abcdef", True)
+    ]
