@@ -7,7 +7,7 @@ module Hakshell.String
     -- * Pattern Matching
     StringPattern(..),
     Label, Offset, Capture(..), PatternMatch(..), Captured(..), matchVector,
-    StringSlice, sliceStart, sliceSize, sliceString, splitBy,
+    StringSlice, sliceOffset, sliceLength, sliceString, splitBy,
     -- * Patterns
     ExactString(..), exact, 
   ) where
@@ -85,6 +85,11 @@ class StringPattern pat where
   -- | Returns the smallest possible string that can be matched by the @pat@ pattern.
   smallestMatch :: pat -> Int
 
+splitBy :: StringPattern pat => StrictBytes -> pat -> IMap.IntMap StringSlice
+splitBy = error "TODO"
+
+----------------------------------------------------------------------------------------------------
+
 type Label  = StrictBytes
 type Offset = Int
 
@@ -114,18 +119,26 @@ data PatternMatch
   deriving (Eq, Ord, Show)
 
 data Captured
-  = Captured
-    { capturedOffset :: !Offset
-    , capturedString :: !StrictBytes
-    }
-  | NamedCaptured
-    { capturedLabel  :: !Label
-    , capturedOffset :: !Offset
-    , capturedString :: !StrictBytes
-    }
+  = Captured{ capturedSlice :: !StringSlice}
+  | NamedCaptured{ capturedLabel :: !Label , capturedSlice :: !StringSlice}
   deriving (Eq, Ord, Show)
 
-instance ToByteString Captured where { toByteString = capturedString; }
+-- | An index into a 'StrictBytes' string. This data type is usually the result of a pattern match.
+data StringSlice
+  = StringSlice
+    { sliceOffset :: !Offset
+      -- ^ The starting index of the slice.
+    , sliceLength :: !Int
+      -- ^ The number of bytes after the 'sliceStart' index.
+    , sliceString :: !StrictBytes
+      -- ^ The string into which the 'sliceStart' and 'sliceEnd' are pointing.
+    }
+  deriving (Eq, Ord, Show, Typeable)
+
+instance ToByteString StringSlice where
+  toByteString s = Strict.take (sliceLength s) $ Strict.drop (sliceOffset s) $ sliceString s
+
+instance ToByteString Captured where { toByteString = toByteString . capturedSlice; }
 
 instance Semigroup PatternMatch where
   a <> b = case (a, b) of
@@ -142,23 +155,6 @@ matchVector :: PatternMatch -> Vec.Vector Captured
 matchVector = \ case
   PatternMatch vec -> vec
   PatternNoMatch   -> Vec.empty
-
-----------------------------------------------------------------------------------------------------
-
--- | An index into a 'StrictBytes' string. This data type is usually the result of a pattern match.
-data StringSlice
-  = StringSlice
-    { sliceStart  :: !Offset
-      -- ^ The starting index of the slice.
-    , sliceSize   :: !Int
-      -- ^ The number of bytes after the 'sliceStart' index.
-    , sliceString :: !StrictBytes
-      -- ^ The string into which the 'sliceStart' and 'sliceEnd' are pointing.
-    }
-  deriving (Eq, Ord, Typeable)
-
-splitBy :: StringPattern pat => StrictBytes -> pat -> IMap.IntMap StringSlice
-splitBy = error "TODO"
 
 ----------------------------------------------------------------------------------------------------
 
@@ -197,14 +193,17 @@ instance Monoid       ExactString where
 instance StringPattern ExactString where
   smallestMatch = intSize
   matchHead capt (ExactString pat) str =
-    if Strict.isPrefixOf pat str then case capt of
-        NoMatch            -> PatternNoMatch
-        Match              -> PatternMatch mempty
-        Capture            -> PatternMatch $ Vec.singleton $ Captured 0 pat
-        CaptureNamed label -> PatternMatch $ Vec.singleton $ NamedCaptured label 0 pat
-      else case capt of
-        NoMatch            -> PatternMatch mempty
-        _                  -> PatternNoMatch
+    if Strict.isPrefixOf pat str then
+      let match constr =
+            PatternMatch $ Vec.singleton $ constr $ StringSlice 0 (Strict.length pat) str
+      in  case capt of
+            NoMatch            -> PatternNoMatch
+            Match              -> PatternMatch mempty
+            Capture            -> match Captured
+            CaptureNamed label -> match $ NamedCaptured label
+    else  case capt of
+            NoMatch            -> PatternMatch mempty
+            _                  -> PatternNoMatch
   findSubstringFrom = findExactSubstringFrom
 
 enableTrace :: Bool
@@ -232,8 +231,11 @@ cmp (cmpstr, cmp) lblA a lblB b = " (" ++
 -- pattern. Rather than using a table, a search for the offset of the bad character is performed in
 -- the pattern between the start of the good suffix and the start of the pattern string every time a
 -- bad character is encountered. Given that the patterns that are typically used in shell scripts
--- are usually rather small, (often less than 16 bytes in length), this implementation is fast
--- enough for the purposes of this library without using a shift lookup table.
+-- are usually rather small (often less than 16 bytes in length), and that the haystacks that are
+-- searched are also small (typically in the vicinity of 128 bytes, less than the size of the lookup
+-- table) this implementation is fast enough for the purposes of this library without using a shift
+-- lookup table, and may even be faster than a similar implementation that did use a shift lookup
+-- table.
 findExactSubstringFrom :: Capture -> ExactString -> Offset -> StrictBytes -> PatternMatch
 findExactSubstringFrom capt (ExactString pat) offset str =
   if offset < 0 then noMatch else loop offset where
@@ -241,7 +243,8 @@ findExactSubstringFrom capt (ExactString pat) offset str =
     index  = Strict.index
     strlen = Strict.length str
     patlen = Strict.length pat
-    strmatch constr offset = PatternMatch $ Vec.singleton $ constr offset pat
+    strmatch constr offset = PatternMatch $ Vec.singleton $ constr
+      StringSlice{ sliceOffset = offset, sliceLength = patlen, sliceString = str }
     shift mark cS p0 =
       tr ("shift:" ++ val "mark" mark ++ val "cS" cS ++ val "p0" p0 ++ cmp le "p0" p0 "z" 0) $
       if p0 <= 0 then patlen else
@@ -275,20 +278,17 @@ findExactSubstringFrom capt (ExactString pat) offset str =
 -- | Temporary test.
 tempTest :: IO ()
 tempTest = mapM_ check tests where
-  showCapture = \ case
-    Captured{ capturedOffset=off } -> show off
-    NamedCaptured{ capturedLabel=lbl, capturedOffset=off } -> unpack lbl++"="++show off
-  check :: (StrictBytes, StrictBytes, StrictBytes -> PatternMatch) -> IO ()
+  check :: (StrictBytes, StrictBytes, StrictBytes -> StrictBytes -> PatternMatch) -> IO ()
   check (haystack, needle, expecting) = do
     let result = findExactSubstringFrom Capture (ExactString needle) 0 haystack
-    let expected = expecting needle
+    let expected = expecting haystack needle
     let pass = result == expected
     (if pass then putStrLn else error) $
       "in "++show haystack++" find "++show needle++" -> "++
       if pass then "OK" else
       "FAIL\nexpected = "++show expected++"\n  result = "++show result
-  noMatch = const PatternNoMatch
-  match i = PatternMatch . Vec.singleton . Captured i
+  noMatch _str _pat = PatternNoMatch
+  match i str pat = PatternMatch $ Vec.singleton $ Captured (StringSlice i (Strict.length pat) str)
   tests =
     [ ("", "", match 0)
     , ("a", "a", match 0)
