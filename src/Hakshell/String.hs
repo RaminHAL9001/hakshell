@@ -27,6 +27,8 @@ import           Data.Semigroup
 import           Data.Typeable
 import qualified Data.Vector                    as Vec
 
+import Debug.Trace
+
 ----------------------------------------------------------------------------------------------------
 
 type StrictBytes = Strict.ByteString
@@ -109,7 +111,7 @@ data Capture
 data PatternMatch
   = PatternNoMatch
   | PatternMatch (Vec.Vector Captured)
-  deriving (Eq, Ord)
+  deriving (Eq, Ord, Show)
 
 data Captured
   = Captured
@@ -121,7 +123,7 @@ data Captured
     , capturedOffset :: !Offset
     , capturedString :: !StrictBytes
     }
-  deriving (Eq, Ord)
+  deriving (Eq, Ord, Show)
 
 instance ToByteString Captured where { toByteString = capturedString; }
 
@@ -205,64 +207,112 @@ instance StringPattern ExactString where
         _                  -> PatternNoMatch
   findSubstringFrom = findExactSubstringFrom
 
+enableTrace :: Bool
+enableTrace = False
+
+eq, gt, le :: (Eq a, Ord a) => (String, a -> a -> Bool)
+eq = ("==", (==))
+gt = (">", (>))
+le = ("<=", (<=))
+
+tr :: String -> more -> more
+tr msg = if enableTrace then trace msg else id
+
+val :: Show a => String -> a -> String
+val lbl val = " (" ++ lbl ++ '=' : show val ++ ")"
+
+cmp
+  :: (Eq a, Eq b, Show a, Show b)
+  => (String, a -> b -> Bool) -> String -> a -> String -> b -> String
+cmp (cmpstr, cmp) lblA a lblB b = " (" ++
+  lblA ++ '=' : show a ++ ' ' : cmpstr ++ ' ' : lblB ++ '=' : show b ++
+  " -> " ++ (if cmp a b then "yes" else "no") ++ ")"
+
+-- An implementation of the Boyer-Moore algorithm that does not produce a shift lookup table for the
+-- pattern. Rather than using a table, a search for the offset of the bad character is performed in
+-- the pattern between the start of the good suffix and the start of the pattern string every time a
+-- bad character is encountered. Given that the patterns that are typically used in shell scripts
+-- are usually rather small, (often less than 16 bytes in length), this implementation is fast
+-- enough for the purposes of this library without using a shift lookup table.
 findExactSubstringFrom :: Capture -> ExactString -> Offset -> StrictBytes -> PatternMatch
 findExactSubstringFrom capt (ExactString pat) offset str =
   if offset < 0 then noMatch else loop offset where
-    strlen           = Strict.length str
-    patlen           = Strict.length pat
-    strmatch  constr = PatternMatch $ Vec.singleton $ constr offset str
-    patscan mark c i = if i <= 0 then mark else
-      if Strict.index pat i == c then mark - i else patscan mark c $! i - 1
-    scan  i0 offset0 = seq offset $! if i0 == 0 then Right () else
-      let { i = i0 - 1; offset = offset0 - 1; c = Strict.index str offset; } in
-      if Strict.index pat i == c then scan i offset else Left $ patscan i c $! i - 1
+    --index  = Strict.unsafeIndex else Strict.index
+    index  = Strict.index
+    strlen = Strict.length str
+    patlen = Strict.length pat
+    strmatch constr offset = PatternMatch $ Vec.singleton $ constr offset pat
+    shift mark cS p0 =
+      tr ("shift:" ++ val "mark" mark ++ val "cS" cS ++ val "p0" p0 ++ cmp le "p0" p0 "z" 0) $
+      if p0 <= 0 then patlen else
+      let { p = p0 - 1; cP = index pat p; } in
+      tr ("shift:" ++ cmp eq ("pat["++show p++"]") cP "cP" cP) $
+      if cP == cS then tr (val "<- (mark - p)" (mark - p)) $ mark - p else
+      if p <= 0 then tr (val "p" p ++ "<= 0 -> yes <- mark="++show mark) mark else
+      shift mark cS p
+    suffix offset p0 s0 =
+      tr ("suffix:" ++ val "offset" offset ++ val "p0" p0 ++ val "s0" s0 ++ cmp le "p0" p0 "z" 0) $
+      if p0 <= 0 then Right () else
+      let { s = s0 - 1; p = p0 - 1; cS = index str s; cP = index pat p } in
+      tr ("suffix:" ++ cmp eq ("str["++show s++"]") cS ("pat["++show p++"]") cP) $
+      if cP == cS then suffix offset p s else Left $ shift p cS p
     noMatch          = case capt of
       NoMatch                  -> PatternMatch mempty
-      CaptureNoMatch           -> strmatch Captured
-      CaptureNamedNoMatch name -> strmatch (NamedCaptured name)
+      CaptureNoMatch           -> strmatch Captured offset
+      CaptureNamedNoMatch name -> strmatch (NamedCaptured name) offset
       _                        -> PatternNoMatch
-    loop      offset = if offset > strlen then noMatch else case scan patlen offset of
-      Left  i  -> loop $! offset + i
-      Right () -> case capt of
-        Match             -> PatternMatch mempty
-        Capture           -> strmatch Captured
-        CaptureNamed name -> strmatch (NamedCaptured name)
-        _                 -> PatternNoMatch
+    loop      offset =
+      let strtop = offset + patlen in
+      tr ("loop" ++ val "offset" offset ++ cmp gt "strtop" strtop "strlen" strlen) $
+      if strtop > strlen then noMatch else case suffix offset patlen strtop of
+        Left  i  -> tr ("loop <- Left "++show i) $ loop $ offset + i
+        Right () -> case capt of
+          Match             -> PatternMatch mempty
+          Capture           -> strmatch Captured offset
+          CaptureNamed name -> strmatch (NamedCaptured name) offset
+          _                 -> PatternNoMatch
 
 -- | Temporary test.
 tempTest :: IO ()
-tempTest = mapM_ match tests where
+tempTest = mapM_ check tests where
   showCapture = \ case
     Captured{ capturedOffset=off } -> show off
     NamedCaptured{ capturedLabel=lbl, capturedOffset=off } -> unpack lbl++"="++show off
-  match (haystack, needle, expected) = do
-    let end result msg = (if result expected then putStrLn else error) $ msg
-    putStr $ "in "++show haystack++" find "++show needle++" -> "
-    case findExactSubstringFrom Capture (ExactString needle) 0 haystack of
-      PatternNoMatch   -> end not "NOT FOUND"
-      PatternMatch vec -> end id $ "FOUND " ++ unwords (showCapture <$> Vec.toList vec)
+  check :: (StrictBytes, StrictBytes, StrictBytes -> PatternMatch) -> IO ()
+  check (haystack, needle, expecting) = do
+    let result = findExactSubstringFrom Capture (ExactString needle) 0 haystack
+    let expected = expecting needle
+    let pass = result == expected
+    (if pass then putStrLn else error) $
+      "in "++show haystack++" find "++show needle++" -> "++
+      if pass then "OK" else
+      "FAIL\nexpected = "++show expected++"\n  result = "++show result
+  noMatch = const PatternNoMatch
+  match i = PatternMatch . Vec.singleton . Captured i
   tests =
-    [ ("", "", True)
-    , ("a", "a", True)
-    , ("a", "b", False)
-    , ("a", "", False)
-    , ("ab", "a", True)
-    , ("ab", "b", True)
-    , ("ab", "c", False)
-    , ("ab", "", True)
-    , ("abc", "a", True)
-    , ("abc", "b", True)
-    , ("abc", "c", True)
-    , ("abc", "ab", True)
-    , ("abc", "bc", True)
-    , ("abc", "abc", True)
-    , ("abc", "xbc", False)
-    , ("abc", "abx", False)
-    , ("abc", "ax", False)
-    , ("abc", "xb", False)
-    , ("abc", "xc", False)
-    , ("abc", "x", False)
-    , ("aaaabaaa", "abaaa", True)
-    , ("abcdefghijklmno", "hijkl", True)
-    , ("abcdeabcdeabcdef", "abcdef", True)
+    [ ("", "", match 0)
+    , ("a", "a", match 0)
+    , ("a", "b", noMatch)
+    , ("a", "", match 0)
+    , ("", "a", noMatch)
+    , ("ab", "a", match 0)
+    , ("ab", "b", match 1)
+    , ("ab", "c", noMatch)
+    , ("ab", "", match 0)
+    , ("abc", "a", match 0)
+    , ("abc", "b", match 1)
+    , ("abc", "c", match 2)
+    , ("abc", "ab", match 0)
+    , ("abc", "bc", match 1)
+    , ("abc", "abc", match 0)
+    , ("abc", "xbc", noMatch)
+    , ("abc", "abx", noMatch)
+    , ("abc", "ax", noMatch)
+    , ("abc", "xb", noMatch)
+    , ("abc", "xc", noMatch)
+    , ("abc", "x", noMatch)
+    , ("aaaabaaa", "abaaa", match 3)
+    , ("abcdefghijklmno", "hijkl", match 7)
+    , ("abcdeabcdeabcdef", "abcdef", match 10)
+    , ("bxxxxxxaaxxxxxxa", "axxxxxxa", match 8)
     ]
