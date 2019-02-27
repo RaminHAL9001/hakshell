@@ -105,9 +105,13 @@ data Capture
   | Match
     -- ^ if 'StringPattern' matches, evaluate to 'PatternMatch'
   | Capture
-    -- ^ if 'StringPattern' matches, evaluate to 'PatternMatch' with 'Captured'
+    -- ^ if 'StringPattern' matches, evaluate to 'PatternMatch' with 'Captured'. Be careful not to
+    -- confuse this constructor with the 'Captured' constructor (ends with a @d@). 'Capture' is a
+    -- present tense, 'Captured' is past tense, as in the 'Capture' function has already completed.
   | CaptureNamed !Label
-    -- ^ like 'Capture' but evaluate to 'PatternMatch' with 'CapturedName'
+    -- ^ like 'Capture' but evaluate to 'PatternMatch' with 'CapturedName'. Like 'Capture' and
+    -- 'Captured', be careful not to confuse this constructor with 'CapturedNamed'. Again, this
+    -- function is present tense, whereas 'CapturedNamed' is past tense.
   deriving (Eq, Ord, Typeable)
 
 -- | A value determining whether a 'StringPattern' has matched a string input. This value
@@ -120,7 +124,7 @@ data PatternMatch
 
 data Captured
   = Captured{ capturedSlice :: !StringSlice}
-  | NamedCaptured{ capturedLabel :: !Label , capturedSlice :: !StringSlice}
+  | CapturedNamed{ capturedLabel :: !Label , capturedSlice :: !StringSlice}
   deriving (Eq, Ord, Show)
 
 -- | An index into a 'StrictBytes' string. This data type is usually the result of a pattern match.
@@ -151,6 +155,7 @@ instance Monoid PatternMatch where
   mappend = (<>)
   mconcat = PatternMatch . mconcat . fmap matchVector
 
+-- | Convert a 'PatternMatch' to a vector of 'Captured' strings.
 matchVector :: PatternMatch -> Vec.Vector Captured
 matchVector = \ case
   PatternMatch vec -> vec
@@ -200,7 +205,7 @@ instance StringPattern ExactString where
             NoMatch            -> PatternNoMatch
             Match              -> PatternMatch mempty
             Capture            -> match Captured
-            CaptureNamed label -> match $ NamedCaptured label
+            CaptureNamed label -> match $ CapturedNamed label
     else  case capt of
             NoMatch            -> PatternMatch mempty
             _                  -> PatternNoMatch
@@ -262,7 +267,7 @@ findExactSubstringFrom capt (ExactString pat) offset str =
     noMatch          = case capt of
       NoMatch                  -> PatternMatch mempty
       CaptureNoMatch           -> strmatch Captured offset
-      CaptureNamedNoMatch name -> strmatch (NamedCaptured name) offset
+      CaptureNamedNoMatch name -> strmatch (CapturedNamed name) offset
       _                        -> PatternNoMatch
     loop      offset =
       let strtop = offset + patlen in
@@ -272,7 +277,7 @@ findExactSubstringFrom capt (ExactString pat) offset str =
         Right () -> case capt of
           Match             -> PatternMatch mempty
           Capture           -> strmatch Captured offset
-          CaptureNamed name -> strmatch (NamedCaptured name) offset
+          CaptureNamed name -> strmatch (CapturedNamed name) offset
           _                 -> PatternNoMatch
 
 -- | Temporary test.
