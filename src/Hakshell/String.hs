@@ -5,9 +5,9 @@ module Hakshell.String
     Packable(..), Unpackable(..), IntSized(..),
     SizePackable, -- <-NO (..), members are unsafe.
     -- * Pattern Matching
-    StringPattern(..),
+    StringPattern(..), findSubstring,
     Label, Offset, Capture(..), PatternMatch(..), Captured(..), matchVector,
-    StringSlice, sliceOffset, sliceLength, sliceString, splitBy,
+    StringSlice, sliceOffset, sliceLength, sliceString, splitByPatternFrom,
     -- * Patterns
     ExactString(..), exact, 
   ) where
@@ -31,7 +31,12 @@ import Debug.Trace
 
 ----------------------------------------------------------------------------------------------------
 
+-- | A strict 'Strict.ByteString' from the "Data.ByteString.Char8" module. UTF8 encoding is provided
+-- by the "Data.ByteString.UTF8" module.
 type StrictBytes = Strict.ByteString
+
+-- | A lazy 'Lazy.ByteString' from the "Data.ByteString.Lazy.Char8" module. UTF8 encoding is
+-- provided by the "Data.ByteString.Lazy.UTF8" module.
 type LazyBytes   = Lazy.ByteString
 
 class ToByteString str where { toByteString :: str -> StrictBytes; }
@@ -85,8 +90,17 @@ class StringPattern pat where
   -- | Returns the smallest possible string that can be matched by the @pat@ pattern.
   smallestMatch :: pat -> Int
 
-splitBy :: StringPattern pat => StrictBytes -> pat -> IMap.IntMap StringSlice
-splitBy = error "TODO"
+findSubstring :: StringPattern pat => Capture -> pat -> StrictBytes -> PatternMatch
+findSubstring cap pat = findSubstringFrom cap pat 0
+
+-- | Find all non-overlapping matching 'StringPattern's in a given 'StrictBytes' string. Returns an
+-- assoication list indexed by the 'sliceOffset' of the 'StringSlice' of each 'Captured' item.
+splitByPatternFrom
+  :: StringPattern pat
+  => StrictBytes -> pat -> Offset -> StrictBytes -> IMap.IntMap Captured
+splitByPatternFrom str pat = loop id where
+  loop stk offset str = case findSubstringFrom Capture pat offset str of
+    _ -> error "TODO: splitBy"
 
 ----------------------------------------------------------------------------------------------------
 
