@@ -48,9 +48,9 @@
 -- processors, and hence it is an integral part of the "Hakshell" library.
 module Hakshell.TextEditor
   ( -- * Text Editing API
-    MonadEditText(..),
---    insertCharBefore, insertCharAfter, deleteCharsBefore, deleteCharsAfter,
---    insertStringAfter, insertStringBefore, 
+    MonadEditText(..), MonadEditLine(..),
+    RelativeToCursor(..),
+    insertChar, deleteChars, insertString, 
     -- * Text Editor Function Types
     EditText, runEditText, emptyTextBuffer, emptyTextCursor,
     FoldMapLines, runFoldMapLines, execFoldMapLines, evalFoldMapLines,
@@ -60,11 +60,13 @@ module Hakshell.TextEditor
     MapChars, runMapChars,
     -- * Text Editor Data Structures
     -- ** Text Buffer
-    TextBuffer, LineBreaker, theBufferCharCount, theBufferCharNumber, theBufferLineCount,
-    bufferAboveCursor, bufferLineBreaker, bufferCurrentLine, bufferBelowCursor, textLineString,
+    TextBuffer, LineBreaker(..), lineBreaker, lineBreakPredicate,
+    theBufferCharCount, theBufferCharNumber,
+    theBufferLineCount, theBufferLineNumber,
+    bufferAboveCursor, bufferLineBreaks, bufferCurrentLine, bufferBelowCursor, textLineString,
     lineBreakNLCR,
     -- ** Line Editing
-    TextLine, TextCursor, RelativeToCursor, textCursorBefore, textCursorAfter, textLineTags,
+    TextLine, TextCursor, textCursorBefore, textCursorAfter, textLineTags,
     -- ** Errors
     TextEditError(..),
     -- * Re-exporting "Hakshell.String"
@@ -82,7 +84,8 @@ import qualified Data.ByteString           as Strict
 import qualified Data.ByteString.UTF8      as UTF8st
 import qualified Data.ByteString.Lazy      as Lazy
 import qualified Data.ByteString.Lazy.UTF8 as UTF8lz
-import           Data.Sequence
+import           Data.Semigroup
+import qualified Data.Sequence             as Seq
 
 ----------------------------------------------------------------------------------------------------
 
@@ -238,14 +241,17 @@ data TextBuffer line
       -- ^ The total number of lines in this buffer.
     , theBufferLineNumber  :: !Int
       -- ^ The line number of the 'bufferCurrentLine'. The top-most line of any buffer is 1.
+    , theBufferDefaultTag  :: line
+      -- ^ The tag value to use when new 'TextLine's are automatically constructed after a line
+      -- break character is inserted.
     , theBufferLineBreaker :: LineBreaker
       -- ^ The function used to break strings into lines. This function is called every time a
       -- string is transferred from 'theBufferCursor' to to 'theLinesAbove' or 'theLinesBelow'.
-    , theBufferAboveCursor :: !(Seq (TextLine line))
+    , theBufferAboveCursor :: !(Seq.Seq (TextLine line))
       -- ^ Lines above the cursor
     , theBufferCursor      :: !(TextCursor line)
       -- ^ A data structure for editing individual characters in a line of text.
-    , theBufferBelowCursor :: !(Seq (TextLine line))
+    , theBufferBelowCursor :: !(Seq.Seq (TextLine line))
       -- ^ Lines below the cursor
     }
   deriving Functor
@@ -254,15 +260,25 @@ data TextEditError
   = TextEditError StrictBytes
   deriving (Eq, Ord)
 
--- | A function used to break strings into lines. This function is called every time a string is
--- transferred from 'theBufferCursor' to to 'theLinesAbove' or 'theLinesBelow'.
+-- | A pair of functions used to break strings into lines. This function is called every time a
+-- string is transferred from 'theBufferCursor' to to 'theLinesAbove' or 'theLinesBelow' to ensure
+-- all strings entered into a buffer have no more than one line terminating character sequence at
+-- the end of them.
 --
 -- If you choose to use your own 'LineBreaker' function, be sure that the function obeys this law:
 --
 -- @
 -- 'Prelude.concat' ('lineBreakNLCR' str) == str
 -- @
-type LineBreaker = String -> [String]
+data LineBreaker
+  = LineBreaker
+    { theLineBreakPredicate :: Char -> Bool
+      -- ^ This function is called by 'insertChar' to determine if the 'bufferCurrentLine' should be
+      -- terminated.
+    , theLineBreaker :: LazyBytes -> [StrictBytes]
+      -- ^ This function scans through a string finding character sequences that delimit the end of
+      -- a line of text.
+    }
 
 -- | 'EditText' functions operate on units of text, and each unit of text is the "line," which is
 -- usually a @'\n'@ character terminated line of text in a text file, although it could represent
@@ -287,11 +303,15 @@ data TextLine line
 -- | Similar to a 'TextLine', but expands the 'textLineString' 
 data TextCursor line
   = TextCursor
-    { theTextCursorBefore :: String
-    , theTextCursorAfter  :: String
+    { theTextCursorBefore :: SizedLazyBytes
+    , theTextCursorAfter  :: SizedLazyBytes
     , theTextCursorTag    :: line
     }
   deriving Functor
+
+-- | Evaluate an 'EditText' function on the given 'TextBuffer'.
+runEditText :: EditText line a -> TextBuffer line -> (Either TextEditError a, TextBuffer line)
+runEditText (EditText f) = runState $ runExceptT f
 
 -- | Use this to initialize a new empty 'TextBuffer'. The default 'bufferLineBreaker' is set to
 -- 'lineBreakNLCR'. A 'TextBuffer' always contains one empty line, but a line must have a @line@
@@ -303,6 +323,7 @@ emptyTextBuffer tag = TextBuffer
   , theBufferCharCount   = 0
   , theBufferLineNumber  = 0
   , theBufferLineCount   = 0
+  , theBufferDefaultTag  = tag
   , theBufferLineBreaker = lineBreakNLCR
   , theBufferAboveCursor = mempty
   , theBufferCursor      = emptyTextCursor tag
@@ -316,24 +337,34 @@ emptyTextBuffer tag = TextBuffer
 -- initializing tag value of type @line@.
 emptyTextCursor :: line -> TextCursor line
 emptyTextCursor tag = TextCursor
-  { theTextCursorBefore = ""
-  , theTextCursorAfter  = ""
+  { theTextCursorBefore = mempty
+  , theTextCursorAfter  = mempty
   , theTextCursorTag    = tag
+  }
+
+-- Not for export: unsafe because it does not check for line breaks in the given string.
+unsafeMakeLine :: line -> SizedLazyBytes -> TextLine line
+unsafeMakeLine tag str = TextLine
+  { theTextLineString = toStrictBytes str
+  , theTextLineTags   = tag
   }
 
 -- | This is the default line break function. It will split the line on the character sequence
 -- @"\n"@, or @"\r"@, or @"\n\r"@, or @"\r\n"@. The line terminators must be included at the end of
 -- each broken string, so that the rule that the law @'Prelude.concat' ('lineBreakNLCR' str) == str@
 -- is obeyed.
-lineBreakNLCR :: String -> [String]
-lineBreakNLCR = lines where
-  nlcr c = c == '\n' || c == '\r'
-  lines = break nlcr >>> \ case
-    (""  , "") -> []
-    (line, "") -> [line]
-    (line, '\n':'\r':more) -> (line ++ "\n\r") : lines more
-    (line, '\r':'\n':more) -> (line ++ "\r\n") : lines more
-    (line, c:more)         -> [line ++ [c], more]
+lineBreakNLCR :: LineBreaker
+lineBreakNLCR = LineBreaker
+  { theLineBreakPredicate = nlcr
+  , theLineBreaker = lines . unpack
+  } where
+    nlcr c = c == '\n' || c == '\r'
+    lines  = break nlcr >>> \ case
+      (""  , "") -> []
+      (line, "") -> [pack line]
+      (line, '\n':'\r':more) -> pack (line ++ "\n\r") : lines more
+      (line, '\r':'\n':more) -> pack (line ++ "\r\n") : lines more
+      (line, c:more)         -> [pack $ line ++ [c], pack more]
 
 -- Not for export: updated when characters are added to the 'TextBuffer'.
 bufferCharNumber :: Lens' (TextBuffer line) Int
@@ -351,6 +382,13 @@ bufferLineCount = lens theBufferLineCount $ \ a b -> a{ theBufferLineCount = b }
 bufferLineNumber :: Lens' (TextBuffer line) Int
 bufferLineNumber = lens theBufferLineNumber $ \ a b -> a{ theBufferLineNumber = b }
 
+-- | Entering a line-breaking character (e.g. @'\n'@) into a 'TextBuffer' using 'insertChar' or
+-- 'insertString' results in several 'TextLine's being generated automatically. Whenever a
+-- 'TextLine' is constructed, there needs to be a default tag value that is assigned to it. This
+-- lens allows you to observe or set the default tag value.
+bufferDefaultTag :: Lens' (TextBuffer line) line
+bufferDefaultTag = lens theBufferDefaultTag $ \ a b -> a{ theBufferDefaultTag = b }
+
 -- | The function used to break strings into lines. This function is called every time a string is
 -- transferred from 'theBufferCursor' to 'theLinesAbove' or 'theLinesBelow'. Note that setting this
 -- function doesn't restructure the buffer, the old line breaks will still exist as they were before
@@ -361,13 +399,23 @@ bufferLineNumber = lens theBufferLineNumber $ \ a b -> a{ theBufferLineNumber = 
 -- @
 -- 'Prelude.concat' ('lineBreakNLCR' str) == str
 -- @
-bufferLineBreaker :: Lens' (TextBuffer line) LineBreaker
-bufferLineBreaker = lens theBufferLineBreaker $ \ a b -> a{ theBufferLineBreaker = b }
+bufferLineBreaks :: Lens' (TextBuffer line) LineBreaker
+bufferLineBreaks = lens theBufferLineBreaker $ \ a b -> a{ theBufferLineBreaker = b }
+
+-- | This function is called by 'insertChar' to determine if the 'bufferCurrentLine' should be
+-- terminated.
+lineBreakPredicate :: Lens' LineBreaker (Char -> Bool)
+lineBreakPredicate = lens theLineBreakPredicate $ \ a b -> a{ theLineBreakPredicate = b }
+
+-- | This function scans through a string finding character sequences that delimit the end of a line
+-- of text.
+lineBreaker :: Lens' LineBreaker (LazyBytes -> [StrictBytes])
+lineBreaker = lens theLineBreaker $ \ a b -> a{ theLineBreaker = b }
 
 -- | Lines above the 'bufferCurrentLine' in the 'TextBuffer'. Note that this list is reversed, so if
 -- the current line is at the end of the file, the entire file consists of all lines in this field
 -- in reverse order from the direction in which they were read.
-bufferAboveCursor :: Lens' (TextBuffer line) (Seq (TextLine line))
+bufferAboveCursor :: Lens' (TextBuffer line) (Seq.Seq (TextLine line))
 bufferAboveCursor = lens theBufferAboveCursor $ \ a b -> a{ theBufferAboveCursor = b }
 
 -- | The current line of text being edited under the cursor.
@@ -375,12 +423,8 @@ bufferCurrentLine :: Lens' (TextBuffer line) (TextCursor line)
 bufferCurrentLine = lens theBufferCursor $ \ a b -> a{ theBufferCursor = b }
 
 -- | Lines below the 'bufferCurrentLine'.
-bufferBelowCursor :: Lens' (TextBuffer line) (Seq (TextLine line))
+bufferBelowCursor :: Lens' (TextBuffer line) (Seq.Seq (TextLine line))
 bufferBelowCursor = lens theBufferBelowCursor $ \ a b -> a{ theBufferBelowCursor = b }
-
--- | Evaluate an 'EditText' function on the given 'TextBuffer'.
-runEditText :: EditText line a -> (TextBuffer line) -> (Either TextEditError a, TextBuffer line)
-runEditText (EditText f) = runState $ runExceptT f
 
 -- | The null-terminated, UTF-8 encoded string of bytes stored in this line of text.
 textLineString :: Lens' (TextLine line) StrictBytes
@@ -392,16 +436,14 @@ textLineString = lens theTextLineString $ \ a b -> a{ theTextLineString = b }
 textLineTags :: Lens' (TextLine line) line
 textLineTags = lens theTextLineTags $ \ a b -> a{ theTextLineTags = b }
 
-type RelativeToCursor = forall line . Lens' (TextCursor line) String
-
 -- | A lens that observes or updates characters before the cursor on the 'bufferCurrentLine'. Note
 -- that characters observed by this lens are in the reversed of the order in which they were
 -- inserted.
-textCursorBefore :: RelativeToCursor
+textCursorBefore :: Lens' (TextCursor line) SizedLazyBytes
 textCursorBefore = lens theTextCursorBefore $ \ a b -> a{ theTextCursorBefore = b }
 
 -- | A lens that observes or updates characters after the cursor on the 'bufferCurrentLine'.
-textCursorAfter :: RelativeToCursor
+textCursorAfter :: Lens' (TextCursor line) SizedLazyBytes
 textCursorAfter = lens theTextCursorAfter $ \ a b -> a{ theTextCursorAfter = b }
 
 ----------------------------------------------------------------------------------------------------
@@ -450,4 +492,21 @@ instance MonadEditLine (FoldMapLines fold) where { liftEditLine = foldMapChars .
 
 ----------------------------------------------------------------------------------------------------
 
+-- | Controls whether characters are inserted/deleted before or after the cursor.
+data RelativeToCursor = Before | After
+  deriving (Eq, Ord, Read, Show, Bounded, Enum)
 
+insertChar
+  :: (MonadEditText editor, Monad (editor line))
+  => RelativeToCursor -> Char -> editor line ()
+insertChar rel c = liftEditText $ do
+  isBreak <- use $ bufferLineBreaks . lineBreakPredicate
+  let cs = pack [c]
+  if isBreak c then do
+      line <- use $ bufferCurrentLine . textCursorBefore
+      tag  <- use bufferDefaultTag
+      bufferAboveCursor %= (Seq.:|> (unsafeMakeLine tag $ line <> cs))
+      bufferCurrentLine . textCursorBefore .= mempty
+    else case rel of
+      Before -> bufferCurrentLine . textCursorBefore %= (<> cs)
+      After  -> bufferCurrentLine . textCursorAfter  %= (cs <>)
