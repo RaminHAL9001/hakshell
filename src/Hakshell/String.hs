@@ -2,13 +2,11 @@
 module Hakshell.String
   ( tempTest,
     -- * Common Data Types
-    StrictBytes, LazyBytes, SizedLazyBytes,
-    sizedLazyBytesCharCount, sizedLazyBytesByteCount, sizedLazyBytesString,
-    sizedLazyBytesUpperBound,
+    StrictBytes, LazyBytes,
     -- * Common String Functions
     ToStrictBytes(..),
     Packable(..), Unpackable(..), IntSized(..),
-    SizePackable, -- <-NO (..), members are unsafe.
+    SizePackable, packSize, -- <-NO (..), members are unsafe.
     -- * Pattern Matching
     StringPattern(..), findSubstring,
     Label, Offset, Capture(..), PatternMatch(..), Captured(..), matchVector,
@@ -18,9 +16,6 @@ module Hakshell.String
   ) where
 
 import           Hakshell.Struct
-
-import           Control.Arrow
-import           Control.Monad
 
 import           Data.String
 import qualified Data.ByteString.Char8          as Strict
@@ -89,65 +84,6 @@ type StrictBytes = Strict.ByteString
 -- | A lazy 'Lazy.ByteString' from the "Data.ByteString.Lazy.Char8" module. UTF8 encoding is
 -- provided by the "Data.ByteString.Lazy.UTF8" module.
 type LazyBytes   = Lazy.ByteString
-
--- | A 'LazyBytes' string that keeps track of how many characters have been inserted into it. This
--- string data type is useful in situations in which you expect many updates to a string. The
--- maximum length of this string is 1/8th the maximum bound for the 'Int' data type, so it is large,
--- but if you expect to be working with 512 megabytes of data on a 32-bit computer system, keep in
--- mind that this data type should not be used in that situation.
-data SizedLazyBytes
-  = SizedLazyBytes
-    { sizedLazyBytesCharCount :: Int -- ^ Lazily counted number of characters
-    , sizedLazyBytesByteCount :: Int -- ^ Lazily counted number of encoded bytes
-    , sizedLazyBytesString    :: LazyBytes
-    }
-  deriving (Eq, Ord)
-
-instance Show SizedLazyBytes where { show = show . unpack . sizedLazyBytesString; }
-instance Read SizedLazyBytes where
-  readsPrec p = readsPrec p >=> \ (str, rem) -> [(pack str, rem)]
-
-instance Semigroup SizedLazyBytes where
-  (SizedLazyBytes ccA bcA sA) <> (SizedLazyBytes ccB bcB sB) = SizedLazyBytes
-    { sizedLazyBytesCharCount = ccA + ccB
-    , sizedLazyBytesByteCount = bcA + bcB
-    , sizedLazyBytesString    = sA <> sB
-    }
-
-instance Monoid SizedLazyBytes where
-  mappend = (<>)
-  mempty  = SizedLazyBytes
-    { sizedLazyBytesCharCount = 0
-    , sizedLazyBytesByteCount = 0
-    , sizedLazyBytesString    = ""
-    }
-
-instance Packable SizedLazyBytes where
-  pack = (\ (len, str) -> packSize len str) .
-    first sum . unzip . take sizedLazyBytesUpperBound . zip (repeat 1)
-
-instance Unpackable    SizedLazyBytes where { unpack = unpack . sizedLazyBytesString; }
-instance IntSized      SizedLazyBytes where { intSize = sizedLazyBytesCharCount; }
-
-instance ToStrictBytes SizedLazyBytes where
-  toStrictBytes slb =
-    packSize (sizedLazyBytesByteCount slb) (Lazy.unpack $ sizedLazyBytesString slb)
-
-instance SizePackable SizedLazyBytes where
-  packSize size str =
-    if size > sizedLazyBytesUpperBound then error $
-      "(packSize :: Int -> String -> SizedLazyBytes) requested size "++show size++
-      " is greater than size upper bound ("++show sizedLazyBytesUpperBound++
-      ") allowable for data type SizedLazyBytes"
-    else let bstr = packSize size str in SizedLazyBytes
-      { sizedLazyBytesCharCount = size
-      , sizedLazyBytesByteCount = fromIntegral $ Lazy.length bstr
-      , sizedLazyBytesString    = bstr
-      }
-
--- | The maximum number of characters that can be stored into a 'SizedLazyBytes' data structure.
-sizedLazyBytesUpperBound :: Int
-sizedLazyBytesUpperBound = div maxBound 8
 
 ----------------------------------------------------------------------------------------------------
 

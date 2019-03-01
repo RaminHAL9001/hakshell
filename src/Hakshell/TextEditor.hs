@@ -50,7 +50,7 @@ module Hakshell.TextEditor
   ( -- * Text Editing API
     MonadEditText(..), MonadEditLine(..),
     RelativeToCursor(..),
-    insertChar, deleteChars, insertString, 
+    insertChar, deleteChars, deleteCharsWrap, insertString, 
     -- * Text Editor Function Types
     EditText, runEditText, emptyTextBuffer, emptyTextCursor,
     FoldMapLines, runFoldMapLines, execFoldMapLines, evalFoldMapLines,
@@ -84,6 +84,7 @@ import qualified Data.ByteString           as Strict
 import qualified Data.ByteString.UTF8      as UTF8st
 import qualified Data.ByteString.Lazy      as Lazy
 import qualified Data.ByteString.Lazy.UTF8 as UTF8lz
+import           Data.Foldable             (toList)
 import           Data.Semigroup
 import qualified Data.Sequence             as Seq
 
@@ -275,7 +276,7 @@ data LineBreaker
     { theLineBreakPredicate :: Char -> Bool
       -- ^ This function is called by 'insertChar' to determine if the 'bufferCurrentLine' should be
       -- terminated.
-    , theLineBreaker :: LazyBytes -> [StrictBytes]
+    , theLineBreaker :: String -> [String]
       -- ^ This function scans through a string finding character sequences that delimit the end of
       -- a line of text.
     }
@@ -303,11 +304,39 @@ data TextLine line
 -- | Similar to a 'TextLine', but expands the 'textLineString' 
 data TextCursor line
   = TextCursor
-    { theTextCursorBefore :: SizedLazyBytes
-    , theTextCursorAfter  :: SizedLazyBytes
+    { theTextCursorBefore :: TextSubCursor
+    , theTextCursorAfter  :: TextSubCursor
     , theTextCursorTag    :: line
     }
   deriving Functor
+
+-- | A line of text in a 'TextCursor' is split into two pieces: a part before the cursor (to the
+-- left of the cursor in left-to-right written languages) and a part after the cursor (to the right
+-- of the cursor in left-to-right written languages). Each part is a 'TextSubCursor', and a
+-- 'TextCursor' contains two 'TextSubCursors', one 'textCursorBefore' and one 'textCursorAfter'.
+data TextSubCursor
+  = TextSubCursor
+    { theSubCursorLength :: !Int
+    , theSubCursorString :: Seq.Seq Char
+    }
+  deriving (Eq, Ord)
+
+instance Semigroup TextSubCursor where
+  a <> b = TextSubCursor
+    { theSubCursorLength = theSubCursorLength a +  theSubCursorLength b
+    , theSubCursorString = theSubCursorString a <> theSubCursorString b
+    }
+
+instance Monoid TextSubCursor where
+  mappend = (<>)
+  mempty  = TextSubCursor
+    { theSubCursorLength = 0
+    , theSubCursorString = mempty
+    }
+
+instance ToStrictBytes TextSubCursor where
+  toStrictBytes str = packSize (theSubCursorLength str) $
+    toList $ Seq.viewl $ theSubCursorString str
 
 -- | Evaluate an 'EditText' function on the given 'TextBuffer'.
 runEditText :: EditText line a -> TextBuffer line -> (Either TextEditError a, TextBuffer line)
@@ -343,7 +372,7 @@ emptyTextCursor tag = TextCursor
   }
 
 -- Not for export: unsafe because it does not check for line breaks in the given string.
-unsafeMakeLine :: line -> SizedLazyBytes -> TextLine line
+unsafeMakeLine :: line -> TextSubCursor -> TextLine line
 unsafeMakeLine tag str = TextLine
   { theTextLineString = toStrictBytes str
   , theTextLineTags   = tag
@@ -356,15 +385,15 @@ unsafeMakeLine tag str = TextLine
 lineBreakNLCR :: LineBreaker
 lineBreakNLCR = LineBreaker
   { theLineBreakPredicate = nlcr
-  , theLineBreaker = lines . unpack
+  , theLineBreaker = lines
   } where
     nlcr c = c == '\n' || c == '\r'
     lines  = break nlcr >>> \ case
       (""  , "") -> []
-      (line, "") -> [pack line]
-      (line, '\n':'\r':more) -> pack (line ++ "\n\r") : lines more
-      (line, '\r':'\n':more) -> pack (line ++ "\r\n") : lines more
-      (line, c:more)         -> [pack $ line ++ [c], pack more]
+      (line, "") -> [line]
+      (line, '\n':'\r':more) -> (line ++ "\n\r") : lines more
+      (line, '\r':'\n':more) -> (line ++ "\r\n") : lines more
+      (line, c:more)         -> [line ++ [c], more]
 
 -- Not for export: updated when characters are added to the 'TextBuffer'.
 bufferCharNumber :: Lens' (TextBuffer line) Int
@@ -409,7 +438,7 @@ lineBreakPredicate = lens theLineBreakPredicate $ \ a b -> a{ theLineBreakPredic
 
 -- | This function scans through a string finding character sequences that delimit the end of a line
 -- of text.
-lineBreaker :: Lens' LineBreaker (LazyBytes -> [StrictBytes])
+lineBreaker :: Lens' LineBreaker (String -> [String])
 lineBreaker = lens theLineBreaker $ \ a b -> a{ theLineBreaker = b }
 
 -- | Lines above the 'bufferCurrentLine' in the 'TextBuffer'. Note that this list is reversed, so if
@@ -439,12 +468,37 @@ textLineTags = lens theTextLineTags $ \ a b -> a{ theTextLineTags = b }
 -- | A lens that observes or updates characters before the cursor on the 'bufferCurrentLine'. Note
 -- that characters observed by this lens are in the reversed of the order in which they were
 -- inserted.
-textCursorBefore :: Lens' (TextCursor line) SizedLazyBytes
+textCursorBefore :: Lens' (TextCursor line) TextSubCursor
 textCursorBefore = lens theTextCursorBefore $ \ a b -> a{ theTextCursorBefore = b }
 
 -- | A lens that observes or updates characters after the cursor on the 'bufferCurrentLine'.
-textCursorAfter :: Lens' (TextCursor line) SizedLazyBytes
+textCursorAfter :: Lens' (TextCursor line) TextSubCursor
 textCursorAfter = lens theTextCursorAfter $ \ a b -> a{ theTextCursorAfter = b }
+
+-- | How many characters in this string.
+subCursorLength :: Lens' TextSubCursor Int
+subCursorLength = lens theSubCursorLength $ \ a b -> a{ theSubCursorLength = b }
+
+-- | The string itself.
+subCursorString :: Lens' TextSubCursor (Seq.Seq Char)
+subCursorString = lens theSubCursorString $ \ a b -> a{ theSubCursorString = b }
+
+-- | Append a character to the end of a 'TextSubCursor'.
+subCursorAppend :: Char -> TextSubCursor -> TextSubCursor
+subCursorAppend c = (subCursorLength +~ 1) . (subCursorString %~ (c Seq.<|))
+
+-- | Prepend a character to the start of a 'TextSubCursor'.
+subCursorPrepend :: Char -> TextSubCursor -> TextSubCursor
+subCursorPrepend c = (subCursorLength +~ 1) . (subCursorString %~ (Seq.|> c))
+
+-- | Delete characters from the left-hand side of the 'TextSubCursor'
+subCursorDropLeft :: Int -> TextSubCursor -> TextSubCursor
+subCursorDropLeft n tsc = if tsc ^. subCursorLength <= n then mempty else
+  tsc & (subCursorLength -~ n) . (subCursorString %~ Seq.drop n)
+
+subCursorDropRight :: Int -> TextSubCursor -> TextSubCursor
+subCursorDropRight n tsc = let len = tsc ^. subCursorLength in if len <= n then mempty else
+  tsc & (subCursorLength -~ n) . (subCursorString %~ Seq.take (len - n))
 
 ----------------------------------------------------------------------------------------------------
 
@@ -496,17 +550,44 @@ instance MonadEditLine (FoldMapLines fold) where { liftEditLine = foldMapChars .
 data RelativeToCursor = Before | After
   deriving (Eq, Ord, Read, Show, Bounded, Enum)
 
+-- | Insert a single character. If the 'lineBreakPredicate' function evaluates to 'Prelude.True',
+-- meaning the given character is a line breaking character, this function does nothing. To insert
+-- line breaks, using 'insertString'.
 insertChar
   :: (MonadEditText editor, Monad (editor line))
   => RelativeToCursor -> Char -> editor line ()
 insertChar rel c = liftEditText $ do
   isBreak <- use $ bufferLineBreaks . lineBreakPredicate
-  let cs = pack [c]
-  if isBreak c then do
-      line <- use $ bufferCurrentLine . textCursorBefore
-      tag  <- use bufferDefaultTag
-      bufferAboveCursor %= (Seq.:|> (unsafeMakeLine tag $ line <> cs))
-      bufferCurrentLine . textCursorBefore .= mempty
-    else case rel of
-      Before -> bufferCurrentLine . textCursorBefore %= (<> cs)
-      After  -> bufferCurrentLine . textCursorAfter  %= (cs <>)
+  if isBreak c then return () else case rel of
+    Before -> bufferCurrentLine . textCursorBefore %= subCursorAppend  c
+    After  -> bufferCurrentLine . textCursorAfter  %= subCursorPrepend c
+
+-- | This function only deletes characters on the current line, if the cursor is at the start of the
+-- line and you evaluate @'deleteChars' 'Before'@, this function does nothing.
+deleteChars
+  :: (MonadEditText editor, Monad (editor line))
+  => RelativeToCursor -> Int -> editor line ()
+deleteChars rel n = liftEditText $ case rel of
+  Before -> bufferCurrentLine . textCursorBefore %= \ str ->
+    let count = theSubCursorLength str in
+    if n >= count then mempty else subCursorDropRight (count - n) str
+  After  -> bufferCurrentLine . textCursorAfter  %= \ str ->
+    let count = theSubCursorLength str in
+    if n >= count then mempty else subCursorDropLeft  n str
+
+-- | This function deletes characters starting from the cursor, and if the number of characters to
+-- be deleted exceeds the number of characters in the current line, characters are deleted from
+-- adjacent lines such that the travel of deletion wraps to the end of the prior line or the
+-- beginning of the next line, depending on the direction of travel.
+deleteCharsWrap
+  :: (MonadEditText editor, Monad (editor line))
+  => RelativeToCursor -> Int -> editor line ()
+deleteCharsWrap rel n = error "TODO: deleteCharsWrap"
+
+-- | This function evaluates the 'lineBreaker' function on the given string, and beginning from the
+-- current cursor position, begins inserting all the lines of text produced by the 'lineBreaker'
+-- function.
+insertString
+  :: (MonadEditText editor, Monad (editor line))
+  => RelativeToCursor -> Int -> editor line ()
+insertString str = error "TODO: insertString"
