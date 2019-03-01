@@ -1,7 +1,12 @@
 -- | Automatic text processing, scripting tools.
 module Hakshell.String
   ( tempTest,
-    StrictBytes, LazyBytes, ToByteString(..),
+    -- * Common Data Types
+    StrictBytes, LazyBytes, SizedLazyBytes,
+    sizedLazyBytesCharCount, sizedLazyBytesByteCount, sizedLazyBytesString,
+    sizedLazyBytesUpperBound,
+    -- * Common String Functions
+    ToStrictBytes(..),
     Packable(..), Unpackable(..), IntSized(..),
     SizePackable, -- <-NO (..), members are unsafe.
     -- * Pattern Matching
@@ -14,12 +19,15 @@ module Hakshell.String
 
 import           Hakshell.Struct
 
+import           Control.Arrow
+import           Control.Monad
+
 import           Data.String
 import qualified Data.ByteString.Char8          as Strict
 import qualified Data.ByteString.Lazy.Char8     as Lazy
 import qualified Data.ByteString.Builder        as Build
 import qualified Data.ByteString.Builder.Extra  as Bytes
---import qualified Data.ByteString.UTF8           as StrictUTF8
+import qualified Data.ByteString.UTF8           as StrictUTF8
 import qualified Data.ByteString.Lazy.UTF8      as LazyUTF8
 import qualified Data.IntMap                    as IMap
 --import           Data.Monoid
@@ -31,26 +39,18 @@ import Debug.Trace
 
 ----------------------------------------------------------------------------------------------------
 
--- | A strict 'Strict.ByteString' from the "Data.ByteString.Char8" module. UTF8 encoding is provided
--- by the "Data.ByteString.UTF8" module.
-type StrictBytes = Strict.ByteString
-
--- | A lazy 'Lazy.ByteString' from the "Data.ByteString.Lazy.Char8" module. UTF8 encoding is
--- provided by the "Data.ByteString.Lazy.UTF8" module.
-type LazyBytes   = Lazy.ByteString
-
-class ToByteString str where { toByteString :: str -> StrictBytes; }
+class ToStrictBytes str where { toStrictBytes :: str -> StrictBytes; }
 
 -- | This class is a synonym for 'Data.String.fromString', renamed to the word 'pack' which is
 -- easier to type.
 class Packable str where { pack :: String -> str; }
-instance Packable StrictBytes where { pack = Strict.pack; }
+instance Packable StrictBytes where { pack = StrictUTF8.fromString; }
 instance Packable LazyBytes   where { pack = LazyUTF8.fromString; }
 
 -- | Inverse of 'Packable'.
 class Unpackable str where { unpack :: str -> String; }
-instance Unpackable StrictBytes where { unpack = Strict.unpack; }
-instance Unpackable LazyBytes   where { unpack = Lazy.unpack; }
+instance Unpackable StrictBytes where { unpack = StrictUTF8.toString; }
+instance Unpackable LazyBytes   where { unpack = LazyUTF8.toString; }
 
 ----------------------------------------------------------------------------------------------------
 
@@ -79,6 +79,75 @@ instance SizePackable LazyBytes where
 
 instance SizePackable StrictBytes where
   packSize size = Lazy.toStrict . packSize size
+
+----------------------------------------------------------------------------------------------------
+
+-- | A strict 'Strict.ByteString' from the "Data.ByteString.Char8" module. UTF8 encoding is provided
+-- by the "Data.ByteString.UTF8" module.
+type StrictBytes = Strict.ByteString
+
+-- | A lazy 'Lazy.ByteString' from the "Data.ByteString.Lazy.Char8" module. UTF8 encoding is
+-- provided by the "Data.ByteString.Lazy.UTF8" module.
+type LazyBytes   = Lazy.ByteString
+
+-- | A 'LazyBytes' string that keeps track of how many characters have been inserted into it. This
+-- string data type is useful in situations in which you expect many updates to a string. The
+-- maximum length of this string is 1/8th the maximum bound for the 'Int' data type, so it is large,
+-- but if you expect to be working with 512 megabytes of data on a 32-bit computer system, keep in
+-- mind that this data type should not be used in that situation.
+data SizedLazyBytes
+  = SizedLazyBytes
+    { sizedLazyBytesCharCount :: Int -- ^ Lazily counted number of characters
+    , sizedLazyBytesByteCount :: Int -- ^ Lazily counted number of encoded bytes
+    , sizedLazyBytesString    :: LazyBytes
+    }
+  deriving (Eq, Ord)
+
+instance Show SizedLazyBytes where { show = show . unpack . sizedLazyBytesString; }
+instance Read SizedLazyBytes where
+  readsPrec p = readsPrec p >=> \ (str, rem) -> [(pack str, rem)]
+
+instance Semigroup SizedLazyBytes where
+  (SizedLazyBytes ccA bcA sA) <> (SizedLazyBytes ccB bcB sB) = SizedLazyBytes
+    { sizedLazyBytesCharCount = ccA + ccB
+    , sizedLazyBytesByteCount = bcA + bcB
+    , sizedLazyBytesString    = sA <> sB
+    }
+
+instance Monoid SizedLazyBytes where
+  mappend = (<>)
+  mempty  = SizedLazyBytes
+    { sizedLazyBytesCharCount = 0
+    , sizedLazyBytesByteCount = 0
+    , sizedLazyBytesString    = ""
+    }
+
+instance Packable SizedLazyBytes where
+  pack = (\ (len, str) -> packSize len str) .
+    first sum . unzip . take sizedLazyBytesUpperBound . zip (repeat 1)
+
+instance Unpackable    SizedLazyBytes where { unpack = unpack . sizedLazyBytesString; }
+instance IntSized      SizedLazyBytes where { intSize = sizedLazyBytesCharCount; }
+
+instance ToStrictBytes SizedLazyBytes where
+  toStrictBytes slb =
+    packSize (sizedLazyBytesByteCount slb) (Lazy.unpack $ sizedLazyBytesString slb)
+
+instance SizePackable SizedLazyBytes where
+  packSize size str =
+    if size > sizedLazyBytesUpperBound then error $
+      "(packSize :: Int -> String -> SizedLazyBytes) requested size "++show size++
+      " is greater than size upper bound ("++show sizedLazyBytesUpperBound++
+      ") allowable for data type SizedLazyBytes"
+    else let bstr = packSize size str in SizedLazyBytes
+      { sizedLazyBytesCharCount = size
+      , sizedLazyBytesByteCount = fromIntegral $ Lazy.length bstr
+      , sizedLazyBytesString    = bstr
+      }
+
+-- | The maximum number of characters that can be stored into a 'SizedLazyBytes' data structure.
+sizedLazyBytesUpperBound :: Int
+sizedLazyBytesUpperBound = div maxBound 8
 
 ----------------------------------------------------------------------------------------------------
 
@@ -153,10 +222,10 @@ data StringSlice
     }
   deriving (Eq, Ord, Show, Typeable)
 
-instance ToByteString StringSlice where
-  toByteString s = Strict.take (sliceLength s) $ Strict.drop (sliceOffset s) $ sliceString s
+instance ToStrictBytes StringSlice where
+  toStrictBytes s = Strict.take (sliceLength s) $ Strict.drop (sliceOffset s) $ sliceString s
 
-instance ToByteString Captured where { toByteString = toByteString . capturedSlice; }
+instance ToStrictBytes Captured where { toStrictBytes = toStrictBytes . capturedSlice; }
 
 instance Semigroup PatternMatch where
   a <> b = case (a, b) of
@@ -216,10 +285,10 @@ instance StringPattern ExactString where
       let match constr =
             PatternMatch $ Vec.singleton $ constr $ StringSlice 0 (Strict.length pat) str
       in  case capt of
-            NoMatch            -> PatternNoMatch
             Match              -> PatternMatch mempty
             Capture            -> match Captured
             CaptureNamed label -> match $ CapturedNamed label
+            _                  -> PatternNoMatch
     else  case capt of
             NoMatch            -> PatternMatch mempty
             _                  -> PatternNoMatch
