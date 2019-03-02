@@ -52,7 +52,7 @@ module Hakshell.TextEditor
     RelativeToCursor(..),
     insertChar, deleteChars, deleteCharsWrap, insertString, 
     -- * Text Editor Function Types
-    EditText, runEditText, emptyTextBuffer, emptyTextCursor,
+    EditText, runEditText, newTextBuffer, newTextCursor,
     FoldMapLines, runFoldMapLines, execFoldMapLines, evalFoldMapLines,
     MapLines, runMapLines,
     EditLine, editLine,
@@ -66,7 +66,7 @@ module Hakshell.TextEditor
     bufferAboveCursor, bufferLineBreaks, bufferCurrentLine, bufferBelowCursor, textLineString,
     lineBreakNLCR,
     -- ** Line Editing
-    TextLine, TextCursor, textCursorBefore, textCursorAfter, textLineTags,
+    TextLine, TextCursor, textCursorCharCount, textLineTags,
     -- ** Errors
     TextEditError(..),
     -- * Re-exporting "Hakshell.String"
@@ -80,26 +80,31 @@ import           Control.Lens
 import           Control.Monad.Except
 import           Control.Monad.State
 
-import qualified Data.ByteString           as Strict
-import qualified Data.ByteString.UTF8      as UTF8st
-import qualified Data.ByteString.Lazy      as Lazy
-import qualified Data.ByteString.Lazy.UTF8 as UTF8lz
-import           Data.Foldable             (toList)
+import qualified Data.ByteString             as Strict
+import qualified Data.ByteString.UTF8        as UTF8st
+import qualified Data.ByteString.Lazy        as Lazy
+import qualified Data.ByteString.Lazy.UTF8   as UTF8lz
+import           Data.Foldable               (toList)
 import           Data.Semigroup
-import qualified Data.Sequence             as Seq
+import qualified Data.Sequence               as Seq
+import qualified Data.Vector.Unboxed.Mutable as UMVec
 
 ----------------------------------------------------------------------------------------------------
 
 -- | This is a type of functions that can modify the textual content stored in a 'TextBuffer'.
 newtype EditText line a
-  = EditText{ unwrapEditText :: ExceptT TextEditError (State (TextBuffer line)) a }
-  deriving (Functor, Applicative, Monad)
+  = EditText{ unwrapEditText :: ExceptT TextEditError (StateT (TextBuffer line) IO) a }
+  deriving (Functor, Applicative, Monad, MonadIO)
 
 instance MonadState (TextBuffer line) (EditText line) where { state = EditText . lift . state; }
 
 instance MonadError TextEditError (EditText line) where
   throwError = EditText . throwError
   catchError (EditText try) catch = EditText $ catchError try $ unwrapEditText . catch
+
+-- | Evaluate an 'EditText' function on the given 'TextBuffer'.
+runEditText :: EditText line a -> TextBuffer line -> IO (Either TextEditError a, TextBuffer line)
+runEditText (EditText f) = runStateT $ runExceptT f
 
 ----------------------------------------------------------------------------------------------------
 
@@ -119,7 +124,7 @@ instance MonadError TextEditError (EditText line) where
 -- 'FoldMapLines' has nothing to do with such a feature.
 newtype FoldMapLines fold line a
   = FoldMapLines{ unwrapFoldMapLines :: ExceptT TextEditError (StateT fold (EditText line)) a }
-  deriving (Functor, Applicative, Monad)
+  deriving (Functor, Applicative, Monad, MonadIO)
 
 instance MonadState fold (FoldMapLines fold line) where
   state = FoldMapLines . lift . state
@@ -160,7 +165,7 @@ runMapLines = flip evalFoldMapLines ()
 -- 'bufferCurrentLine'.
 newtype EditLine line a
   = EditLine{ unwrapEditLine :: ExceptT TextEditError (StateT (TextCursor line) (EditText line)) a }
-  deriving (Functor, Applicative, Monad)
+  deriving (Functor, Applicative, Monad, MonadIO)
 
 instance MonadState (TextCursor line) (EditLine line) where
   state = EditLine . lift . state
@@ -185,7 +190,7 @@ editLine (EditLine f) = use bufferCurrentLine >>= runStateT (runExceptT f) >>= \
 -- in the line.
 newtype FoldMapChars fold line a
   = FoldMapChars{ unwrapFoldMapChars :: ExceptT TextEditError (StateT fold (EditLine line)) a }
-  deriving (Functor, Applicative, Monad)
+  deriving (Functor, Applicative, Monad, MonadIO)
 
 instance MonadState fold (FoldMapChars fold line) where
   state = FoldMapChars . lift . state
@@ -301,82 +306,80 @@ data TextLine line
     }
   deriving Functor
 
--- | Similar to a 'TextLine', but expands the 'textLineString' 
+-- | The current line that is being edited.
 data TextCursor line
   = TextCursor
-    { theTextCursorBefore :: TextSubCursor
-    , theTextCursorAfter  :: TextSubCursor
-    , theTextCursorTag    :: line
+    { theLineEditBuffer    :: !(UMVec.IOVector Char)
+    , theCharsBeforeCursor :: !Int
+    , theCharsAfterCursor  :: !Int
+    , theTextCursorTag     :: line
     }
   deriving Functor
 
--- | A line of text in a 'TextCursor' is split into two pieces: a part before the cursor (to the
--- left of the cursor in left-to-right written languages) and a part after the cursor (to the right
--- of the cursor in left-to-right written languages). Each part is a 'TextSubCursor', and a
--- 'TextCursor' contains two 'TextSubCursors', one 'textCursorBefore' and one 'textCursorAfter'.
-data TextSubCursor
-  = TextSubCursor
-    { theSubCursorLength :: !Int
-    , theSubCursorString :: Seq.Seq Char
-    }
-  deriving (Eq, Ord)
+-- Not for export: this buffer is formatted such that characters before the cursror are near index
+-- zero, while characters after the cursor are near the final index.
+lineEditBuffer :: Lens' (TextCursor line) (UMVec.IOVector Char)
+lineEditBuffer = lens theLineEditBuffer $ \ a b -> a{ theLineEditBuffer = b }
 
-instance Semigroup TextSubCursor where
-  a <> b = TextSubCursor
-    { theSubCursorLength = theSubCursorLength a +  theSubCursorLength b
-    , theSubCursorString = theSubCursorString a <> theSubCursorString b
-    }
+-- Not for export: this gets updated when inserting or deleting characters before the cursor.
+charsBeforeCursor :: Lens' (TextCursor line) Int
+charsBeforeCursor = lens theCharsBeforeCursor $ \ a b -> a{ theCharsAfterCursor = b }
 
-instance Monoid TextSubCursor where
-  mappend = (<>)
-  mempty  = TextSubCursor
-    { theSubCursorLength = 0
-    , theSubCursorString = mempty
-    }
-
-instance ToStrictBytes TextSubCursor where
-  toStrictBytes str = packSize (theSubCursorLength str) $
-    toList $ Seq.viewl $ theSubCursorString str
-
--- | Evaluate an 'EditText' function on the given 'TextBuffer'.
-runEditText :: EditText line a -> TextBuffer line -> (Either TextEditError a, TextBuffer line)
-runEditText (EditText f) = runState $ runExceptT f
+-- Not for export: this gets updated when inserting or deleting characters after the cursor.
+charsAfterCursor :: Lens' (TextCursor line) Int
+charsAfterCursor = lens theCharsAfterCursor $ \ a b -> a{ theCharsAfterCursor = b}
 
 -- | Use this to initialize a new empty 'TextBuffer'. The default 'bufferLineBreaker' is set to
 -- 'lineBreakNLCR'. A 'TextBuffer' always contains one empty line, but a line must have a @line@
 -- tag, so it is necessary to pass an initializing tag value of type @line@ -- if you need nothing
 -- but plain text editing, @line@ can be unit @()@.
-emptyTextBuffer :: line -> TextBuffer line
-emptyTextBuffer tag = TextBuffer
-  { theBufferCharNumber  = 0
-  , theBufferCharCount   = 0
-  , theBufferLineNumber  = 0
-  , theBufferLineCount   = 0
-  , theBufferDefaultTag  = tag
-  , theBufferLineBreaker = lineBreakNLCR
-  , theBufferAboveCursor = mempty
-  , theBufferCursor      = emptyTextCursor tag
-  , theBufferBelowCursor = mempty
-  }
+newTextBuffer :: line -> IO (TextBuffer line)
+newTextBuffer tag = do
+  cur <- newTextCursor tag
+  return TextBuffer
+    { theBufferCharNumber  = 0
+    , theBufferCharCount   = 0
+    , theBufferLineNumber  = 0
+    , theBufferLineCount   = 0
+    , theBufferDefaultTag  = tag
+    , theBufferLineBreaker = lineBreakNLCR
+    , theBufferAboveCursor = mempty
+    , theBufferCursor      = cur
+    , theBufferBelowCursor = mempty
+    }
 
 -- | Use this to initialize a new empty 'TextCursor'. This is usually only handy if you want to
 -- define and test your own 'EditLine' functions and need to evaluate 'runEditLine' by hand rather
 -- than allowing the 'TextEdit' APIs automatically manage line editing. A 'TextBuffer' always
 -- contains one empty line, but a line must have a @line@ tag, so it is necessary to pass an
 -- initializing tag value of type @line@.
-emptyTextCursor :: line -> TextCursor line
-emptyTextCursor tag = TextCursor
-  { theTextCursorBefore = mempty
-  , theTextCursorAfter  = mempty
-  , theTextCursorTag    = tag
-  }
+newTextCursor :: line -> IO (TextCursor line)
+newTextCursor tag = do
+  buf <- UMVec.replicate 1024 '\0'
+  return TextCursor
+    { theLineEditBuffer    = buf
+    , theCharsBeforeCursor = 0
+    , theCharsAfterCursor  = 0
+    , theTextCursorTag     = tag
+    }
 
--- Not for export: unsafe because it does not check for line breaks in the given string.
-unsafeMakeLine :: line -> TextSubCursor -> TextLine line
-unsafeMakeLine tag str = TextLine
-  { theTextLineString = toStrictBytes str
-  , theTextLineTags   = tag
-  }
+-- | Determine how many characters have been stored into this buffer.
+textCursorCharCount :: TextCursor line -> Int
+textCursorCharCount cur = theCharsBeforeCursor cur + theCharsAfterCursor cur
+
+-- Not for export: unsafe because it does not check for line breaks in the given string. This
+-- function copies the characters from a 'TextCursor' buffer into a pure 'TextLine'.
+unsafeMakeLine :: TextCursor line -> IO (TextLine line)
+unsafeMakeLine cur = do
+  let buf = theLineEditBuffer cur
+  let len = UMVec.length buf
+  let chars = mapM $ UMVec.read buf
+  before <- chars [0  .. theCharsBeforeCursor cur - 1] 
+  after  <- chars [len - theCharsAfterCursor  cur .. len - 1]
+  return TextLine
+    { theTextLineString = packSize (textCursorCharCount cur) $ before ++ after
+    , theTextLineTags   = theTextCursorTag cur
+    }
 
 -- | This is the default line break function. It will split the line on the character sequence
 -- @"\n"@, or @"\r"@, or @"\n\r"@, or @"\r\n"@. The line terminators must be included at the end of
@@ -465,41 +468,6 @@ textLineString = lens theTextLineString $ \ a b -> a{ theTextLineString = b }
 textLineTags :: Lens' (TextLine line) line
 textLineTags = lens theTextLineTags $ \ a b -> a{ theTextLineTags = b }
 
--- | A lens that observes or updates characters before the cursor on the 'bufferCurrentLine'. Note
--- that characters observed by this lens are in the reversed of the order in which they were
--- inserted.
-textCursorBefore :: Lens' (TextCursor line) TextSubCursor
-textCursorBefore = lens theTextCursorBefore $ \ a b -> a{ theTextCursorBefore = b }
-
--- | A lens that observes or updates characters after the cursor on the 'bufferCurrentLine'.
-textCursorAfter :: Lens' (TextCursor line) TextSubCursor
-textCursorAfter = lens theTextCursorAfter $ \ a b -> a{ theTextCursorAfter = b }
-
--- | How many characters in this string.
-subCursorLength :: Lens' TextSubCursor Int
-subCursorLength = lens theSubCursorLength $ \ a b -> a{ theSubCursorLength = b }
-
--- | The string itself.
-subCursorString :: Lens' TextSubCursor (Seq.Seq Char)
-subCursorString = lens theSubCursorString $ \ a b -> a{ theSubCursorString = b }
-
--- | Append a character to the end of a 'TextSubCursor'.
-subCursorAppend :: Char -> TextSubCursor -> TextSubCursor
-subCursorAppend c = (subCursorLength +~ 1) . (subCursorString %~ (c Seq.<|))
-
--- | Prepend a character to the start of a 'TextSubCursor'.
-subCursorPrepend :: Char -> TextSubCursor -> TextSubCursor
-subCursorPrepend c = (subCursorLength +~ 1) . (subCursorString %~ (Seq.|> c))
-
--- | Delete characters from the left-hand side of the 'TextSubCursor'
-subCursorDropLeft :: Int -> TextSubCursor -> TextSubCursor
-subCursorDropLeft n tsc = if tsc ^. subCursorLength <= n then mempty else
-  tsc & (subCursorLength -~ n) . (subCursorString %~ Seq.drop n)
-
-subCursorDropRight :: Int -> TextSubCursor -> TextSubCursor
-subCursorDropRight n tsc = let len = tsc ^. subCursorLength in if len <= n then mempty else
-  tsc & (subCursorLength -~ n) . (subCursorString %~ Seq.take (len - n))
-
 ----------------------------------------------------------------------------------------------------
 
 -- | Throughout this module you will find functions that are defined like so:
@@ -550,6 +518,38 @@ instance MonadEditLine (FoldMapLines fold) where { liftEditLine = foldMapChars .
 data RelativeToCursor = Before | After
   deriving (Eq, Ord, Read, Show, Bounded, Enum)
 
+-- Not for export: should be executed automatically by insertion operations. Increases the size of
+-- the 'lineEditBuffer' to be large enough to contain the current 'textCursorCharCount' plus the
+-- given number of elements.
+growIfTooSmall :: Int -> EditText line ()
+growIfTooSmall increase = do
+  cur <- use bufferCurrentLine
+  let buf    = cur ^. lineEditBuffer
+  let filled = textCursorCharCount cur + max 0 increase
+  let len    = UMVec.length buf :: Int
+  let newlen = head $ dropWhile (<= filled) $ iterate (* 2) len
+  let lower  = cur ^. charsBeforeCursor
+  let upper  = cur ^. charsAfterCursor
+  if len > filled then return () else
+    ( liftIO $ do
+        newbuf <- UMVec.new newlen
+        -- TODO: switch to 'unsafe' after testing
+        liftIO $ UMVec.copy (UMVec.slice 0 lower newbuf) (UMVec.slice 0 lower buf)
+        liftIO $ UMVec.copy
+          (UMVec.slice (len - upper) (len - 1) newbuf)
+          (UMVec.slice (len - upper) (len - 1) buf)
+        return newbuf
+    ) >>= assign (bufferCurrentLine . lineEditBuffer)
+
+-- Not for export: should be executed automatically by insertion operations. This function is
+-- necessary because it's pretty much fucking impossible to use @let@ bindings to bind lenses.
+writeChar :: Lens' (TextCursor line) Int -> (Int -> Int) -> Char -> Int -> EditText line ()
+writeChar lens topMinus c diff = do
+  i   <- topMinus <$> use (bufferCurrentLine . lens)
+  buf <- use $ bufferCurrentLine . lineEditBuffer
+  liftIO $ UMVec.write buf i c
+  bufferCurrentLine . lens += diff
+  
 -- | Insert a single character. If the 'lineBreakPredicate' function evaluates to 'Prelude.True',
 -- meaning the given character is a line breaking character, this function does nothing. To insert
 -- line breaks, using 'insertString'.
@@ -558,22 +558,21 @@ insertChar
   => RelativeToCursor -> Char -> editor line ()
 insertChar rel c = liftEditText $ do
   isBreak <- use $ bufferLineBreaks . lineBreakPredicate
-  if isBreak c then return () else case rel of
-    Before -> bufferCurrentLine . textCursorBefore %= subCursorAppend  c
-    After  -> bufferCurrentLine . textCursorAfter  %= subCursorPrepend c
+  if isBreak c then return () else do
+    growIfTooSmall 1
+    cur <- use bufferCurrentLine
+    let buf = cur ^. lineEditBuffer
+    let len = UMVec.length buf
+    case rel of
+      Before -> writeChar charsBeforeCursor id c 1
+      After  -> writeChar charsAfterCursor (len -) c (-1)
 
 -- | This function only deletes characters on the current line, if the cursor is at the start of the
 -- line and you evaluate @'deleteChars' 'Before'@, this function does nothing.
 deleteChars
   :: (MonadEditText editor, Monad (editor line))
   => RelativeToCursor -> Int -> editor line ()
-deleteChars rel n = liftEditText $ case rel of
-  Before -> bufferCurrentLine . textCursorBefore %= \ str ->
-    let count = theSubCursorLength str in
-    if n >= count then mempty else subCursorDropRight (count - n) str
-  After  -> bufferCurrentLine . textCursorAfter  %= \ str ->
-    let count = theSubCursorLength str in
-    if n >= count then mempty else subCursorDropLeft  n str
+deleteChars = error "TODO: deleteChars"
 
 -- | This function deletes characters starting from the cursor, and if the number of characters to
 -- be deleted exceeds the number of characters in the current line, characters are deleted from
@@ -582,7 +581,7 @@ deleteChars rel n = liftEditText $ case rel of
 deleteCharsWrap
   :: (MonadEditText editor, Monad (editor line))
   => RelativeToCursor -> Int -> editor line ()
-deleteCharsWrap rel n = error "TODO: deleteCharsWrap"
+deleteCharsWrap = error "TODO: deleteCharsWrap"
 
 -- | This function evaluates the 'lineBreaker' function on the given string, and beginning from the
 -- current cursor position, begins inserting all the lines of text produced by the 'lineBreaker'
@@ -590,4 +589,4 @@ deleteCharsWrap rel n = error "TODO: deleteCharsWrap"
 insertString
   :: (MonadEditText editor, Monad (editor line))
   => RelativeToCursor -> Int -> editor line ()
-insertString str = error "TODO: insertString"
+insertString = error "TODO: insertString"
