@@ -549,6 +549,20 @@ writeChar lens topMinus c diff = do
   buf <- use $ bufferCurrentLine . lineEditBuffer
   liftIO $ UMVec.write buf i c
   bufferCurrentLine . lens += diff
+
+-- Not for export: these functions, when evaluated alone, leave the 'TextBuffer' in an inconsistent
+-- state. This function creates a 'TextLine' from the 'TextCursor' stored at 'bufferCurrentLine'. It
+-- does nothing to replace the 'bufferCurrentLine', so essentially the line is duplicated and pushed
+-- upward or downward, and it is then up to the calling context whether to open a new line, or
+-- replace the current line with a line above or below.
+pushCurrentLine :: RelativeToCursor -> EditText line ()
+pushCurrentLine rel = do
+  line <- use bufferCurrentLine >>= liftIO . unsafeMakeLine
+  case rel of
+    Before -> bufferAboveCursor %= (|> line)
+    After  -> bufferBelowCursor %= (line <|)
+
+----------------------------------------------------------------------------------------------------
   
 -- | Insert a single character. If the 'lineBreakPredicate' function evaluates to 'Prelude.True',
 -- meaning the given character is a line breaking character, this function does nothing. To insert
@@ -572,7 +586,11 @@ insertChar rel c = liftEditText $ do
 deleteChars
   :: (MonadEditText editor, Monad (editor line))
   => RelativeToCursor -> Int -> editor line ()
-deleteChars = error "TODO: deleteChars"
+deleteChars rel n = liftEditText $ do
+  let del = max 0 . subtract (max 0 n)
+  bufferCurrentLine %= case rel of
+    Before -> charsBeforeCursor %~ del
+    After  -> charsAfterCursor  %~ del
 
 -- | This function deletes characters starting from the cursor, and if the number of characters to
 -- be deleted exceeds the number of characters in the current line, characters are deleted from
