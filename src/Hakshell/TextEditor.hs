@@ -78,6 +78,7 @@ import           Hakshell.String
 import           Control.Arrow
 import           Control.Lens
 import           Control.Monad.Except
+import           Control.Monad.Primitive
 import           Control.Monad.State
 
 import qualified Data.ByteString             as Strict
@@ -88,6 +89,7 @@ import           Data.Foldable               (toList)
 import           Data.Semigroup
 import qualified Data.Sequence               as Seq
 import qualified Data.Vector.Unboxed.Mutable as UMVec
+import qualified Data.Vector.Generic.Mutable as GMVec
 
 ----------------------------------------------------------------------------------------------------
 
@@ -530,28 +532,36 @@ relativeToChar :: RelativeToCursor -> Lens' (TextBuffer line) Int
 relativeToChar =
   (bufferCurrentLine .) . \ case { Before -> charsBeforeCursor; After -> charsAfterCursor; }
 
+-- Not for export: unsafe, requires correct accounting of cursor positions, otherwise segfaults may
+-- occur. Cursor is implemented by keeping a mutable array in which elements before the cursor fill
+-- the array from index zero up to the cursor, and the elements after the cursror fill the array
+-- from the top-most index of the array down to the index computed from the top-most index of the
+-- array subtracted by the total number of elements in the array plus the cursor position.
+growVec
+  :: (GMVec.MVector vector a, PrimMonad m)
+  => vector (PrimState m) a
+  -> Int -> Int -> Int -> m (vector (PrimState m) a)
+growVec vec beforeElems afterElems addElems = do
+  let reqSize = beforeElems + afterElems + addElems
+  let len = GMVec.length vec
+  if reqSize <= len then return vec else do
+    let newSize = head $ dropWhile (< reqSize) $ iterate (* 2) len
+    newVec <- GMVec.new newSize
+    GMVec.copy (GMVec.slice 0 beforeElems newVec) (GMVec.slice 0 beforeElems vec)
+    GMVec.copy
+      (GMVec.slice (len - afterElems) (len - 1) newVec)
+      (GMVec.slice (len - afterElems) (len - 1) vec)
+    return newVec
+
 -- Not for export: should be executed automatically by insertion operations. Increases the size of
 -- the 'lineEditBuffer' to be large enough to contain the current 'textCursorCharCount' plus the
 -- given number of elements.
 growIfTooSmall :: Int -> EditText line ()
-growIfTooSmall increase = do
+growIfTooSmall grow = do
   cur <- use bufferCurrentLine
-  let buf    = cur ^. lineEditBuffer
-  let filled = textCursorCharCount cur + max 0 increase
-  let len    = UMVec.length buf :: Int
-  let newlen = head $ dropWhile (<= filled) $ iterate (* 2) len
-  let lower  = cur ^. charsBeforeCursor
-  let upper  = cur ^. charsAfterCursor
-  if len > filled then return () else
-    ( liftIO $ do
-        newbuf <- UMVec.new newlen
-        -- TODO: switch to 'unsafe' after testing
-        liftIO $ UMVec.copy (UMVec.slice 0 lower newbuf) (UMVec.slice 0 lower buf)
-        liftIO $ UMVec.copy
-          (UMVec.slice (len - upper) (len - 1) newbuf)
-          (UMVec.slice (len - upper) (len - 1) buf)
-        return newbuf
-    ) >>= assign (bufferCurrentLine . lineEditBuffer)
+  buf <- liftIO $
+    growVec (cur ^. lineEditBuffer) (cur ^. charsBeforeCursor) (cur ^. charsAfterCursor) grow
+  bufferCurrentLine . lineEditBuffer .= buf
 
 -- Not for export: these functions, when evaluated alone, leave the 'TextBuffer' in an inconsistent
 -- state. This function creates a 'TextLine' from the 'TextCursor' stored at 'bufferCurrentLine'. It

@@ -36,6 +36,7 @@ dependencies:
 - lens
 - linear
 - mtl
+- primitive
 - process
 - semigroups
 - time
