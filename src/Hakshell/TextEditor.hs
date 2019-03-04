@@ -50,7 +50,7 @@ module Hakshell.TextEditor
   ( -- * Text Editing API
     MonadEditText(..), MonadEditLine(..),
     RelativeToCursor(..),
-    insertChar, deleteChars, deleteCharsWrap, insertString, 
+    clearCurrentLine, insertChar, deleteChars, deleteCharsWrap, insertString, 
     -- * Text Editor Function Types
     EditText, runEditText, newTextBuffer, newTextCursor,
     FoldMapLines, runFoldMapLines, execFoldMapLines, evalFoldMapLines,
@@ -63,7 +63,7 @@ module Hakshell.TextEditor
     TextBuffer, LineBreaker(..), lineBreaker, lineBreakPredicate,
     theBufferCharCount, theBufferCharNumber,
     theBufferLineCount, theBufferLineNumber,
-    bufferAboveCursor, bufferLineBreaks, bufferCurrentLine, bufferBelowCursor, textLineString,
+    bufferCurrentLine, textLineString,
     lineBreakNLCR,
     -- ** Line Editing
     TextLine, TextCursor, textCursorCharCount, textLineTags,
@@ -88,8 +88,9 @@ import qualified Data.ByteString.Lazy.UTF8   as UTF8lz
 import           Data.Foldable               (toList)
 import           Data.Semigroup
 import qualified Data.Sequence               as Seq
-import qualified Data.Vector.Unboxed.Mutable as UMVec
+import qualified Data.Vector.Mutable         as MVec
 import qualified Data.Vector.Generic.Mutable as GMVec
+import qualified Data.Vector.Unboxed.Mutable as UMVec
 
 ----------------------------------------------------------------------------------------------------
 
@@ -255,14 +256,15 @@ data TextBuffer line
     , theBufferLineBreaker :: LineBreaker
       -- ^ The function used to break strings into lines. This function is called every time a
       -- string is transferred from 'theBufferCursor' to to 'theLinesAbove' or 'theLinesBelow'.
-    , theBufferAboveCursor :: !(Seq.Seq (TextLine line))
-      -- ^ Lines above the cursor
+    , theBufferVector      :: !(MVec.IOVector (TextLine line))
+      -- ^ A mutable vector containing each line of editable text.
+    , theLinesAboveCursor  :: !Int
+      -- ^ The number of lines above the cursor
+    , theLinesBelowCursor  :: !Int
+      -- ^ The number of line below the cursor
     , theBufferCursor      :: !(TextCursor line)
       -- ^ A data structure for editing individual characters in a line of text.
-    , theBufferBelowCursor :: !(Seq.Seq (TextLine line))
-      -- ^ Lines below the cursor
     }
-  deriving Functor
 
 data TextEditError
   = TextEditError StrictBytes
@@ -338,6 +340,7 @@ charsAfterCursor = lens theCharsAfterCursor $ \ a b -> a{ theCharsAfterCursor = 
 newTextBuffer :: line -> IO (TextBuffer line)
 newTextBuffer tag = do
   cur <- newTextCursor tag
+  buf <- MVec.new 512
   return TextBuffer
     { theBufferCharNumber  = 0
     , theBufferCharCount   = 0
@@ -345,9 +348,10 @@ newTextBuffer tag = do
     , theBufferLineCount   = 0
     , theBufferDefaultTag  = tag
     , theBufferLineBreaker = lineBreakNLCR
-    , theBufferAboveCursor = mempty
+    , theBufferVector      = buf
+    , theLinesAboveCursor  = 0
+    , theLinesBelowCursor  = 0
     , theBufferCursor      = cur
-    , theBufferBelowCursor = mempty
     }
 
 -- | Use this to initialize a new empty 'TextCursor'. This is usually only handy if you want to
@@ -446,19 +450,21 @@ lineBreakPredicate = lens theLineBreakPredicate $ \ a b -> a{ theLineBreakPredic
 lineBreaker :: Lens' LineBreaker (String -> [String])
 lineBreaker = lens theLineBreaker $ \ a b -> a{ theLineBreaker = b }
 
--- | Lines above the 'bufferCurrentLine' in the 'TextBuffer'. Note that this list is reversed, so if
--- the current line is at the end of the file, the entire file consists of all lines in this field
--- in reverse order from the direction in which they were read.
-bufferAboveCursor :: Lens' (TextBuffer line) (Seq.Seq (TextLine line))
-bufferAboveCursor = lens theBufferAboveCursor $ \ a b -> a{ theBufferAboveCursor = b }
+-- Not for export: requires correct accounting of line numbers to avoid segment faults.
+linesAboveCursor :: Lens' (TextBuffer line) Int
+linesAboveCursor = lens theLinesAboveCursor $ \ a b -> a{ theLinesAboveCursor = b }
+
+-- Not for export: requires correct accounting of line numbers to avoid segment faults.
+linesBelowCursor :: Lens' (TextBuffer line) Int
+linesBelowCursor = lens theLinesBelowCursor $ \ a b -> a{ theLinesBelowCursor = b }
+
+-- Not for export: the vector containing all the lines of text in this buffer.
+bufferVector :: Lens' (TextBuffer line) (MVec.IOVector (TextLine line))
+bufferVector = lens theBufferVector $ \ a b -> a{ theBufferVector = b }
 
 -- | The current line of text being edited under the cursor.
 bufferCurrentLine :: Lens' (TextBuffer line) (TextCursor line)
 bufferCurrentLine = lens theBufferCursor $ \ a b -> a{ theBufferCursor = b }
-
--- | Lines below the 'bufferCurrentLine'.
-bufferBelowCursor :: Lens' (TextBuffer line) (Seq.Seq (TextLine line))
-bufferBelowCursor = lens theBufferBelowCursor $ \ a b -> a{ theBufferBelowCursor = b }
 
 -- | The null-terminated, UTF-8 encoded string of bytes stored in this line of text.
 textLineString :: Lens' (TextLine line) StrictBytes
@@ -522,8 +528,8 @@ data RelativeToCursor = Before | After
 
 -- Not for export: This function takes a 'RelativeToCursor' value and constructs a lens that can be
 -- used to access 'TextLine's within the 'TextCursor'.
-relativeToLine :: RelativeToCursor -> Lens' (TextBuffer line) (Seq.Seq (TextLine line))
-relativeToLine = \ case { Before -> bufferAboveCursor; After -> bufferBelowCursor; }
+relativeToLine :: RelativeToCursor -> Lens' (TextBuffer line) Int
+relativeToLine = \ case { Before -> linesAboveCursor; After -> linesBelowCursor; }
   -- This function may dissapear if I decide to buffer lines in a mutable vector.
 
 -- Not for export: This function takes a 'RelativeToCursor' value and constructs a lens that can be
@@ -531,6 +537,12 @@ relativeToLine = \ case { Before -> bufferAboveCursor; After -> bufferBelowCurso
 relativeToChar :: RelativeToCursor -> Lens' (TextBuffer line) Int
 relativeToChar =
   (bufferCurrentLine .) . \ case { Before -> charsBeforeCursor; After -> charsAfterCursor; }
+
+-- Get an index into the 'bufferVector' from the current position of the cursor.
+cursorIndex :: RelativeToCursor -> EditText line Int
+cursorIndex = \ case
+  Before -> use linesAboveCursor
+  After  -> (-) <$> (MVec.length <$> use bufferVector) <*> (subtract 1 <$> use linesBelowCursor)
 
 -- Not for export: unsafe, requires correct accounting of cursor positions, otherwise segfaults may
 -- occur. Cursor is implemented by keeping a mutable array in which elements before the cursor fill
@@ -556,12 +568,19 @@ growVec vec beforeElems afterElems addElems = do
 -- Not for export: should be executed automatically by insertion operations. Increases the size of
 -- the 'lineEditBuffer' to be large enough to contain the current 'textCursorCharCount' plus the
 -- given number of elements.
-growIfTooSmall :: Int -> EditText line ()
-growIfTooSmall grow = do
+growLineIfTooSmall :: Int -> EditText line ()
+growLineIfTooSmall grow = do
   cur <- use bufferCurrentLine
   buf <- liftIO $
     growVec (cur ^. lineEditBuffer) (cur ^. charsBeforeCursor) (cur ^. charsAfterCursor) grow
   bufferCurrentLine . lineEditBuffer .= buf
+
+growBufferIfTooSmall :: Int -> EditText line ()
+growBufferIfTooSmall grow = do
+  buf   <- use bufferVector
+  above <- use linesAboveCursor
+  below <- use linesBelowCursor
+  liftIO (growVec buf above below grow) >>= assign bufferVector
 
 -- Not for export: these functions, when evaluated alone, leave the 'TextBuffer' in an inconsistent
 -- state. This function creates a 'TextLine' from the 'TextCursor' stored at 'bufferCurrentLine'. It
@@ -569,14 +588,17 @@ growIfTooSmall grow = do
 -- upward or downward, and it is then up to the calling context whether to open a new line, or
 -- replace the current line with a line above or below.
 pushCurrentLine :: RelativeToCursor -> EditText line ()
-pushCurrentLine rel = do
-  line <- use bufferCurrentLine >>= liftIO . unsafeMakeLine
-  case rel of
-    Before -> bufferAboveCursor %= (|> line)
-    After  -> bufferBelowCursor %= (line <|)
+pushCurrentLine rel = growBufferIfTooSmall 1 >>
+  (MVec.write <$> use bufferVector <*> cursorIndex rel <*>
+    (use bufferCurrentLine >>= liftIO . unsafeMakeLine)) >>= liftIO
 
 ----------------------------------------------------------------------------------------------------
-  
+
+-- | Delete the current line, replacing it with a new empty line.
+clearCurrentLine :: (MonadEditText editor, Monad (editor line)) => editor line ()
+clearCurrentLine = liftEditText $
+  use bufferDefaultTag >>= liftIO . newTextCursor >>= assign bufferCurrentLine
+
 -- | Insert a single character. If the 'lineBreakPredicate' function evaluates to 'Prelude.True',
 -- meaning the given character is a line breaking character, this function does nothing. To insert
 -- line breaks, using 'insertString'.
@@ -586,7 +608,7 @@ insertChar
 insertChar rel c = liftEditText $ do
   isBreak <- use $ bufferLineBreaks . lineBreakPredicate
   if isBreak c then return () else do
-    growIfTooSmall 1
+    growLineIfTooSmall 1
     cur <- use bufferCurrentLine
     let buf = cur ^. lineEditBuffer
     let len = UMVec.length buf
