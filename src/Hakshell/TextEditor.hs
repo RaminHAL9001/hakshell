@@ -518,6 +518,18 @@ instance MonadEditLine (FoldMapLines fold) where { liftEditLine = foldMapChars .
 data RelativeToCursor = Before | After
   deriving (Eq, Ord, Read, Show, Bounded, Enum)
 
+-- Not for export: This function takes a 'RelativeToCursor' value and constructs a lens that can be
+-- used to access 'TextLine's within the 'TextCursor'.
+relativeToLine :: RelativeToCursor -> Lens' (TextBuffer line) (Seq.Seq (TextLine line))
+relativeToLine = \ case { Before -> bufferAboveCursor; After -> bufferBelowCursor; }
+  -- This function may dissapear if I decide to buffer lines in a mutable vector.
+
+-- Not for export: This function takes a 'RelativeToCursor' value and constructs a lens that can be
+-- used to access a character index within the 'bufferCurrentLine'.
+relativeToChar :: RelativeToCursor -> Lens' (TextBuffer line) Int
+relativeToChar =
+  (bufferCurrentLine .) . \ case { Before -> charsBeforeCursor; After -> charsAfterCursor; }
+
 -- Not for export: should be executed automatically by insertion operations. Increases the size of
 -- the 'lineEditBuffer' to be large enough to contain the current 'textCursorCharCount' plus the
 -- given number of elements.
@@ -540,15 +552,6 @@ growIfTooSmall increase = do
           (UMVec.slice (len - upper) (len - 1) buf)
         return newbuf
     ) >>= assign (bufferCurrentLine . lineEditBuffer)
-
--- Not for export: should be executed automatically by insertion operations. This function is
--- necessary because it's pretty much fucking impossible to use @let@ bindings to bind lenses.
-writeChar :: Lens' (TextCursor line) Int -> (Int -> Int) -> Char -> Int -> EditText line ()
-writeChar lens topMinus c diff = do
-  i   <- topMinus <$> use (bufferCurrentLine . lens)
-  buf <- use $ bufferCurrentLine . lineEditBuffer
-  liftIO $ UMVec.write buf i c
-  bufferCurrentLine . lens += diff
 
 -- Not for export: these functions, when evaluated alone, leave the 'TextBuffer' in an inconsistent
 -- state. This function creates a 'TextLine' from the 'TextCursor' stored at 'bufferCurrentLine'. It
@@ -577,20 +580,18 @@ insertChar rel c = liftEditText $ do
     cur <- use bufferCurrentLine
     let buf = cur ^. lineEditBuffer
     let len = UMVec.length buf
-    case rel of
-      Before -> writeChar charsBeforeCursor id c 1
-      After  -> writeChar charsAfterCursor (len -) c (-1)
+    let (diff, topMinus) = case rel of { Before -> (1, id); After -> ((-1), (len -)); }
+    i   <- topMinus <$> use (relativeToChar rel)
+    buf <- use $ bufferCurrentLine . lineEditBuffer
+    liftIO $ UMVec.write buf i c
+    relativeToChar rel += diff
 
 -- | This function only deletes characters on the current line, if the cursor is at the start of the
 -- line and you evaluate @'deleteChars' 'Before'@, this function does nothing.
 deleteChars
   :: (MonadEditText editor, Monad (editor line))
   => RelativeToCursor -> Int -> editor line ()
-deleteChars rel n = liftEditText $ do
-  let del = max 0 . subtract (max 0 n)
-  bufferCurrentLine %= case rel of
-    Before -> charsBeforeCursor %~ del
-    After  -> charsAfterCursor  %~ del
+deleteChars rel n = liftEditText $ relativeToChar rel %= max 0 . subtract (max 0 n)
 
 -- | This function deletes characters starting from the cursor, and if the number of characters to
 -- be deleted exceeds the number of characters in the current line, characters are deleted from
