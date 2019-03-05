@@ -361,7 +361,7 @@ newTextBuffer tag = do
 -- initializing tag value of type @line@.
 newTextCursor :: line -> IO (TextCursor line)
 newTextCursor tag = do
-  buf <- UMVec.replicate 1024 '\0'
+  buf <- UMVec.new 1024
   return TextCursor
     { theLineEditBuffer    = buf
     , theCharsBeforeCursor = 0
@@ -588,13 +588,47 @@ growBufferIfTooSmall grow = do
 -- upward or downward, and it is then up to the calling context whether to open a new line, or
 -- replace the current line with a line above or below.
 pushCurrentLine :: RelativeToCursor -> EditText line ()
-pushCurrentLine rel = growBufferIfTooSmall 1 >>
-  (MVec.write <$> use bufferVector <*> cursorIndex rel <*>
-    (use bufferCurrentLine >>= liftIO . unsafeMakeLine)) >>= liftIO
+pushCurrentLine rel = do
+  growBufferIfTooSmall 1
+  MVec.write <$> use bufferVector <*> cursorIndex rel <*> copyCurrentLine >>= liftIO
+  relativeToLine rel += 1
 
 ----------------------------------------------------------------------------------------------------
 
--- | Delete the current line, replacing it with a new empty line.
+-- | Create a copy of the 'bufferCurrentLine'.
+copyCurrentLine :: (MonadEditText editor, Monad (editor line)) => editor line (TextLine line)
+copyCurrentLine = liftEditText $ use bufferCurrentLine >>= liftIO . unsafeMakeLine
+
+-- | Create a new 'TextCursor' from a 'TextLine'. The 'TextCursor' can be updated with an 'EditLine'
+-- function.
+newCursorFromLine :: MonadIO m => Int -> TextLine line -> m (TextCursor line)
+newCursorFromLine cur line = liftIO $ do
+  let str = line ^. textLineString
+  let len = UTF8st.length str
+  cur <- pure $ min len $ max 0 cur
+  let (before, after) = splitAt cur $ unpack str
+  let (lenBefore, lenAfter) = (length before, length after)
+  let strlen = lenBefore + lenAfter
+  let len = head $ takeWhile (< strlen) $ iterate (* 2) 1024
+  buf <- UMVec.new len
+  forM_ (zip [0 .. lenBefore - 1] before) $ uncurry $ UMVec.write buf
+  forM_ (zip [len - lenAfter .. len - 1] after) $ uncurry $ UMVec.write buf
+  return TextCursor
+    { theLineEditBuffer = buf
+    , theCharsBeforeCursor = lenBefore
+    , theCharsAfterCursor  = lenAfter
+    , theTextCursorTag     = theTextLineTags line
+    }
+
+-- | Delete the 'bufferCurrentLine' and replace it with the given 'TextLine'. Pass an integer value
+-- indicating where the cursor position should be set.
+replaceCurrentLine
+  :: (MonadEditText editor, Monad (editor line))
+  => Int -> TextLine line -> editor line ()
+replaceCurrentLine cur line = liftEditText $
+  newCursorFromLine cur line >>= assign bufferCurrentLine
+
+-- | Delete the 'bufferCurrentLine', replacing it with a new empty line.
 clearCurrentLine :: (MonadEditText editor, Monad (editor line)) => editor line ()
 clearCurrentLine = liftEditText $
   use bufferDefaultTag >>= liftIO . newTextCursor >>= assign bufferCurrentLine
