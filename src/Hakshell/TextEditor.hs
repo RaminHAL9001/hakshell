@@ -50,7 +50,8 @@ module Hakshell.TextEditor
   ( -- * Text Editing API
     MonadEditText(..), MonadEditLine(..),
     RelativeToCursor(..),
-    clearCurrentLine, insertChar, deleteChars, deleteCharsWrap, insertString, 
+    copyCurrentLine, newCursorFromLine, replaceCurrentLine, clearCurrentLine,
+    insertChar, deleteChars, deleteCharsWrap, insertString, 
     -- * Text Editor Function Types
     EditText, runEditText, newTextBuffer, newTextCursor,
     FoldMapLines, runFoldMapLines, execFoldMapLines, evalFoldMapLines,
@@ -70,7 +71,9 @@ module Hakshell.TextEditor
     -- ** Errors
     TextEditError(..),
     -- * Re-exporting "Hakshell.String"
-    module Hakshell.String
+    module Hakshell.String,
+    -- * Re-exporting "Control.Monad.State.Class"
+    module Control.Monad.State.Class,
   ) where
 
 import           Hakshell.String
@@ -80,6 +83,7 @@ import           Control.Lens
 import           Control.Monad.Except
 import           Control.Monad.Primitive
 import           Control.Monad.State
+import           Control.Monad.State.Class
 
 import qualified Data.ByteString             as Strict
 import qualified Data.ByteString.UTF8        as UTF8st
