@@ -51,7 +51,8 @@ module Hakshell.TextEditor
     MonadEditText(..), MonadEditLine(..),
     RelativeToCursor(..),
     copyCurrentLine, newCursorFromLine, replaceCurrentLine, clearCurrentLine,
-    insertChar, deleteChars, deleteCharsWrap, insertString, 
+    moveCursorLine, moveCursorChar,
+    insertChar, deleteChars, deleteCharsWrap, insertString,
     -- * Text Editor Function Types
     EditText, runEditText, newTextBuffer, newTextCursor,
     FoldMapLines, runFoldMapLines, execFoldMapLines, evalFoldMapLines,
@@ -391,6 +392,32 @@ unsafeMakeLine cur = do
     , theTextLineTags   = theTextCursorTag cur
     }
 
+-- | Create a new 'TextCursor' from a 'TextLine'. The 'TextCursor' can be updated with an 'EditLine'
+-- function. Note that this function works in any monadic function type @m@ which instantiates
+-- 'Control.Monad.IO.Class.MonadIO', so this will work in the @IO@ monad, the 'EditText' monad, the
+-- 'EditLine' monad, and in other contexts as well.
+newCursorFromLine :: MonadIO m => Int -> TextLine tags -> m (TextCursor tags)
+newCursorFromLine cur line = liftIO $ do
+  -- This function is safe to export because we assume a 'TextLine' never contains more than one
+  -- line terminator, and always only at the end of the buffer. The 'TextLine' constructor is not
+  -- exported.
+  let str = line ^. textLineString
+  let len = UTF8st.length str
+  cur <- pure $ min len $ max 0 cur
+  let (before, after) = splitAt cur $ unpack str
+  let (lenBefore, lenAfter) = (length before, length after)
+  let strlen = lenBefore + lenAfter
+  let len = head $ takeWhile (< strlen) $ iterate (* 2) 1024
+  buf <- UMVec.new len
+  forM_ (zip [0 .. lenBefore - 1] before) $ uncurry $ UMVec.write buf
+  forM_ (zip [len - lenAfter .. len - 1] after) $ uncurry $ UMVec.write buf
+  return TextCursor
+    { theLineEditBuffer = buf
+    , theCharsBeforeCursor = lenBefore
+    , theCharsAfterCursor  = lenAfter
+    , theTextCursorTag     = theTextLineTags line
+    }
+
 -- | This is the default line break function. It will split the line on the character sequence
 -- @"\n"@, or @"\r"@, or @"\n\r"@, or @"\r\n"@. The line terminators must be included at the end of
 -- each broken string, so that the rule that the law @'Prelude.concat' ('lineBreakNLCR' str) == str@
@@ -549,10 +576,10 @@ cursorIndex = \ case
   After  -> (-) <$> (MVec.length <$> use bufferVector) <*> (subtract 1 <$> use linesBelowCursor)
 
 -- Not for export: unsafe, requires correct accounting of cursor positions, otherwise segfaults may
--- occur. Cursor is implemented by keeping a mutable array in which elements before the cursor fill
--- the array from index zero up to the cursor, and the elements after the cursror fill the array
--- from the top-most index of the array down to the index computed from the top-most index of the
--- array subtracted by the total number of elements in the array plus the cursor position.
+-- occur. The cursor is implemented by keeping a mutable array in which elements before the cursor
+-- fill the array from index zero up to the cursor, and the elements after the cursror fill the
+-- array from the top-most index of the array down to the index computed from the top-most index of
+-- the array subtracted by the total number of elements in the array plus the cursor position.
 growVec
   :: (GMVec.MVector vector a, PrimMonad m)
   => vector (PrimState m) a
@@ -603,27 +630,6 @@ pushCurrentLine rel = do
 copyCurrentLine :: (MonadEditText editor, Monad (editor tags)) => editor tags (TextLine tags)
 copyCurrentLine = liftEditText $ use bufferCurrentLine >>= liftIO . unsafeMakeLine
 
--- | Create a new 'TextCursor' from a 'TextLine'. The 'TextCursor' can be updated with an 'EditLine'
--- function.
-newCursorFromLine :: MonadIO m => Int -> TextLine tags -> m (TextCursor tags)
-newCursorFromLine cur line = liftIO $ do
-  let str = line ^. textLineString
-  let len = UTF8st.length str
-  cur <- pure $ min len $ max 0 cur
-  let (before, after) = splitAt cur $ unpack str
-  let (lenBefore, lenAfter) = (length before, length after)
-  let strlen = lenBefore + lenAfter
-  let len = head $ takeWhile (< strlen) $ iterate (* 2) 1024
-  buf <- UMVec.new len
-  forM_ (zip [0 .. lenBefore - 1] before) $ uncurry $ UMVec.write buf
-  forM_ (zip [len - lenAfter .. len - 1] after) $ uncurry $ UMVec.write buf
-  return TextCursor
-    { theLineEditBuffer = buf
-    , theCharsBeforeCursor = lenBefore
-    , theCharsAfterCursor  = lenAfter
-    , theTextCursorTag     = theTextLineTags line
-    }
-
 -- | Delete the 'bufferCurrentLine' and replace it with the given 'TextLine'. Pass an integer value
 -- indicating where the cursor position should be set.
 replaceCurrentLine
@@ -636,6 +642,63 @@ replaceCurrentLine cur line = liftEditText $
 clearCurrentLine :: (MonadEditText editor, Monad (editor tags)) => editor tags ()
 clearCurrentLine = liftEditText $
   use bufferDefaultTag >>= liftIO . newTextCursor >>= assign bufferCurrentLine
+
+-- Not for export: exposes structure of internal mutable vector. Moves a region of elements near the
+-- cursor from top to bottom, or from bottom to top. Negative value for select indicates to select
+-- elements before the cursor, positive means after the cursor. Returns updated before and after
+-- values.
+shiftElems
+  :: (GMVec.MVector vector a, PrimMonad m)
+  => a -> vector (PrimState m) a -> Int -> Int -> Int -> m (Int, Int)
+shiftElems nil vec select before after =
+  if select == 0
+  then noop
+  else if select == 1
+  then if after  == 0 then noop else
+    GMVec.read vec after  >>= GMVec.write vec before >> GMVec.write vec after nil >> done
+  else if select == (-1)
+  then if before == 0 then noop else
+    GMVec.read vec before >>= GMVec.write vec after >> GMVec.write vec before nil >> done
+  else if select > 1
+  then GMVec.move lower upper >> clear upper >> done
+  else if select < 1
+  then GMVec.move upper lower >> clear lower >> done
+  else error "shiftElems: this should never happen"
+  where
+    len  = GMVec.length vec
+    noop = return (before, after)
+    done = return (before + select, after - select)
+    clamp i = max 0 $ min i $ len - 1
+    slice a b = (if a < b then GMVec.slice a b else GMVec.slice b a) vec
+    upper = slice after  $ clamp $ after  + select
+    lower = slice before $ clamp $ before + select
+    clear slice = forM_ [0 .. GMVec.length slice - 1] $ flip (GMVec.write slice) nil
+
+-- | Move the cursor to a different line by an @n :: Int@ number of lines. A negative @n@ indicates
+-- moving the cursor toward the start of the buffer, a positive @n@ indicates moving the cursor
+-- toward the end of the buffer.
+moveCursorLine
+  :: (MonadEditText editor, Monad (editor tags))
+  => Int -> editor tags ()
+moveCursorLine select = liftEditText $ do
+  vec <- use bufferVector
+  (before, after) <- (,) <$> use linesAboveCursor <*> use linesBelowCursor >>=
+    liftIO . uncurry (shiftElems (error "empty line") vec select)
+  linesAboveCursor .= before
+  linesBelowCursor .= after
+
+-- | Move the cursor to a different character position within the 'bufferCurrentLine' by an @n ::
+-- Int@ number of characters. A negative @n@ indicates moving toward the start of the line, a
+-- positive @n@ indicates moving toward the end of the line.
+moveCursorChar
+  :: (MonadEditLine editor, Monad (editor tags))
+  => Int -> editor tags ()
+moveCursorChar select = liftEditLine $ do
+  vec <- use lineEditBuffer
+  (before, after) <- (,) <$> use charsBeforeCursor <*> use charsAfterCursor >>=
+    liftIO . uncurry (shiftElems '\0' vec select)
+  charsBeforeCursor .= before
+  charsAfterCursor  .= after
 
 -- | Insert a single character. If the 'lineBreakPredicate' function evaluates to 'Prelude.True',
 -- meaning the given character is a line breaking character, this function does nothing. To insert
