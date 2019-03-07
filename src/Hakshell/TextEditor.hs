@@ -21,43 +21,47 @@
 -- also used throughout the UNIX system, but as often as possible there are tools for representing
 -- the binary information as text, and even re-constructing binary from it's textual representation.
 --
--- Bash still has extensive commands for manipulating text. Much of this functionality, for example,
--- Globs and Regular Expressions, are in fact a wrapper around the same libraries used by the text
--- editor programs, the only difference is that in Bash these functions are invoked through the
--- various Bash programming language features (often embedded in bash syntax, like when you run the
--- command @ls *@), where as in an editor like Vi or Emacs, these functions are invoked
--- interactively, for example, when doing an interactive text search/replace operation.
+-- Bash still has extensive commands for manipulating text. Much of this functionality within Bash,
+-- for example, Globs and Regular Expressions, are also provided by the text editor programs -- it
+-- may even be possible for both Bash and an editor like Vi to use the exact same glob pattern
+-- implementation by linking these Bash or Vi against a glob pattern library. The only difference is
+-- the end users see is that in Bash, these functions are invoked through the various Bash
+-- programming language features (often embedded in bash syntax, like when you run the command @ls
+-- *@), where as in an editor like Vi or Emacs, these functions are invoked interactively, for
+-- example, when doing an interactive text search/replace operation.
 --
 -- Emacs itself further eliminates the distinction between shell and text editor. It is even
 -- arguable as to whether Emacs is a text editor at all. Some people jokingly refer to it as an
 -- "operating system that lacks a useful text editor." A more accurate description of Emacs would be
 -- a "Lisp interpreter that allows one to easily invent various text editors for various specific
--- use cases." You could also call Emacs an IDE, or an app platform, both of which require text
--- editing facilities. Emacs also has very good shell integration: there are commands that execute
--- shell commands with buffered text as input, and capturing the output text of the process back
--- into a buffer.
+-- use cases." You could also call Emacs an IDE, or an app platform, both of which have their text
+-- editing facilities provided for by the Emacs text editor functionality. Emacs also has very good
+-- shell integration: there are commands that execute shell commands with buffered text as input,
+-- and capturing the output text of the process back into a buffer.
 --
--- Emacs is, in many ways, can perform all the same functions as Bash, while providing additional
--- interactive feautres. Emacs is therefore a more advanced system shell with integrated text
--- editing features. It is possible, although not commonly done, to use Emacs in place of bash as
--- the login shell process, and anyone logging in to the system would have no difficulty using any
--- and all of the services provided to them by the server.
+-- Emacs can, to a great extent, perform most all of the same functions as Bash, while providing
+-- countless additional interactive feautres. Emacs is therefore a more advanced system shell with
+-- integrated text editing features. It is possible, although not commonly done, to use Emacs in
+-- place of bash as the login shell process, and anyone logging in to the system would have no
+-- difficulty using any and all of the services provided to them by the server.
 --
 -- The "Hakshell.TextEditor" module is therefore designed to provide a solid, consistent foundation
 -- for automated text processing APIs, upon which programmers can build text editors and text
--- processors, and hence it is an integral part of the "Hakshell" library.
+-- processors, and hence a text editor API is an integral part of the "Hakshell" library.
 module Hakshell.TextEditor
   ( -- * Text Editing API
-    MonadEditText(..), MonadEditLine(..),
+    -- ** Create and Start Editing a 'TextBuffer'
+    newTextBuffer, runEditText, runMapLines, runFoldMapLines, execFoldMapLines, evalFoldMapLines,
+    -- ** Text Editing Combinators
     RelativeToCursor(..),
     copyCurrentLine, newCursorFromLine, replaceCurrentLine, clearCurrentLine,
     moveCursorLine, moveCursorChar,
     insertChar, deleteChars, deleteCharsWrap, insertString,
-    -- * Text Editor Function Types
-    EditText, runEditText, newTextBuffer, newTextCursor,
-    FoldMapLines, runFoldMapLines, execFoldMapLines, evalFoldMapLines,
-    MapLines, runMapLines,
-    EditLine, editLine,
+    -- ** Text Editing Typeclasses
+    MonadEditText(..), MonadEditLine(..),
+    -- ** Instances of Text Editing Type Classes
+    EditText, newTextCursor,
+    FoldMapLines, MapLines, EditLine, editLine,
     FoldMapChars, foldMapChars, runFoldMapChars, execFoldMapChars, evalFoldMapChars,
     MapChars, runMapChars,
     -- * Text Editor Data Structures
@@ -71,9 +75,10 @@ module Hakshell.TextEditor
     TextLine, TextCursor, textCursorCharCount, textLineTags,
     -- ** Errors
     TextEditError(..),
-    -- * Re-exporting "Hakshell.String"
+    -- * Re-Exports
+    -- ** "Hakshell.String"
     module Hakshell.String,
-    -- * Re-exporting "Control.Monad.State.Class"
+    -- ** "Control.Monad.State.Class"
     module Control.Monad.State.Class,
   ) where
 
