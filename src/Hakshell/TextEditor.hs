@@ -51,7 +51,7 @@
 module Hakshell.TextEditor
   ( -- * Text Editing API
     -- ** Create and Start Editing a 'TextBufferState'
-    TextBuffer, newTextBuffer,
+    TextBuffer, newTextBuffer, Relative, Absolute, LineIndex, CharIndex,
     runEditText, runMapLines, runFoldMapLines, execFoldMapLines, evalFoldMapLines,
     -- ** Text Editing Combinators
     RelativeToCursor(..),
@@ -104,6 +104,31 @@ import qualified Data.Sequence               as Seq
 import qualified Data.Vector.Mutable         as MVec
 import qualified Data.Vector.Generic.Mutable as GMVec
 import qualified Data.Vector.Unboxed.Mutable as UMVec
+
+----------------------------------------------------------------------------------------------------
+
+-- | Used for indexing lines and characters relative to the cursor.
+newtype Relative a = Relative a
+  deriving (Eq, Ord, Show, Read, Enum, Num)
+
+-- | Used for indexing absolute lines and characters (relative to the start of the document, which
+-- is line 1).
+newtype Absolute a = Absolute a
+  deriving (Eq, Ord, Show, Read, Enum, Num)
+
+-- | A number for indexing a line. This data type instantiates the 'Prelude.Num' typeclass so that
+-- you can write an integer literal in your code and (if used in the correct context) the type
+-- inference will automatically declare a 'LineIndex' without you needing to write @(LineIndex 1)@
+-- constructor unless you really want to.
+newtype LineIndex = LineIndex Int
+  deriving (Eq, Ord, Show, Read, Enum, Num)
+
+-- | A number for indexing a column, i.e. a character within a line. This data type instantiates
+-- the 'Prelude.Num' typeclass so that you can write an integer literal in your code and (if used in
+-- the correct context) the type inference will automatically declare a 'CharIndex' without you
+-- needing to write @(LineIndex 1)@ constructor unless you really want to.
+newtype CharIndex = CharIndex Int
+  deriving (Eq, Ord, Show, Read, Enum, Num)
 
 ----------------------------------------------------------------------------------------------------
 
@@ -737,7 +762,7 @@ shiftElems nil vec select before after =
 -- and characters relative to the current cursor position.
 moveCursor
   :: (MonadEditText editor, MonadEditLine editor, Monad (editor tags))
-  => Int -> Int -> editor tags ()
+  => Relative LineIndex -> Relative CharIndex -> editor tags ()
 moveCursor row col = moveByLine row >> moveByChar col
 
 -- | Move the cursor to a different line by an @n :: Int@ number of lines. A negative @n@ indicates
@@ -745,8 +770,8 @@ moveCursor row col = moveByLine row >> moveByChar col
 -- toward the end of the buffer.
 moveByLine
   :: (MonadEditText editor, Monad (editor tags))
-  => Int -> editor tags ()
-moveByLine select = liftEditText $ do
+  => Relative LineIndex -> editor tags ()
+moveByLine (Relative (LineIndex select)) = liftEditText $ do
   vec <- use bufferVector
   (before, after) <- (,) <$> use linesAboveCursor <*> use linesBelowCursor >>=
     liftIO . uncurry (shiftElems (error "empty line") vec select)
@@ -758,8 +783,8 @@ moveByLine select = liftEditText $ do
 -- positive @n@ indicates moving toward the end of the line.
 moveByChar
   :: (MonadEditLine editor, Monad (editor tags))
-  => Int -> editor tags ()
-moveByChar select = liftEditLine $ do
+  => Relative CharIndex -> editor tags ()
+moveByChar (Relative (CharIndex select)) = liftEditLine $ do
   vec <- use lineEditBuffer
   (before, after) <- (,) <$> use charsBeforeCursor <*> use charsAfterCursor >>=
     liftIO . uncurry (shiftElems '\0' vec select)
@@ -789,31 +814,32 @@ insertChar rel c = liftEditText $ do
 -- line 1), the last line is 'Prelude.maxBound'.
 gotoLine
   :: (MonadEditText editor, MonadEditLine editor, Monad (editor tags))
-  => Int -> editor tags ()
-gotoLine = subtract 1 >>> \ n ->
-  liftEditText $ use linesAboveCursor >>= moveByLine . (n -)
+  => Absolute LineIndex -> editor tags ()
+gotoLine (Absolute (LineIndex n)) = liftEditText $
+  use linesAboveCursor >>= moveByLine . Relative . LineIndex . ((n - 1) -)
 
 -- | Go to an absolute character (column) number, the first character is 1 (character 0 and below
 -- all send the cursor to column 1), the last line is 'Prelude.maxBound'.
 gotoChar
   :: (MonadEditLine editor, Monad (editor tags))
-  => Int -> editor tags ()
-gotoChar = subtract 1 >>> \ n ->
-  liftEditLine $ use charsBeforeCursor >>= moveByChar . (n -)
+  => Absolute CharIndex -> editor tags ()
+gotoChar (Absolute (CharIndex n)) = liftEditLine $
+  use charsBeforeCursor >>= moveByChar . Relative . CharIndex . ((n - 1) -)
 
 -- | This function calls 'gotoLine' and then 'gotoChar' to move the cursor to an absolute a line
 -- number and characters (column) number.
 gotoPosition
   :: (MonadEditText editor, MonadEditLine editor, Monad (editor tags))
-  => Int -> Int -> editor tags ()
+  => Absolute LineIndex -> Absolute CharIndex -> editor tags ()
 gotoPosition line col = liftEditText $ gotoLine line >> gotoChar col
 
 -- | This function only deletes characters on the current line, if the cursor is at the start of the
 -- line and you evaluate @'deleteChars' 'Before'@, this function does nothing.
 deleteChars
   :: (MonadEditText editor, Monad (editor tags))
-  => RelativeToCursor -> Int -> editor tags ()
-deleteChars rel n = liftEditText $ relativeToChar rel %= max 0 . subtract (max 0 n)
+  => RelativeToCursor -> Relative CharIndex -> editor tags ()
+deleteChars rel (Relative (CharIndex n)) = liftEditText $
+  relativeToChar rel %= max 0 . subtract (max 0 n)
 
 -- | This function deletes characters starting from the cursor, and if the number of characters to
 -- be deleted exceeds the number of characters in the current line, characters are deleted from
@@ -821,7 +847,7 @@ deleteChars rel n = liftEditText $ relativeToChar rel %= max 0 . subtract (max 0
 -- beginning of the next line, depending on the direction of travel.
 deleteCharsWrap
   :: (MonadEditText editor, Monad (editor tags))
-  => RelativeToCursor -> Int -> editor tags ()
+  => RelativeToCursor -> Relative CharIndex -> editor tags ()
 deleteCharsWrap = error "TODO: deleteCharsWrap"
 
 -- | This function evaluates the 'lineBreaker' function on the given string, and beginning from the
