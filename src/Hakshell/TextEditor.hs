@@ -50,7 +50,7 @@
 -- processors, and hence a text editor API is an integral part of the "Hakshell" library.
 module Hakshell.TextEditor
   ( -- * Text Editing API
-    -- ** Create and Start Editing a 'TextBuffer'
+    -- ** Create and Start Editing a 'TextBufferState'
     newTextBuffer, runEditText, runMapLines, runFoldMapLines, execFoldMapLines, evalFoldMapLines,
     -- ** Text Editing Combinators
     RelativeToCursor(..),
@@ -66,7 +66,7 @@ module Hakshell.TextEditor
     MapChars, runMapChars,
     -- * Text Editor Data Structures
     -- ** Text Buffer
-    TextBuffer, LineBreaker(..), lineBreaker, lineBreakPredicate,
+    TextBufferState, LineBreaker(..), lineBreaker, lineBreakPredicate,
     theBufferCharCount, theBufferCharNumber,
     theBufferLineCount, theBufferLineNumber,
     bufferCurrentLine, textLineString,
@@ -104,25 +104,25 @@ import qualified Data.Vector.Unboxed.Mutable as UMVec
 
 ----------------------------------------------------------------------------------------------------
 
--- | This is a type of functions that can modify the textual content stored in a 'TextBuffer'.
+-- | This is a type of functions that can modify the textual content stored in a 'TextBufferState'.
 newtype EditText tags a
-  = EditText{ unwrapEditText :: ExceptT TextEditError (StateT (TextBuffer tags) IO) a }
+  = EditText{ unwrapEditText :: ExceptT TextEditError (StateT (TextBufferState tags) IO) a }
   deriving (Functor, Applicative, Monad, MonadIO)
 
-instance MonadState (TextBuffer tags) (EditText tags) where { state = EditText . lift . state; }
+instance MonadState (TextBufferState tags) (EditText tags) where { state = EditText . lift . state; }
 
 instance MonadError TextEditError (EditText tags) where
   throwError = EditText . throwError
   catchError (EditText try) catch = EditText $ catchError try $ unwrapEditText . catch
 
--- | Evaluate an 'EditText' function on the given 'TextBuffer'.
-runEditText :: EditText tags a -> TextBuffer tags -> IO (Either TextEditError a, TextBuffer tags)
+-- | Evaluate an 'EditText' function on the given 'TextBufferState'.
+runEditText :: EditText tags a -> TextBufferState tags -> IO (Either TextEditError a, TextBufferState tags)
 runEditText (EditText f) = runStateT $ runExceptT f
 
 ----------------------------------------------------------------------------------------------------
 
 -- | A type of functions that can perform a fold (in the sense of the Haskell 'Control.Monad.foldM'
--- function) over lines of text in a 'TextBuffer'. This function takes an arbitrary @fold@ data type
+-- function) over lines of text in a 'TextBufferState'. This function takes an arbitrary @fold@ data type
 -- which can be anything you want, and is initialized when evaluating the 'runFoldMapLines'
 -- function. The 'FoldMapLines' function type instantiates 'Control.Monad.State.Class.MonadState'
 -- over the @fold@ type, so you will use 'Control.Monad.State.state', 'Control.Monad.State.modify',
@@ -250,8 +250,8 @@ runMapChars = flip evalFoldMapChars ()
 ----------------------------------------------------------------------------------------------------
 
 -- | This data type stores a buffer of editable text.
-data TextBuffer tags
-  = TextBuffer
+data TextBufferState tags
+  = TextBufferState
     { theBufferCharNumber  :: !Int
       -- ^ The number of characters before the cursor position in the file.
     , theBufferCharCount   :: !Int
@@ -312,7 +312,7 @@ data LineBreaker
 -- at a later time, or all of the above.
 --
 -- Note that when a user user is editing text interactively, they are not operating on a
--- 'TextLine', but on a 'Prelude.String' (list of 'Char's) stored in the 'TextBuffer' state.
+-- 'TextLine', but on a 'Prelude.String' (list of 'Char's) stored in the 'TextBufferState' state.
 data TextLine tags
   = TextLine
     { theTextLineString :: !StrictBytes
@@ -343,15 +343,15 @@ charsBeforeCursor = lens theCharsBeforeCursor $ \ a b -> a{ theCharsAfterCursor 
 charsAfterCursor :: Lens' (TextCursor tags) Int
 charsAfterCursor = lens theCharsAfterCursor $ \ a b -> a{ theCharsAfterCursor = b}
 
--- | Use this to initialize a new empty 'TextBuffer'. The default 'bufferLineBreaker' is set to
--- 'lineBreakNLCR'. A 'TextBuffer' always contains one empty line, but a line must have a @tags@
+-- | Use this to initialize a new empty 'TextBufferState'. The default 'bufferLineBreaker' is set to
+-- 'lineBreakNLCR'. A 'TextBufferState' always contains one empty line, but a line must have a @tags@
 -- tag, so it is necessary to pass an initializing tag value of type @tags@ -- if you need nothing
 -- but plain text editing, @tags@ can be unit @()@.
-newTextBuffer :: tags -> IO (TextBuffer tags)
+newTextBuffer :: tags -> IO (TextBufferState tags)
 newTextBuffer tag = do
   cur <- newTextCursor tag
   buf <- MVec.new 512
-  return TextBuffer
+  return TextBufferState
     { theBufferCharNumber  = 0
     , theBufferCharCount   = 0
     , theBufferLineNumber  = 0
@@ -366,7 +366,7 @@ newTextBuffer tag = do
 
 -- | Use this to initialize a new empty 'TextCursor'. This is usually only handy if you want to
 -- define and test your own 'EditLine' functions and need to evaluate 'runEditLine' by hand rather
--- than allowing the 'TextEdit' APIs automatically manage line editing. A 'TextBuffer' always
+-- than allowing the 'TextEdit' APIs automatically manage line editing. A 'TextBufferState' always
 -- contains one empty line, but a line must have a @tags@ tag, so it is necessary to pass an
 -- initializing tag value of type @tags@.
 newTextCursor :: tags -> IO (TextCursor tags)
@@ -440,27 +440,27 @@ lineBreakNLCR = LineBreaker
       (line, '\r':'\n':more) -> (line ++ "\r\n") : lines more
       (line, c:more)         -> [line ++ [c], more]
 
--- Not for export: updated when characters are added to the 'TextBuffer'.
-bufferCharNumber :: Lens' (TextBuffer tags) Int
+-- Not for export: updated when characters are added to the 'TextBufferState'.
+bufferCharNumber :: Lens' (TextBufferState tags) Int
 bufferCharNumber = lens theBufferCharNumber $ \ a b -> a{ theBufferCharNumber = b }
 
--- Not for export: updated when characters are added to the 'TextBuffer'.
-bufferCharCount :: Lens' (TextBuffer tags) Int
+-- Not for export: updated when characters are added to the 'TextBufferState'.
+bufferCharCount :: Lens' (TextBufferState tags) Int
 bufferCharCount = lens theBufferCharCount $ \ a b -> a{ theBufferCharCount = b }
 
--- Not for export: updated when characters are added to the 'TextBuffer'.
-bufferLineCount :: Lens' (TextBuffer tags) Int
+-- Not for export: updated when characters are added to the 'TextBufferState'.
+bufferLineCount :: Lens' (TextBufferState tags) Int
 bufferLineCount = lens theBufferLineCount $ \ a b -> a{ theBufferLineCount = b }
 
--- Not for export: updated when characters are added to the 'TextBuffer'.
-bufferLineNumber :: Lens' (TextBuffer tags) Int
+-- Not for export: updated when characters are added to the 'TextBufferState'.
+bufferLineNumber :: Lens' (TextBufferState tags) Int
 bufferLineNumber = lens theBufferLineNumber $ \ a b -> a{ theBufferLineNumber = b }
 
--- | Entering a line-breaking character (e.g. @'\n'@) into a 'TextBuffer' using 'insertChar' or
+-- | Entering a line-breaking character (e.g. @'\n'@) into a 'TextBufferState' using 'insertChar' or
 -- 'insertString' results in several 'TextLine's being generated automatically. Whenever a
 -- 'TextLine' is constructed, there needs to be a default tag value that is assigned to it. This
 -- lens allows you to observe or set the default tag value.
-bufferDefaultTag :: Lens' (TextBuffer tags) tags
+bufferDefaultTag :: Lens' (TextBufferState tags) tags
 bufferDefaultTag = lens theBufferDefaultTag $ \ a b -> a{ theBufferDefaultTag = b }
 
 -- | The function used to break strings into lines. This function is called every time a string is
@@ -473,7 +473,7 @@ bufferDefaultTag = lens theBufferDefaultTag $ \ a b -> a{ theBufferDefaultTag = 
 -- @
 -- 'Prelude.concat' ('lineBreakNLCR' str) == str
 -- @
-bufferLineBreaks :: Lens' (TextBuffer tags) LineBreaker
+bufferLineBreaks :: Lens' (TextBufferState tags) LineBreaker
 bufferLineBreaks = lens theBufferLineBreaker $ \ a b -> a{ theBufferLineBreaker = b }
 
 -- | This function is called by 'insertChar' to determine if the 'bufferCurrentLine' should be
@@ -487,19 +487,19 @@ lineBreaker :: Lens' LineBreaker (String -> [String])
 lineBreaker = lens theLineBreaker $ \ a b -> a{ theLineBreaker = b }
 
 -- Not for export: requires correct accounting of line numbers to avoid segment faults.
-linesAboveCursor :: Lens' (TextBuffer tags) Int
+linesAboveCursor :: Lens' (TextBufferState tags) Int
 linesAboveCursor = lens theLinesAboveCursor $ \ a b -> a{ theLinesAboveCursor = b }
 
 -- Not for export: requires correct accounting of line numbers to avoid segment faults.
-linesBelowCursor :: Lens' (TextBuffer tags) Int
+linesBelowCursor :: Lens' (TextBufferState tags) Int
 linesBelowCursor = lens theLinesBelowCursor $ \ a b -> a{ theLinesBelowCursor = b }
 
 -- Not for export: the vector containing all the lines of text in this buffer.
-bufferVector :: Lens' (TextBuffer tags) (MVec.IOVector (TextLine tags))
+bufferVector :: Lens' (TextBufferState tags) (MVec.IOVector (TextLine tags))
 bufferVector = lens theBufferVector $ \ a b -> a{ theBufferVector = b }
 
 -- | The current line of text being edited under the cursor.
-bufferCurrentLine :: Lens' (TextBuffer tags) (TextCursor tags)
+bufferCurrentLine :: Lens' (TextBufferState tags) (TextCursor tags)
 bufferCurrentLine = lens theBufferCursor $ \ a b -> a{ theBufferCursor = b }
 
 -- | The null-terminated, UTF-8 encoded string of bytes stored in this line of text.
@@ -564,13 +564,13 @@ data RelativeToCursor = Before | After
 
 -- Not for export: This function takes a 'RelativeToCursor' value and constructs a lens that can be
 -- used to access 'TextLine's within the 'TextCursor'.
-relativeToLine :: RelativeToCursor -> Lens' (TextBuffer tags) Int
+relativeToLine :: RelativeToCursor -> Lens' (TextBufferState tags) Int
 relativeToLine = \ case { Before -> linesAboveCursor; After -> linesBelowCursor; }
   -- This function may dissapear if I decide to buffer lines in a mutable vector.
 
 -- Not for export: This function takes a 'RelativeToCursor' value and constructs a lens that can be
 -- used to access a character index within the 'bufferCurrentLine'.
-relativeToChar :: RelativeToCursor -> Lens' (TextBuffer tags) Int
+relativeToChar :: RelativeToCursor -> Lens' (TextBufferState tags) Int
 relativeToChar =
   (bufferCurrentLine .) . \ case { Before -> charsBeforeCursor; After -> charsAfterCursor; }
 
@@ -618,7 +618,7 @@ growBufferIfTooSmall grow = do
   below <- use linesBelowCursor
   liftIO (growVec buf above below grow) >>= assign bufferVector
 
--- Not for export: these functions, when evaluated alone, leave the 'TextBuffer' in an inconsistent
+-- Not for export: these functions, when evaluated alone, leave the 'TextBufferState' in an inconsistent
 -- state. This function creates a 'TextLine' from the 'TextCursor' stored at 'bufferCurrentLine'. It
 -- does nothing to replace the 'bufferCurrentLine', so essentially the line is duplicated and pushed
 -- upward or downward, and it is then up to the calling context whether to open a new line, or
