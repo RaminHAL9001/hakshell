@@ -35,15 +35,15 @@
 -- "operating system that lacks a useful text editor." A more accurate description of Emacs would be
 -- a "Lisp interpreter that allows one to easily invent various text editors for various specific
 -- use cases." You could also call Emacs an IDE, or an app platform, both of which have their text
--- editing facilities provided for by the Emacs text editor functionality. Emacs also has very good
--- shell integration: there are commands that execute shell commands with buffered text as input,
--- and capturing the output text of the process back into a buffer.
+-- editing facilities provided for by the built-in Emacs text editor functionality. Emacs also has
+-- very good shell integration: there are commands that execute shell commands with buffered text as
+-- input, and capturing the output text of the process back into a buffer.
 --
 -- Emacs can, to a great extent, perform most all of the same functions as Bash, while providing
--- countless additional interactive feautres. Emacs is therefore a more advanced system shell with
--- integrated text editing features. It is possible, although not commonly done, to use Emacs in
--- place of bash as the login shell process, and anyone logging in to the system would have no
--- difficulty using any and all of the services provided to them by the server.
+-- countless additional interactive feautres. You can therefore think of Emacs a more advanced
+-- system shell with integrated text editing features. It is even possible, although not commonly
+-- done, to use Emacs in place of Bash as the login shell process, and anyone logging in to the
+-- system would have no difficulty using any and all of the services provided to them by the server.
 --
 -- The "Hakshell.TextEditor" module is therefore designed to provide a solid, consistent foundation
 -- for automated text processing APIs, upon which programmers can build text editors and text
@@ -51,12 +51,14 @@
 module Hakshell.TextEditor
   ( -- * Text Editing API
     -- ** Create and Start Editing a 'TextBufferState'
-    newTextBuffer, runEditText, runMapLines, runFoldMapLines, execFoldMapLines, evalFoldMapLines,
+    TextBuffer, newTextBuffer,
+    runEditText, runMapLines, runFoldMapLines, execFoldMapLines, evalFoldMapLines,
     -- ** Text Editing Combinators
     RelativeToCursor(..),
+    insertString, insertChar,
+    gotoPosition, gotoLine, gotoChar, moveCursor, moveByLine, moveByChar,
     copyCurrentLine, newCursorFromLine, replaceCurrentLine, clearCurrentLine,
-    moveCursorLine, moveCursorChar,
-    insertChar, deleteChars, deleteCharsWrap, insertString,
+    deleteChars, deleteCharsWrap,
     -- ** Text Editing Typeclasses
     MonadEditText(..), MonadEditLine(..),
     -- ** Instances of Text Editing Type Classes
@@ -85,6 +87,7 @@ module Hakshell.TextEditor
 import           Hakshell.String
 
 import           Control.Arrow
+import           Control.Concurrent.MVar
 import           Control.Lens
 import           Control.Monad.Except
 import           Control.Monad.Primitive
@@ -116,8 +119,9 @@ instance MonadError TextEditError (EditText tags) where
   catchError (EditText try) catch = EditText $ catchError try $ unwrapEditText . catch
 
 -- | Evaluate an 'EditText' function on the given 'TextBufferState'.
-runEditText :: EditText tags a -> TextBufferState tags -> IO (Either TextEditError a, TextBufferState tags)
-runEditText (EditText f) = runStateT $ runExceptT f
+runEditText :: EditText tags a -> TextBuffer tags -> IO (Either TextEditError a)
+runEditText (EditText f) (TextBuffer mvar) = modifyMVar mvar $
+  fmap (\ (a,b) -> (b,a)) . runStateT (runExceptT f)
 
 ----------------------------------------------------------------------------------------------------
 
@@ -168,7 +172,17 @@ evalFoldMapLines = fmap (fmap fst) . runFoldMapLines
 -- | A type synonym for a 'FoldMapLines' function in which the folded type is the unit @()@ value.
 type MapLines = FoldMapLines ()
 
--- | Evaluate a 'MapLines' using 'evalFoldMapLines'.
+-- | Evaluate a 'MapLines' using 'evalFoldMapLines'. Note that this funcion must be evaluated within
+-- an 'EditText' type of function. When using @do@ notation, it would look like this:
+--
+-- @
+-- dotEndOfEveryLine :: EditText tags a
+-- dotEndOfEveryLine = do
+--     'gotoPosition' 0 0
+--     'runMapLines' $ do
+--         'gotoChar' 'Prelude.maxBound'
+--         'insertChar' \'.\'
+-- @
 runMapLines :: MapLines tags a -> EditText tags a
 runMapLines = flip evalFoldMapLines ()
 
@@ -249,7 +263,47 @@ runMapChars = flip evalFoldMapChars ()
 
 ----------------------------------------------------------------------------------------------------
 
--- | This data type stores a buffer of editable text.
+-- | This is a reference to the stateful data of your buffer of text. You edit this text by
+-- evaluating any text editing combinators that evaluate to an 'EditText' function type. Declare a
+-- new 'TextBuffer' using the 'newTextBuffer' function, then pass this 'TextBuffer' to the
+-- 'runEditText' function along with some combinator functions of type @('EditText' tags)@ or type
+-- @'MonadEditText' editor => (editor tags)@.
+--
+-- @
+-- main :: IO ()
+-- main = do
+--     buf <- 'newTextBuffer' ()
+--     'runEditText' $ do
+--         'insertString' "Hello, world!\\nThis is a text document.\\n"
+--         'gotoPosition' 1 0 'Control.Monad.>>' 'insertChar' \'"\'
+--         'moveByChar' 'Prelude.maxBound' 'Control.Monad.>>' 'insertChar' '"'
+--     'Control.Monad.return' ()
+-- @
+--
+-- You may also notice some of the combinator functions in this module are of the type @(editor tags
+-- a)@ (all lower-case, all type variables) such that the @editor@ type variable is an instance of
+-- the 'MonadEditText' type class and @(editor tags)@ type variable is an instance of the 'Monad'
+-- typeclass. Since the 'EditText' function does instantiate both the 'MonadEditText' and 'Monad'
+-- typeclasss, this means it is possible to use any function which is defined be of type @(editor
+-- tags a)@ type as if it were an 'EditText' function.
+--
+-- Just remember that you can't use an @(editor tag a@) type as though @editor@ were two different
+-- function types, for example when using an 'EditText' and an 'FoldMapLines' function in the same
+-- @do@ block, this will fail to pass the type-checker.
+newtype TextBuffer tags = TextBuffer (MVar (TextBufferState tags))
+  deriving Eq
+
+-- | This data type stores a buffer of editable text. This is stateful information for the
+-- 'TextBuffer' data type. The constructor for this data type is not exposed because it is
+-- automatically constructed by the 'newTextBuffer' function, and it contains what object oriented
+-- programmers would call "private" variables. However some of the lenses for this data type, namely
+-- 'bufferDefaultTag', 'bufferLineBreaks', and 'bufferCurrentLine', do allow you to modify the
+-- variable fields of this data type.
+--
+-- The 'EditText' monad instantiates the 'MonadState' typeclass such that the stateful data is this
+-- data type, which means you can use the 'Control.Lens.use', 'Control.Lens.assign', functions and
+-- the similar @('Control.Lens..=')@, @('Control.Lens.%=') operators in the "Control.Lens" module to
+-- update these values from within a @do@ block of code when programming a text editing combinator.
 data TextBufferState tags
   = TextBufferState
     { theBufferCharNumber  :: !Int
@@ -679,13 +733,20 @@ shiftElems nil vec select before after =
     lower = slice before $ clamp $ before + select
     clear slice = forM_ [0 .. GMVec.length slice - 1] $ flip (GMVec.write slice) nil
 
+-- | This function calls 'moveByLine' and then 'moveByChar' to move the cursor by a number of lines
+-- and characters relative to the current cursor position.
+moveCursor
+  :: (MonadEditText editor, MonadEditLine editor, Monad (editor tags))
+  => Int -> Int -> editor tags ()
+moveCursor row col = moveByLine row >> moveByChar col
+
 -- | Move the cursor to a different line by an @n :: Int@ number of lines. A negative @n@ indicates
 -- moving the cursor toward the start of the buffer, a positive @n@ indicates moving the cursor
 -- toward the end of the buffer.
-moveCursorLine
+moveByLine
   :: (MonadEditText editor, Monad (editor tags))
   => Int -> editor tags ()
-moveCursorLine select = liftEditText $ do
+moveByLine select = liftEditText $ do
   vec <- use bufferVector
   (before, after) <- (,) <$> use linesAboveCursor <*> use linesBelowCursor >>=
     liftIO . uncurry (shiftElems (error "empty line") vec select)
@@ -695,10 +756,10 @@ moveCursorLine select = liftEditText $ do
 -- | Move the cursor to a different character position within the 'bufferCurrentLine' by an @n ::
 -- Int@ number of characters. A negative @n@ indicates moving toward the start of the line, a
 -- positive @n@ indicates moving toward the end of the line.
-moveCursorChar
+moveByChar
   :: (MonadEditLine editor, Monad (editor tags))
   => Int -> editor tags ()
-moveCursorChar select = liftEditLine $ do
+moveByChar select = liftEditLine $ do
   vec <- use lineEditBuffer
   (before, after) <- (,) <$> use charsBeforeCursor <*> use charsAfterCursor >>=
     liftIO . uncurry (shiftElems '\0' vec select)
@@ -723,6 +784,29 @@ insertChar rel c = liftEditText $ do
     buf <- use $ bufferCurrentLine . lineEditBuffer
     liftIO $ UMVec.write buf i c
     relativeToChar rel += diff
+
+-- | Go to an absolute line number, the first line is 1 (line 0 and below all send the cursor to
+-- line 1), the last line is 'Prelude.maxBound'.
+gotoLine
+  :: (MonadEditText editor, MonadEditLine editor, Monad (editor tags))
+  => Int -> editor tags ()
+gotoLine = subtract 1 >>> \ n ->
+  liftEditText $ use linesAboveCursor >>= moveByLine . (n -)
+
+-- | Go to an absolute character (column) number, the first character is 1 (character 0 and below
+-- all send the cursor to column 1), the last line is 'Prelude.maxBound'.
+gotoChar
+  :: (MonadEditLine editor, Monad (editor tags))
+  => Int -> editor tags ()
+gotoChar = subtract 1 >>> \ n ->
+  liftEditLine $ use charsBeforeCursor >>= moveByChar . (n -)
+
+-- | This function calls 'gotoLine' and then 'gotoChar' to move the cursor to an absolute a line
+-- number and characters (column) number.
+gotoPosition
+  :: (MonadEditText editor, MonadEditLine editor, Monad (editor tags))
+  => Int -> Int -> editor tags ()
+gotoPosition line col = liftEditText $ gotoLine line >> gotoChar col
 
 -- | This function only deletes characters on the current line, if the cursor is at the start of the
 -- line and you evaluate @'deleteChars' 'Before'@, this function does nothing.
