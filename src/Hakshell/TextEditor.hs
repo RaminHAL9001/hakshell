@@ -731,7 +731,7 @@ replaceCurrentLine
 replaceCurrentLine (Absolute (CharIndex cur)) line = liftEditText $ editLine $ do
   let srcvec = line ^. textLineString
   let srclen = intSize srcvec
-  cur <- pure $ max 0 $ min cur srclen
+  cur <- pure $ max 0 $ min (cur - 1) srclen
   targvec <- use lineEditBuffer
   let targlen = UMVec.length targvec
   targvec <- if targlen >= srclen then return targvec else liftIO $
