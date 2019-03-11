@@ -82,6 +82,10 @@ module Hakshell.TextEditor
     module Hakshell.String,
     -- ** "Control.Monad.State.Class"
     module Control.Monad.State.Class,
+    -- ** "Control.Monad.Error.Class"
+    module Control.Monad.Error.Class,
+    -- ** "Control.Monad.Cont.Class"
+    module Control.Monad.Cont.Class,
   ) where
 
 import           Hakshell.String
@@ -89,7 +93,10 @@ import           Hakshell.String
 import           Control.Arrow
 import           Control.Concurrent.MVar
 import           Control.Lens
+import           Control.Monad.Cont
+import           Control.Monad.Cont.Class
 import           Control.Monad.Except
+import           Control.Monad.Error.Class
 import           Control.Monad.Primitive
 import           Control.Monad.State
 import           Control.Monad.State.Class
@@ -158,39 +165,44 @@ runEditText (EditText f) (TextBuffer mvar) = modifyMVar mvar $
 -- the first line of the block of text, and once below the bottom line of the block of text, then
 -- pushing the edges of the folds of paper together to obscure the text between the folds. The
 -- 'FoldMapLines' has nothing to do with such a feature.
-newtype FoldMapLines fold tags a
-  = FoldMapLines{ unwrapFoldMapLines :: ExceptT TextEditError (StateT fold (EditText tags)) a }
+newtype FoldMapLines r fold tags a
+  = FoldMapLines
+    { unwrapFoldMapLines :: ContT r (ExceptT TextEditError (StateT fold (EditText tags))) a
+    }
   deriving (Functor, Applicative, Monad, MonadIO)
 
-instance MonadState fold (FoldMapLines fold tags) where
+instance MonadState fold (FoldMapLines r fold tags) where
   state = FoldMapLines . lift . state
 
-instance MonadError TextEditError (FoldMapLines fold tags) where
-  throwError = FoldMapLines . throwError
-  catchError (FoldMapLines try) catch = FoldMapLines $ catchError try $ unwrapFoldMapLines . catch
+instance MonadError TextEditError (FoldMapLines r fold tags) where
+  throwError = FoldMapLines . lift . throwError
+  catchError (FoldMapLines try) catch = FoldMapLines $ ContT $ \ next ->
+    catchError (runContT try next) $ flip runContT next . unwrapFoldMapLines . catch
 
 -- | Convert a 'FoldMapLines' into an 'EditText' function. This function is analogous to the
 -- 'runStateT' function. This function does not actually perform a fold or map operation, rather it
 -- simply unwraps the 'EditText' monad that exists within the 'FoldMapLines' monad.
-runFoldMapLines :: FoldMapLines fold tags a -> fold -> EditText tags (a, fold)
-runFoldMapLines (FoldMapLines f) = runStateT (runExceptT f) >=> \ case
+runFoldMapLines :: FoldMapLines a fold tags a -> fold -> EditText tags (a, fold)
+runFoldMapLines (FoldMapLines f) = runStateT (runExceptT $ runContT f return) >=> \ case
   (Left err, _   ) -> throwError err
   (Right  a, fold) -> return (a, fold)
 
 -- | Like 'runFoldMapLines' but only returns the @fold@ result. This function is analogous to the
 -- 'execStateT' function.
-execFoldMapLines :: FoldMapLines fold tags a -> fold -> EditText tags fold
-execFoldMapLines = fmap (fmap snd) . runFoldMapLines
+execFoldMapLines :: FoldMapLines fold fold tags a -> fold -> EditText tags fold
+execFoldMapLines (FoldMapLines f) = runStateT (runExceptT $ runContT f $ const get) >=> \ case
+  (Left err, _   ) -> throwError err
+  (Right  _, fold) -> return fold
 
 -- | Like 'runFoldMapLines' but ignores the @fold@ result. This function is analogous to the
 -- 'evalStateT' function.
-evalFoldMapLines :: FoldMapLines fold tags a -> fold -> EditText tags a
+evalFoldMapLines :: FoldMapLines a fold tags a -> fold -> EditText tags a
 evalFoldMapLines = fmap (fmap fst) . runFoldMapLines
 
 ----------------------------------------------------------------------------------------------------
 
 -- | A type synonym for a 'FoldMapLines' function in which the folded type is the unit @()@ value.
-type MapLines = FoldMapLines ()
+type MapLines r = FoldMapLines r ()
 
 -- | This function evaluates a 'MapLines' using 'evalFoldMapLines' without actually performing a
 -- mapping operation, rather this function simply unwraps the 'MapLines' monad, converting it to an
@@ -205,7 +217,7 @@ type MapLines = FoldMapLines ()
 --         'gotoChar' 'Prelude.maxBound'
 --         'insertChar' \'.\'
 -- @
-runMapLines :: MapLines tags a -> EditText tags a
+runMapLines :: MapLines a tags a -> EditText tags a
 runMapLines = flip evalFoldMapLines ()
 
 ----------------------------------------------------------------------------------------------------
@@ -236,17 +248,53 @@ editLine (EditLine f) = use bufferCurrentLine >>= runStateT (runExceptT f) >>= \
 ----------------------------------------------------------------------------------------------------
 
 -- | Functions of this type operate on a single 'TextLine', and can perform a fold over characters
--- in the line.
-newtype FoldMapChars fold tags a
-  = FoldMapChars{ unwrapFoldMapChars :: ExceptT TextEditError (StateT fold (EditLine tags)) a }
+-- in the line. This function type is polymorphic over 4 type variables
+--
+-- * @a@ is the monadic return type
+--
+-- * @tags@ is the @tags@ type of the 'TextBuffer' you are working on
+--
+-- * @fold@ is a value of your choosing that accumulates information, you can modify this value
+--          using the 'Control.Monad.State.get' and 'Control.Monad.State.put' functions.
+--
+-- * @r@ the continuation return type (from a lifted continuation monad within 'FoldMapChars').
+--       This simply means you can evaluate the 'Control.Monad.Cont.callCC' function to produce a
+--       breaking function. Then within the folding/mapping function you may evaluate the breaking
+--       function to halt and return from the fold or map operation immediately. The only
+--       restriction is that the type @r@ always be the same as the type @a@ of the function that
+--       was called with 'runFoldMapLines' function.
+newtype FoldMapChars r fold tags a
+  = FoldMapChars
+    { unwrapFoldMapChars :: ContT r (ExceptT TextEditError (StateT fold (EditLine tags))) a
+    }
   deriving (Functor, Applicative, Monad, MonadIO)
 
-instance MonadState fold (FoldMapChars fold tags) where
+instance MonadState fold (FoldMapChars r fold tags) where
   state = FoldMapChars . lift . state
 
-instance MonadError TextEditError (FoldMapChars fold tags) where
-  throwError = FoldMapChars . throwError
-  catchError (FoldMapChars try) catch = FoldMapChars $ catchError try $ unwrapFoldMapChars . catch
+instance MonadError TextEditError (FoldMapChars r fold tags) where
+  throwError = FoldMapChars . lift . throwError
+  catchError (FoldMapChars try) catch = FoldMapChars $ ContT $ \ next ->
+    catchError (runContT try next) $ flip runContT next . unwrapFoldMapChars . catch
+
+-- | Convert a 'FoldMapChars' into an 'FoldMapLine' function. This function is analogous to the
+-- 'runStateT' function.
+runFoldMapChars :: FoldMapChars a fold tags a -> fold -> EditLine tags (a, fold)
+runFoldMapChars (FoldMapChars f) = runStateT (runExceptT $ runContT f return) >=> \ case
+  (Left err, _   ) -> throwError err
+  (Right  a, fold) -> return (a, fold)
+
+-- | Like 'runFoldMapChars' but only returns the @fold@ result. This function is analogous to the
+-- 'execStateT' function.
+execFoldMapChars :: FoldMapChars fold fold tags a -> fold -> EditLine tags fold
+execFoldMapChars (FoldMapChars f) = runStateT (runExceptT $ runContT f $ const get) >=> \ case
+  (Left err, _   ) -> throwError err
+  (Right  _, fold) -> return fold
+
+-- | Like 'runFoldMapChars' but ignores the @fold@ result. This function is analogous to the
+-- 'evalStateT' function.
+evalFoldMapChars :: FoldMapChars a fold tags a -> fold -> EditLine tags a
+evalFoldMapChars = fmap (fmap fst) . runFoldMapChars
 
 -- | Evaluate a 'FoldMapChars' function within a 'FoldMapLines' function, using the same @fold@
 -- value from the 'FodlMapLines' state as the @fold@ value seen from within the 'FoldMapChars'
@@ -254,33 +302,16 @@ instance MonadError TextEditError (FoldMapChars fold tags) where
 -- 'liftEditLine' for the 'FoldMapLines' function type is this function, so any function that
 -- evaluates to an @editor@ where the @editor@ is a member of the 'MonadEditLine' typeclass will
 -- automatically invoke this function based on the function type of the context in which it is used.
-foldMapChars :: FoldMapChars fold tags a -> FoldMapLines fold tags a
+foldMapChars :: FoldMapChars a fold tags a -> FoldMapLines r fold tags a
 foldMapChars f = get >>= liftEditText . editLine . runFoldMapChars f >>= state . const
-
--- | Convert a 'FoldMapChars' into an 'FoldMapLine' function. This function is analogous to the
--- 'runStateT' function.
-runFoldMapChars :: FoldMapChars fold tags a -> fold -> EditLine tags (a, fold)
-runFoldMapChars (FoldMapChars f) = runStateT (runExceptT f) >=> \ case
-  (Left err, _   ) -> throwError err
-  (Right  a, fold) -> return (a, fold)
-
--- | Like 'runFoldMapChars' but only returns the @fold@ result. This function is analogous to the
--- 'execStateT' function.
-execFoldMapChars :: FoldMapChars fold tags a -> fold -> EditLine tags fold
-execFoldMapChars = fmap (fmap snd) . runFoldMapChars
-
--- | Like 'runFoldMapChars' but ignores the @fold@ result. This function is analogous to the
--- 'evalStateT' function.
-evalFoldMapChars :: FoldMapChars fold tags a -> fold -> EditLine tags a
-evalFoldMapChars = fmap (fmap fst) . runFoldMapChars
 
 ----------------------------------------------------------------------------------------------------
 
 -- | A type synonym for a 'FoldMapLines' function in which the folded type is the unit @()@ value.
-type MapChars = FoldMapChars ()
+type MapChars r = FoldMapChars r ()
 
 -- | Evaluate a 'MapChars' using 'evalFoldMapChars'.
-runMapChars :: MapChars tags a -> EditLine tags a
+runMapChars :: MapChars a tags a -> EditLine tags a
 runMapChars = flip evalFoldMapChars ()
 
 ----------------------------------------------------------------------------------------------------
@@ -628,7 +659,8 @@ class MonadEditText m where
   liftEditText :: EditText tags a -> m tags a
 
 instance MonadEditText EditText where { liftEditText = id; }
-instance MonadEditText (FoldMapLines fold) where { liftEditText = FoldMapLines . lift . lift; }
+instance MonadEditText (FoldMapLines r fold) where
+  liftEditText = FoldMapLines . lift . lift . lift
 
 -- | This class is basically the same as 'MonadEditText', but lifts a 'EditLine' function rather
 -- than an 'EditText' function. Note that 'MonadEditText' is a subclass of this typeclass, which
@@ -637,9 +669,14 @@ class MonadEditLine m where
   liftEditLine :: EditLine tags a -> m tags a
 
 instance MonadEditLine EditLine where { liftEditLine = id; }
-instance MonadEditLine (FoldMapChars fold) where { liftEditLine = FoldMapChars . lift . lift; }
+
+instance MonadEditLine (FoldMapChars r fold) where
+  liftEditLine = FoldMapChars . lift . lift . lift
+
 instance MonadEditLine EditText where { liftEditLine = editLine; }
-instance MonadEditLine (FoldMapLines fold) where { liftEditLine = foldMapChars . liftEditLine; }
+
+instance MonadEditLine (FoldMapLines r fold) where
+  liftEditLine = foldMapChars . liftEditLine
 
 ----------------------------------------------------------------------------------------------------
 
@@ -876,41 +913,7 @@ deleteChars (Relative (CharIndex n)) = liftEditLine $
 deleteCharsWrap
   :: (MonadEditText editor, Monad (editor tags))
   => Relative CharIndex -> editor tags ()
-deleteCharsWrap rel@(Relative (CharIndex n)) = liftEditText $
-  if n < 0 then back else if n > 0 then fore else return () where
-    back = directional charsBeforeCursor linesBelowCursor id After
-      (\ charCount lineCount -> do
-          return ()
-      )
-    fore = do
-      top <- UMVec.length <$> use bufferVector
-      directional charsAfterCursor linesAboveCursor (\n -> top - 1 - n) Before
-        (\ charCount lineCount -> do
-            return ()
-        )
-    directional charLens lineLens toIndex behind final = do
-      cur <- use $ bufferCurrentLine . charLens
-      if cur >= abs n then deleteChars rel else do
-        bufferCurrentLine . charLens .= 0
-        copyCurrentLine >>= pushCurrentLine behind
-        lineCount <- use lineLens
-        delLines toIndex lineLens (abs n - cur) (lineCount - 1) final
-    delLines toIndex lineLens charCount n final = do
-      vec  <- use bufferVector
-      tags <- use bufferDefaultTags
-      let emptyLine = TextLine
-            { theTextLineString = UVec.empty
-            , theTextLineTags   = tags
-            }
-      let loop charCount n = do
-            let i = toIndex n
-            line <- liftIO $ MVec.read vec i
-            let size = UVec.length $ line ^. textLineString
-            if size < charCount
-             then liftIO (UMVec.write vec i emptyLine) >> lineLens -= 1 >>
-              (if n <= 0 then final else loop) (charCount - size) (n - 1)
-             else final charCount n
-      loop charCount n
+deleteCharsWrap = error "TODO: deleteCharsWrap"
 
 -- | This function evaluates the 'lineBreaker' function on the given string, and beginning from the
 -- current cursor position, begins inserting all the lines of text produced by the 'lineBreaker'
