@@ -726,9 +726,9 @@ copyCurrentLine = liftEditText $ use bufferCurrentLine >>= liftIO . unsafeMakeLi
 -- in the given 'TextLine', meaning this function only grows the buffer memory allocation, it never
 -- shrinks the memory allocation.
 replaceCurrentLine
-  :: (MonadEditText editor, Monad (editor tags))
+  :: (MonadEditLine editor, Monad (editor tags))
   => Absolute CharIndex -> TextLine tags -> editor tags ()
-replaceCurrentLine (Absolute (CharIndex cur)) line = liftEditText $ editLine $ do
+replaceCurrentLine (Absolute (CharIndex cur)) line = liftEditLine $ do
   let srcvec = line ^. textLineString
   let srclen = intSize srcvec
   cur <- pure $ max 0 $ min (cur - 1) srclen
@@ -862,9 +862,9 @@ gotoPosition line col = liftEditText $ gotoLine line >> gotoChar col
 -- | This function only deletes characters on the current line, if the cursor is at the start of the
 -- line and you evaluate @'deleteChars' 'Before'@, this function does nothing.
 deleteChars
-  :: (MonadEditText editor, Monad (editor tags))
+  :: (MonadEditLine editor, Monad (editor tags))
   => Relative CharIndex -> editor tags ()
-deleteChars (Relative (CharIndex n)) = liftEditText $ editLine $
+deleteChars (Relative (CharIndex n)) = liftEditLine $
   if n < 0 then charsBeforeCursor %= max 0 . (+ n)
   else if n > 0 then charsAfterCursor %= max 0 . subtract n
   else return ()
@@ -876,7 +876,41 @@ deleteChars (Relative (CharIndex n)) = liftEditText $ editLine $
 deleteCharsWrap
   :: (MonadEditText editor, Monad (editor tags))
   => Relative CharIndex -> editor tags ()
-deleteCharsWrap = error "TODO: deleteCharsWrap"
+deleteCharsWrap rel@(Relative (CharIndex n)) = liftEditText $
+  if n < 0 then back else if n > 0 then fore else return () where
+    back = directional charsBeforeCursor linesBelowCursor id After
+      (\ charCount lineCount -> do
+          return ()
+      )
+    fore = do
+      top <- UMVec.length <$> use bufferVector
+      directional charsAfterCursor linesAboveCursor (\n -> top - 1 - n) Before
+        (\ charCount lineCount -> do
+            return ()
+        )
+    directional charLens lineLens toIndex behind final = do
+      cur <- use $ bufferCurrentLine . charLens
+      if cur >= abs n then deleteChars rel else do
+        bufferCurrentLine . charLens .= 0
+        copyCurrentLine >>= pushCurrentLine behind
+        lineCount <- use lineLens
+        delLines toIndex lineLens (abs n - cur) (lineCount - 1) final
+    delLines toIndex lineLens charCount n final = do
+      vec  <- use bufferVector
+      tags <- use bufferDefaultTags
+      let emptyLine = TextLine
+            { theTextLineString = UVec.empty
+            , theTextLineTags   = tags
+            }
+      let loop charCount n = do
+            let i = toIndex n
+            line <- liftIO $ MVec.read vec i
+            let size = UVec.length $ line ^. textLineString
+            if size < charCount
+             then liftIO (UMVec.write vec i emptyLine) >> lineLens -= 1 >>
+              (if n <= 0 then final else loop) (charCount - size) (n - 1)
+             else final charCount n
+      loop charCount n
 
 -- | This function evaluates the 'lineBreaker' function on the given string, and beginning from the
 -- current cursor position, begins inserting all the lines of text produced by the 'lineBreaker'
