@@ -145,8 +145,8 @@ runEditText (EditText f) (TextBuffer mvar) = modifyMVar mvar $
 ----------------------------------------------------------------------------------------------------
 
 -- | A type of functions that can perform a fold (in the sense of the Haskell 'Control.Monad.foldM'
--- function) over lines of text in a 'TextBufferState'. This function takes an arbitrary @fold@ data type
--- which can be anything you want, and is initialized when evaluating the 'runFoldMapLines'
+-- function) over lines of text in a 'TextBufferState'. This function takes an arbitrary @fold@ data
+-- type which can be anything you want, and is initialized when evaluating the 'runFoldMapLines'
 -- function. The 'FoldMapLines' function type instantiates 'Control.Monad.State.Class.MonadState'
 -- over the @fold@ type, so you will use 'Control.Monad.State.state', 'Control.Monad.State.modify',
 -- 'Control.Monad.State.get', and 'Control.Monad.State.Put' functions
@@ -170,7 +170,8 @@ instance MonadError TextEditError (FoldMapLines fold tags) where
   catchError (FoldMapLines try) catch = FoldMapLines $ catchError try $ unwrapFoldMapLines . catch
 
 -- | Convert a 'FoldMapLines' into an 'EditText' function. This function is analogous to the
--- 'runStateT' function.
+-- 'runStateT' function. This function does not actually perform a fold or map operation, rather it
+-- simply unwraps the 'EditText' monad that exists within the 'FoldMapLines' monad.
 runFoldMapLines :: FoldMapLines fold tags a -> fold -> EditText tags (a, fold)
 runFoldMapLines (FoldMapLines f) = runStateT (runExceptT f) >=> \ case
   (Left err, _   ) -> throwError err
@@ -191,8 +192,10 @@ evalFoldMapLines = fmap (fmap fst) . runFoldMapLines
 -- | A type synonym for a 'FoldMapLines' function in which the folded type is the unit @()@ value.
 type MapLines = FoldMapLines ()
 
--- | Evaluate a 'MapLines' using 'evalFoldMapLines'. Note that this funcion must be evaluated within
--- an 'EditText' type of function. When using @do@ notation, it would look like this:
+-- | This function evaluates a 'MapLines' using 'evalFoldMapLines' without actually performing a
+-- mapping operation, rather this function simply unwraps the 'MapLines' monad, converting it to an
+-- ordinary 'EditText' monad. Note that this funcion must be evaluated within an 'EditText' type of
+-- function. When using @do@ notation, it would look like this:
 --
 -- @
 -- dotEndOfEveryLine :: EditText tags a
