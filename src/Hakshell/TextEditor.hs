@@ -720,19 +720,35 @@ pushCurrentLine rel = do
 copyCurrentLine :: (MonadEditText editor, Monad (editor tags)) => editor tags (TextLine tags)
 copyCurrentLine = liftEditText $ use bufferCurrentLine >>= liftIO . unsafeMakeLine
 
--- | Delete the 'bufferCurrentLine' and replace it with the given 'TextLine'. Pass an integer value
--- indicating where the cursor position should be set.
+-- | Replace the content in the 'bufferCurrentLine' with the content in the given 'TextLine'. Pass
+-- an integer value indicating where the cursor position should be set. This function does not
+-- re-allocate the current line editor buffer unless it is too small to hold all of the characters
+-- in the given 'TextLine', meaning this function only grows the buffer memory allocation, it never
+-- shrinks the memory allocation.
 replaceCurrentLine
   :: (MonadEditText editor, Monad (editor tags))
-  => Int -> TextLine tags -> editor tags ()
-replaceCurrentLine cur line = liftEditText $ do
-  tags <- use bufferDefaultTag
-  editLine $ do
-    charsBeforeCursor .= 0
-    charsAfterCursor  .= 0
-    textCursorTags    .= tags
+  => Absolute CharIndex -> TextLine tags -> editor tags ()
+replaceCurrentLine (Absolute (CharIndex cur)) line = liftEditText $ editLine $ do
+  let srcvec = line ^. textLineString
+  let srclen = intSize srcvec
+  cur <- pure $ max 0 $ min cur srclen
+  targvec <- use lineEditBuffer
+  let targlen = UMVec.length targvec
+  targvec <- if targlen >= srclen then return targvec else liftIO $
+    UMVec.new $ head $ dropWhile (< srclen) $ iterate (* 2) targlen
+  let targlen = UMVec.length targvec
+  charsBeforeCursor .= cur
+  charsAfterCursor  .= srclen - cur
+  textCursorTags    .= line ^. textLineTags
+  liftIO $ do
+    let copy = mapM_ $ UMVec.write targvec *** (srcvec UVec.!) >>> app
+    copy $ (id &&& id) <$> [0 .. cur - 1]
+    copy $ zip [targlen - cur - 1 .. targlen - 1] [srclen - cur - 1 .. srclen - 1]
 
--- | Delete the 'bufferCurrentLine', replacing it with a new empty line.
+-- | Delete the 'bufferCurrentLine', replacing it with a new empty line. This function also resets
+-- the line editor buffer to the default allocation size, allowing the garbage collector to delete
+-- the previous allocation, meaning this function may shrink the line editor buffer memory
+-- allocation.
 clearCurrentLine :: (MonadEditText editor, Monad (editor tags)) => editor tags ()
 clearCurrentLine = liftEditText $
   use bufferDefaultTag >>= liftIO . newTextCursor >>= assign bufferCurrentLine
