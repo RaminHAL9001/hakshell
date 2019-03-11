@@ -863,9 +863,11 @@ gotoPosition line col = liftEditText $ gotoLine line >> gotoChar col
 -- line and you evaluate @'deleteChars' 'Before'@, this function does nothing.
 deleteChars
   :: (MonadEditText editor, Monad (editor tags))
-  => RelativeToCursor -> Relative CharIndex -> editor tags ()
-deleteChars rel (Relative (CharIndex n)) = liftEditText $
-  relativeToChar rel %= max 0 . subtract (max 0 n)
+  => Relative CharIndex -> editor tags ()
+deleteChars (Relative (CharIndex n)) = liftEditText $ editLine $
+  if n < 0 then charsBeforeCursor %= max 0 . (+ n)
+  else if n > 0 then charsAfterCursor %= max 0 . subtract n
+  else return ()
 
 -- | This function deletes characters starting from the cursor, and if the number of characters to
 -- be deleted exceeds the number of characters in the current line, characters are deleted from
