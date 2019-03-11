@@ -179,6 +179,9 @@ instance MonadError TextEditError (FoldMapLines r fold tags) where
   catchError (FoldMapLines try) catch = FoldMapLines $ ContT $ \ next ->
     catchError (runContT try next) $ flip runContT next . unwrapFoldMapLines . catch
 
+instance MonadCont (FoldMapLines r fold tags) where
+  callCC f = FoldMapLines $ callCC $ unwrapFoldMapLines . f . (FoldMapLines .)
+
 -- | Convert a 'FoldMapLines' into an 'EditText' function. This function is analogous to the
 -- 'runStateT' function. This function does not actually perform a fold or map operation, rather it
 -- simply unwraps the 'EditText' monad that exists within the 'FoldMapLines' monad.
@@ -276,6 +279,9 @@ instance MonadError TextEditError (FoldMapChars r fold tags) where
   throwError = FoldMapChars . lift . throwError
   catchError (FoldMapChars try) catch = FoldMapChars $ ContT $ \ next ->
     catchError (runContT try next) $ flip runContT next . unwrapFoldMapChars . catch
+
+instance MonadCont (FoldMapChars r fold tags) where
+  callCC f = FoldMapChars $ callCC $ unwrapFoldMapChars . f . (FoldMapChars .)
 
 -- | Convert a 'FoldMapChars' into an 'FoldMapLine' function. This function is analogous to the
 -- 'runStateT' function.
