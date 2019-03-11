@@ -94,13 +94,6 @@ import           Control.Monad.Primitive
 import           Control.Monad.State
 import           Control.Monad.State.Class
 
-import qualified Data.ByteString             as Strict
-import qualified Data.ByteString.UTF8        as UTF8st
-import qualified Data.ByteString.Lazy        as Lazy
-import qualified Data.ByteString.Lazy.UTF8   as UTF8lz
-import           Data.Foldable               (toList)
-import           Data.Semigroup
-import qualified Data.Sequence               as Seq
 import qualified Data.Vector.Mutable         as MVec
 import qualified Data.Vector.Unboxed         as UVec
 import qualified Data.Vector.Generic.Mutable as GMVec
@@ -397,7 +390,7 @@ data LineBreaker
 -- 'TextLine', but on a 'Prelude.String' (list of 'Char's) stored in the 'TextBufferState' state.
 data TextLine tags
   = TextLine
-    { theTextLineString :: !StrictBytes
+    { theTextLineString :: !CharVector
     , theTextLineTags   :: !tags
     }
   deriving Functor
@@ -496,7 +489,7 @@ newCursorFromLine cur line = liftIO $ do
   -- line terminator, and always only at the end of the buffer. The 'TextLine' constructor is not
   -- exported.
   let str = line ^. textLineString
-  let len = UTF8st.length str
+  let len = intSize str
   cur <- pure $ min len $ max 0 cur
   let (before, after) = splitAt cur $ unpack str
   let (lenBefore, lenAfter) = (length before, length after)
@@ -592,7 +585,7 @@ bufferCurrentLine :: Lens' (TextBufferState tags) (TextCursor tags)
 bufferCurrentLine = lens theBufferCursor $ \ a b -> a{ theBufferCursor = b }
 
 -- | The null-terminated, UTF-8 encoded string of bytes stored in this line of text.
-textLineString :: Lens' (TextLine tags) StrictBytes
+textLineString :: Lens' (TextLine tags) CharVector
 textLineString = lens theTextLineString $ \ a b -> a{ theTextLineString = b }
 
 -- | Arbitrary information stored with this text. Typcial use cases for this field may include
@@ -884,8 +877,8 @@ insertString str = liftEditText $ use (bufferLineBreaker . lineBreaker) >>= loop
         tags <- use textCursorTags
         let len = UMVec.length vec
         if cur <= 0 then return $ pure () else do
-          --cut <- liftIO $ UVec.freeze $ UMVec.slice (len - cur - 1) (len - 1) vec
-          cut <- liftIO $ packSize cur <$> forM [len - cur - 1 .. len - 1] (UMVec.read vec)
+          cut <- liftIO $ UVec.freeze $ UMVec.slice (len - cur - 1) (len - 1) vec
+          --cut <- liftIO $ packSize cur <$> forM [len - cur - 1 .. len - 1] (UMVec.read vec)
           return $ do
             vec <- use bufferVector
             linesBelowCursor += 1

@@ -2,7 +2,7 @@
 module Hakshell.String
   ( tempTest,
     -- * Common Data Types
-    StrictBytes, LazyBytes,
+    StrictBytes, LazyBytes, CharVector,
     -- * Common String Functions
     ToStrictBytes(..),
     Packable(..), Unpackable(..), IntSized(..),
@@ -17,6 +17,8 @@ module Hakshell.String
 
 import           Hakshell.Struct
 
+import           Control.Monad
+
 import           Data.String
 import qualified Data.ByteString.Char8          as Strict
 import qualified Data.ByteString.Lazy.Char8     as Lazy
@@ -25,10 +27,11 @@ import qualified Data.ByteString.Builder.Extra  as Bytes
 import qualified Data.ByteString.UTF8           as StrictUTF8
 import qualified Data.ByteString.Lazy.UTF8      as LazyUTF8
 import qualified Data.IntMap                    as IMap
---import           Data.Monoid
 import           Data.Semigroup
 import           Data.Typeable
 import qualified Data.Vector                    as Vec
+import qualified Data.Vector.Unboxed            as UVec
+import qualified Data.Vector.Unboxed.Mutable    as UMVec
 
 import Debug.Trace
 
@@ -41,11 +44,13 @@ class ToStrictBytes str where { toStrictBytes :: str -> StrictBytes; }
 class Packable str where { pack :: String -> str; }
 instance Packable StrictBytes where { pack = StrictUTF8.fromString; }
 instance Packable LazyBytes   where { pack = LazyUTF8.fromString; }
+instance Packable CharVector  where { pack = UVec.fromList; }
 
 -- | Inverse of 'Packable'.
 class Unpackable str where { unpack :: str -> String; }
 instance Unpackable StrictBytes where { unpack = StrictUTF8.toString; }
 instance Unpackable LazyBytes   where { unpack = LazyUTF8.toString; }
+instance Unpackable CharVector  where { unpack = UVec.toList; }
 
 ----------------------------------------------------------------------------------------------------
 
@@ -58,6 +63,7 @@ instance Unpackable LazyBytes   where { unpack = LazyUTF8.toString; }
 -- operation since the string needs to be decoded from UTF8 when this happens.
 class IntSized obj where { intSize :: obj -> Int }
 instance IntSized StrictBytes where { intSize = Strict.length; }
+instance IntSized CharVector  where { intSize = UVec.length; }
 
 ----------------------------------------------------------------------------------------------------
 
@@ -75,6 +81,13 @@ instance SizePackable LazyBytes where
 instance SizePackable StrictBytes where
   packSize size = Lazy.toStrict . packSize size
 
+instance SizePackable CharVector where
+  packSize size elems = UVec.create
+    (do vec <- UMVec.replicate size '\0'
+        forM_ (zip [0 ..] elems) $ uncurry $ UMVec.write vec
+        return vec
+    )
+
 ----------------------------------------------------------------------------------------------------
 
 -- | A strict 'Strict.ByteString' from the "Data.ByteString.Char8" module. UTF8 encoding is provided
@@ -84,6 +97,15 @@ type StrictBytes = Strict.ByteString
 -- | A lazy 'Lazy.ByteString' from the "Data.ByteString.Lazy.Char8" module. UTF8 encoding is
 -- provided by the "Data.ByteString.Lazy.UTF8" module.
 type LazyBytes   = Lazy.ByteString
+
+-- | An immutable unboxed vector that contains a sequence of 'Char' values in contiguous
+-- memory. This data structure in many (but not all) cases tends to be the most efficient way to
+-- store strings. Unlike 'StrictBytes' or 'LazyBytes', a 'CharVector' guarnatees O(1) random access
+-- to characters in the array. So for strings that are subject to very heavy analycial computations
+-- in which the results cannot be computed by simple folding and mapping functions, a 'CharVector'
+-- may provide better performance at the expense of possibly increased memory usage and possibly
+-- slower memory access.
+type CharVector  = UVec.Vector Char
 
 ----------------------------------------------------------------------------------------------------
 
