@@ -64,6 +64,7 @@ module Hakshell.TextEditor
     -- ** Instances of Text Editing Type Classes
     EditText, newTextCursor,
     FoldMapLines, MapLines, EditLine, editLine,
+    FoldMapLinesHalt,
     FoldMapChars, foldMapChars, runFoldMapChars, execFoldMapChars, evalFoldMapChars,
     MapChars, runMapChars,
     -- * Text Editor Data Structures
@@ -181,6 +182,26 @@ instance MonadError TextEditError (FoldMapLines r fold tags) where
 
 instance MonadCont (FoldMapLines r fold tags) where
   callCC f = FoldMapLines $ callCC $ unwrapFoldMapLines . f . (FoldMapLines .)
+
+-- | When evaluating 'foldMapLinesM', a 'FoldMapLines' function is evaluated. The 'FoldMapLines'
+-- function type instantiates the 'Control.Monad.Cont.Class.MonadCont' type class, and the
+-- 'Control.Monad.Class.callCC' function is evaluated before running the fold map operation,
+-- producing a halting function. The halting function is of this data type.
+--
+-- Suppose you would like to fold and map over lines 5 through 35 counting the lines as you go, but
+-- halt if the line of text is @"stop\\n"@, you would evaluate 'foldMapLinesM' like so:
+--
+-- @
+-- stopSymbol <- 'Data.List.head' 'Control.Applicative.<$>' 'textLines' "stop\n"
+-- 'foldMapLines' 5 35 $ \\ halt thisLine -> do
+--     count <- 'Control.Monad.State.Class.get'
+--     'Control.Monad.when' (thisLine == stopSymbol) (halt count)
+--     -- If the "halt" function was evaluated in the above "when" statement,
+--     -- then the code below will not be evaluated.
+--     'Control.Monad.State.Class.put' (count + 1)
+--     return [thisLine]
+-- @
+type FoldMapLinesHalt fold tags a = forall void . (a -> FoldMapLines a fold tags void)
 
 -- | Convert a 'FoldMapLines' into an 'EditText' function. This function is analogous to the
 -- 'runStateT' function. This function does not actually perform a fold or map operation, rather it
