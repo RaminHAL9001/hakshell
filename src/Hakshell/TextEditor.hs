@@ -51,14 +51,17 @@
 module Hakshell.TextEditor
   ( -- * Text Editing API
     -- ** Create and Start Editing a 'TextBufferState'
-    TextBuffer, newTextBuffer, Relative, Absolute, LineIndex, CharIndex,
+    TextBuffer, newTextBuffer,
     runEditText, runMapLines, runFoldMapLines, execFoldMapLines, evalFoldMapLines,
     -- ** Text Editing Combinators
     RelativeToCursor(..),
     insertString, insertChar,
-    gotoPosition, gotoLine, gotoChar, moveCursor, moveByLine, moveByChar,
     copyCurrentLine, newCursorFromLine, replaceCurrentLine, clearCurrentLine,
     deleteChars, deleteCharsWrap, textCursorTags,
+    -- ** Cursor Positions
+    Relative, Absolute, LineIndex, CharIndex, TextLocation(..),
+    cursorLineIndex, cursorCharIndex, getCursor, gotoCursor, saveCursorEval,
+    gotoPosition, gotoLine, gotoChar, moveCursor, moveByLine, moveByChar,
     -- ** Text Editing Typeclasses
     MonadEditText(..), MonadEditLine(..),
     -- ** Instances of Text Editing Type Classes
@@ -778,6 +781,23 @@ pushCurrentLine rel = do
   MVec.write <$> use bufferVector <*> cursorIndex rel <*> copyCurrentLine >>= liftIO
   relativeToLine rel += 1
 
+-- Not for export: exposes internal structure of buffer array. I am not sure if this function will
+-- be useful. This function produces a list of "physical" indicies between two "logical" @'Absolute'
+-- 'LineIndex'@ values.
+iterateLineIndicies :: Absolute LineIndex -> Absolute LineIndex -> EditText tags [Int]
+iterateLineIndicies (Absolute (LineIndex a)) (Absolute (LineIndex b)) = do
+  (vec, above, below) <- liftEditText $
+    (,,) <$> use bufferVector <*> use linesAboveCursor <*> use linesBelowCursor
+  let bottom = MVec.length vec
+  let lineCount = above + below
+  let deck = bottom - below
+  let relToCursor i = if i < above then i else min bottom $ deck + i
+  let clip = relToCursor . max 0 . min lineCount . subtract 1
+  let iter a b = if a <= b then [a .. b] else [a, a-1 .. b]
+  (a, b) <- pure (clip a, clip b)
+  return $ if a <= above && b <= above || deck <= a && deck <= b then iter a b else
+    if a <= b then iter a above ++ iter deck b else iter b deck ++ iter above a
+
 ----------------------------------------------------------------------------------------------------
 
 -- | Create a copy of the 'bufferCurrentLine'.
@@ -974,3 +994,58 @@ insertString str = liftEditText $ use (bufferLineBreaker . lineBreaker) >>= loop
               }
       writeLine line
       loop more
+
+-- | Evaluate a folding and mapping monadic function over a range of lines specified. If the first
+-- 'LineIndex' parameter is greater than the second 'LineIndex' parameter, the fold map operation
+-- evaluates in reverse line order.
+--
+-- Remember that the 'FoldMapLines' function type instantiates 'Control.Monad.Cont.State.MonadCont',
+-- which means the 'FoldMapLines' function you pass to this function can elect to halt the fold map
+-- operation by evaluating the stop function passed to it.
+foldMapLinesM
+  :: Absolute LineIndex
+  -> Absolute LineIndex
+  -> ( FoldMapLinesHalt fold tags [TextLine tags] -> TextLine tags ->
+       FoldMapLines [TextLine tags] fold tags [TextLine tags]
+     )
+  -> EditText tags ()
+foldMapLinesM from@(Absolute (LineIndex a)) to@(Absolute (LineIndex b)) f = do
+  --vec  <- use bufferVector
+  --idxs <- iterateLineIndicies from to
+  error "TODO: foldMapLinesM"
+
+----------------------------------------------------------------------------------------------------
+
+data TextLocation
+  = TextLocation
+    { theCursorLineIndex :: !(Absolute LineIndex)
+    , theCursorCharIndex :: !(Absolute CharIndex)
+    }
+  deriving (Eq, Ord)
+
+cursorLineIndex :: Lens' TextLocation (Absolute LineIndex)
+cursorLineIndex = lens theCursorLineIndex $ \ a b -> a{ theCursorLineIndex = b }
+
+cursorCharIndex :: Lens' TextLocation (Absolute CharIndex)
+cursorCharIndex = lens theCursorCharIndex $ \ a b -> a{ theCursorCharIndex = b }
+
+-- | Get the current cursor location.
+getCursor :: (MonadEditText editor, Monad (editor tags)) => editor tags TextLocation
+getCursor = liftEditText $ TextLocation
+  <$> (Absolute . LineIndex . (+ 1) <$> use linesAboveCursor)
+  <*> editLine (Absolute . CharIndex . (+ 1) <$> use charsBeforeCursor)
+
+-- | Move the cursor to given 'TextLocation'.
+gotoCursor
+  :: (MonadEditText editor, Monad (editor tags))
+  => TextLocation -> editor tags ()
+gotoCursor (TextLocation{theCursorLineIndex=line,theCursorCharIndex=char}) = liftEditText $
+  gotoLine line >> editLine (gotoChar char)
+
+-- | Save the location of the cursor, then evaluate an @editor@ function. After evaluation
+-- completes, restore the location of the cursor (within range, as the location may no longer exist)
+-- and return the result of evaluation.
+saveCursorEval :: (MonadEditText editor, Monad (editor line)) => editor line a -> editor line a
+saveCursorEval f = do
+  (cur, a) <- (,) <$> getCursor <*> f
+  gotoCursor cur >> return a
