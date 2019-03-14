@@ -60,6 +60,7 @@ module Hakshell.TextEditor
     deleteChars, deleteCharsWrap, textCursorTags,
     -- ** Cursor Positions
     Relative, Absolute, LineIndex, CharIndex, TextLocation(..),
+    relativeLine, relativeChar,
     cursorLineIndex, cursorCharIndex, getCursor, gotoCursor, saveCursorEval,
     gotoPosition, gotoLine, gotoChar, moveCursor, moveByLine, moveByChar,
     -- ** Text Editing Typeclasses
@@ -1022,6 +1023,11 @@ data TextLocation
     , theCursorCharIndex :: !(Absolute CharIndex)
     }
   deriving (Eq, Ord)
+
+relativeLine :: RelativeToCursor -> Int -> Relative LineIndex
+relativeChar :: RelativeToCursor -> Int -> Relative CharIndex
+(relativeLine, relativeChar) = (f LineIndex, f CharIndex) where
+  f constr = ((Relative . constr) .) . \ case { Before -> negate; After -> id; }
 
 cursorLineIndex :: Lens' TextLocation (Absolute LineIndex)
 cursorLineIndex = lens theCursorLineIndex $ \ a b -> a{ theCursorLineIndex = b }
