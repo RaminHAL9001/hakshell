@@ -57,8 +57,11 @@ module Hakshell.TextEditor
     -- ** Text Editing Combinators
     RelativeToCursor(..),
     insertString, insertChar,
-    copyCurrentLine, newCursorFromLine, replaceCurrentLine, clearCurrentLine,
+    clearCurrentLine, resetCurrentLine,
     deleteChars, deleteCharsWrap, textCursorTags,
+    -- ** Manipulating Lines of Text
+    copyCurrentLine, readLineIndex, writeLineIndex, replaceCurrentLine,
+    beginInsertMode, endInsertMode,
     -- ** Cursor Positions
     Relative, Absolute, LineIndex, CharIndex, TextLocation(..),
     RelativeToAbsoluteCursor, -- <- does not export members
@@ -82,7 +85,7 @@ module Hakshell.TextEditor
     bufferCurrentLine, textLineString,
     lineBreakNLCR,
     -- ** Line Editing
-    TextLine, TextCursor, textCursorCharCount, textLineTags,
+    TextLine, TextCursor, newCursorFromLine, textCursorCharCount, textLineTags,
     -- ** Errors
     TextEditError(..),
     -- * Re-Exports
@@ -415,6 +418,9 @@ data TextBufferState tags
       -- ^ The number of line below the cursor
     , theBufferCursor      :: !(TextCursor tags)
       -- ^ A data structure for editing individual characters in a line of text.
+    , theBufferInsertMode  :: !Bool
+      -- ^ Whether or not the buffer is in insert mode, which means a 'TextLine' has been copied
+      -- into 'theBufferCursor'.
     }
 
 data TextEditError
@@ -512,6 +518,7 @@ newTextBuffer tag = do
     , theLinesAboveCursor  = 0
     , theLinesBelowCursor  = 0
     , theBufferCursor      = cur
+    , theBufferInsertMode  = False
     }
 
 -- | Use this to initialize a new empty 'TextCursor'. This is usually only handy if you want to
@@ -647,6 +654,11 @@ linesBelowCursor = lens theLinesBelowCursor $ \ a b -> a{ theLinesBelowCursor = 
 -- Not for export: the vector containing all the lines of text in this buffer.
 bufferVector :: Lens' (TextBufferState tags) (MVec.IOVector (TextLine tags))
 bufferVector = lens theBufferVector $ \ a b -> a{ theBufferVector = b }
+
+-- Not for export: needs to be set by higher-level combinators to prevent a line in the line editor
+-- cursor from being accidentally copied to more than one index in the line buffer.
+bufferInsertMode :: Lens' (TextBufferState tags) Bool
+bufferInsertMode = lens theBufferInsertMode $ \ a b -> a{ theBufferInsertMode = b }
 
 -- | The current line of text being edited under the cursor.
 bufferCurrentLine :: Lens' (TextBufferState tags) (TextCursor tags)
@@ -808,6 +820,52 @@ iterateLineIndicies (Absolute (LineIndex a)) (Absolute (LineIndex b)) = do
 copyCurrentLine :: (MonadEditText editor, Monad (editor tags)) => editor tags (TextLine tags)
 copyCurrentLine = liftEditText $ use bufferCurrentLine >>= liftIO . unsafeMakeLine
 
+-- | Read a 'TextLine' from an @('Absolute' 'LineIndex')@ address. If the index is out of bounds,
+-- 'Prelude.Nothing' is returned.
+readLineIndex
+  :: (MonadEditText editor, Monad (editor tags))
+  => Absolute LineIndex -> editor tags (Maybe (TextLine tags))
+readLineIndex (Absolute (LineIndex i)) = error "TODO: writeLineTo"
+
+-- | Write a 'TextLine' (as produced by 'copyCurrentLine' or readLineIndex') to an @('Absolute'
+-- 'LineIndex')@ address. If the index is out of bounds, it is written to the end of the buffer.
+writeLineIndex
+  :: (MonadEditText editor, Monad (editor tags))
+  => Absolute LineIndex -> TextLine tags -> editor tags ()
+writeLineIndex (Absolute (LineIndex i)) line = error "TODO: writeLineIndex"
+
+-- | If not in 'bufferInsertMode', this function removes the current line under the cursor from the
+-- text buffer and places it into the 'bufferCurrentLine' line editor so that character-by-character
+-- editing may be performed. If already in 'bufferInsertMode' this function performs no operation.
+beginInsertMode ::  (MonadEditText editor, Monad (editor tags)) => editor tags ()
+beginInsertMode = liftEditText $ do
+  insMode <- use bufferInsertMode
+  unless insMode $ do
+    cur   <- Absolute . CharIndex . subtract 1 <$> use (bufferCurrentLine . charsBeforeCursor)
+    vec   <- use bufferVector
+    above <- use linesAboveCursor
+    below <- use linesBelowCursor
+    if above > 0 then do
+      liftIO (MVec.read vec above) >>= replaceCurrentLine cur
+      linesAboveCursor %= subtract 1
+     else if below > 0 then do
+      liftIO (MVec.read vec $ MVec.length vec - below) >>= replaceCurrentLine cur
+      linesBelowCursor %= subtract 1
+     else do
+      use bufferDefaultTag >>= liftIO . newTextCursor >>= assign bufferCurrentLine
+    bufferInsertMode .= True
+
+-- | If in 'bufferInsertMode', this function places the 'bufferCurrentLine' back into the text
+-- buffer, clears the 'bufferCurrentLine' cursor, and sets the 'bufferInsertMode' to
+-- 'Prelude.False'. If not in 'bufferInsertMode', this function performs no operation.
+endInsertMode :: (MonadEditText editor, Monad (editor tags)) => editor tags ()
+endInsertMode = liftEditText $ do
+  insMode <- use bufferInsertMode
+  when insMode $ do
+    --growBufferIfTooSmall 1
+    MVec.write <$> use bufferVector <*> use linesAboveCursor <*> copyCurrentLine >>= liftIO
+    bufferInsertMode .= False
+
 -- | Replace the content in the 'bufferCurrentLine' with the content in the given 'TextLine'. Pass
 -- an integer value indicating where the cursor position should be set. This function does not
 -- re-allocate the current line editor buffer unless it is too small to hold all of the characters
@@ -833,13 +891,20 @@ replaceCurrentLine (Absolute (CharIndex cur)) line = liftEditLine $ do
     copy $ (id &&& id) <$> [0 .. cur - 1]
     copy $ zip [targlen - cur - 1 .. targlen - 1] [srclen - cur - 1 .. srclen - 1]
 
--- | Delete the 'bufferCurrentLine', replacing it with a new empty line. This function also resets
--- the line editor buffer to the default allocation size, allowing the garbage collector to delete
--- the previous allocation, meaning this function may shrink the line editor buffer memory
--- allocation.
-clearCurrentLine :: (MonadEditText editor, Monad (editor tags)) => editor tags ()
-clearCurrentLine = liftEditText $
-  use bufferDefaultTag >>= liftIO . newTextCursor >>= assign bufferCurrentLine
+-- | Delete the content of the 'bufferCurrentLine'. This function does not change the memory
+-- allocation for the 'TextCursor', it simply sets the character count to zero. Tags on this line
+-- are not effected.
+clearCurrentLine :: (MonadEditLine editor, Monad (editor tags)) => editor tags ()
+clearCurrentLine = liftEditLine $ charsBeforeCursor .= 0 >> charsAfterCursor .= 0
+
+-- | Like 'clearCurrentLine', this function deletes the content of the 'bufferCurrentLine', and tags
+-- on this line are not effected. The difference is that this function replaces the
+-- 'bufferCurrentLine' with a new empty line, resetting the line editor buffer to the default
+-- allocation size and allowing the garbage collector to delete the previous allocation. This means
+-- the line editor buffer memory allocation may be shrunk to it's minimal/default size.
+resetCurrentLine :: (MonadEditText editor, Monad (editor tags)) => editor tags ()
+resetCurrentLine = liftEditText $
+  use (bufferCurrentLine . textCursorTags) >>= liftIO . newTextCursor >>= assign bufferCurrentLine
 
 -- Not for export: exposes structure of internal mutable vector. Moves a region of elements near the
 -- cursor from top to bottom, or from bottom to top. Negative value for select indicates to select
