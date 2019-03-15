@@ -61,6 +61,8 @@ module Hakshell.TextEditor
     deleteChars, deleteCharsWrap, textCursorTags,
     -- ** Cursor Positions
     Relative, Absolute, LineIndex, CharIndex, TextLocation(..),
+    RelativeToAbsoluteCursor, -- <- does not export members
+    relativeToAbsolute,
     relativeLine, relativeChar,
     cursorLineIndex, cursorCharIndex, getCursor, gotoCursor, saveCursorEval,
     gotoPosition, gotoLine, gotoChar, moveCursor, moveByLine, moveByChar,
@@ -1056,3 +1058,19 @@ saveCursorEval :: (MonadEditText editor, Monad (editor line)) => editor line a -
 saveCursorEval f = do
   (cur, a) <- (,) <$> getCursor <*> f
   gotoCursor cur >> return a
+
+class RelativeToAbsoluteCursor index where
+  -- | Convert a 'Relative' index (either a 'LineIndex' or 'CharIndex') to an 'Absolute' index.
+  relativeToAbsolute
+    :: (MonadEditText editor, Monad (editor line))
+    => Relative index -> editor line (Absolute index)
+
+instance RelativeToAbsoluteCursor LineIndex where
+  relativeToAbsolute (Relative (LineIndex i)) = liftEditText $
+    Absolute . LineIndex . (+ 1) . max 0 . app . (min &&& (+ i)) <$>
+    use linesAboveCursor
+
+instance RelativeToAbsoluteCursor CharIndex where
+  relativeToAbsolute (Relative (CharIndex i)) = liftEditText $
+    Absolute . CharIndex . (+ 1) . max 0 . app . (min &&& (+ i)) <$>
+    liftEditLine (use charsBeforeCursor)
