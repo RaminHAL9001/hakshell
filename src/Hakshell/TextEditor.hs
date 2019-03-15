@@ -5,7 +5,7 @@
 -- Any useful system shell needs some form of text editor. Some systems, like traditional UNIX
 -- systems, prefer to keep the editor separate from the shell's command line interpreter. In Linux,
 -- for example, you have Bash as the interpreter, and you can choose from a variety of editor
--- programs depending on your needs: Ed, Sed, Awk, Ex, Vi, Nano, Emacs, and so on. Sed and Awk are
+-- programs depending on your needs: Awk, Sed, Ed, Ex, Vi, Nano, Emacs, and so on. Sed and Awk are
 -- for automatic text processing, where as Ed, Ex, Vi, Nano, and Emacs are for interactive text
 -- editing.
 --
@@ -21,23 +21,24 @@
 -- also used throughout the UNIX system, but as often as possible there are tools for representing
 -- the binary information as text, and even re-constructing binary from it's textual representation.
 --
--- Bash still has extensive commands for manipulating text. Much of this functionality within Bash,
--- for example, Globs and Regular Expressions, are also provided by the text editor programs -- it
--- may even be possible for both Bash and an editor like Vi to use the exact same glob pattern
--- implementation by linking these Bash or Vi against a glob pattern library. The only difference is
--- the end users see is that in Bash, these functions are invoked through the various Bash
--- programming language features (often embedded in bash syntax, like when you run the command @ls
--- *@), where as in an editor like Vi or Emacs, these functions are invoked interactively, for
--- example, when doing an interactive text search/replace operation.
+-- Bash also has extensive functionality for manipulating text, for example, Globs and Regular
+-- Expressions, which are also provided by the text editor programs. It is even theoretically
+-- possible for both Bash and an editor like Vi to use the exact same glob pattern implementation by
+-- linking these Bash or Vi against a glob pattern library. The only difference is the end users see
+-- is that in Bash, these functions are invoked through the various Bash programming language
+-- features (often embedded in Bash syntax, like when you run the command @ls *@), where as in an
+-- editor like Vi or Emacs, these functions are invoked interactively, for example, when doing an
+-- interactive text search/replace operation.
 --
--- Emacs itself further eliminates the distinction between shell and text editor. It is even
--- arguable as to whether Emacs is a text editor at all. Some people jokingly refer to it as an
--- "operating system that lacks a useful text editor." A more accurate description of Emacs would be
--- a "Lisp interpreter that allows one to easily invent various text editors for various specific
--- use cases." You could also call Emacs an IDE, or an app platform, both of which have their text
--- editing facilities provided for by the built-in Emacs text editor functionality. Emacs also has
--- very good shell integration: there are commands that execute shell commands with buffered text as
--- input, and capturing the output text of the process back into a buffer.
+-- Emacs itself further eliminates the distinction between shell and text editor, so much so that it
+-- is even arguable as to whether Emacs is a text editor at all. Some people jokingly refer to it as
+-- an "operating system that lacks a useful text editor." A more accurate description of Emacs would
+-- be a "Lisp interpreter that allows one to easily invent various interactive text editors for
+-- various specific use cases." You could also call Emacs an IDE, or an app platform, both of which
+-- have their text editing facilities provided for by the built-in Emacs text editor
+-- functionality. Emacs also has very good shell integration: there are commands that execute shell
+-- commands with buffered text as input, and capturing the output text of the process back into a
+-- buffer.
 --
 -- Emacs can, to a great extent, perform most all of the same functions as Bash, while providing
 -- countless additional interactive feautres. You can therefore think of Emacs a more advanced
