@@ -827,23 +827,6 @@ popLine = liftEditText . \ case
   After  -> use linesBelowCursor >>= \ after ->
     if after == 0 then return Nothing else Just <$> unsafePopLine After
 
--- Not for export: exposes internal structure of buffer array. I am not sure if this function will
--- be useful. This function produces a list of "physical" indicies between two "logical" @'Absolute'
--- 'LineIndex'@ values.
-iterateLineIndicies :: Absolute LineIndex -> Absolute LineIndex -> EditText tags [Int]
-iterateLineIndicies (Absolute (LineIndex a)) (Absolute (LineIndex b)) = do
-  (vec, above, below) <- liftEditText $
-    (,,) <$> use bufferVector <*> use linesAboveCursor <*> use linesBelowCursor
-  let bottom = MVec.length vec
-  let lineCount = above + below
-  let deck = bottom - below
-  let relToCursor i = if i < above then i else min bottom $ deck + i
-  let clip = relToCursor . max 0 . min lineCount . subtract 1
-  let iter a b = if a <= b then [a .. b] else [a, a-1 .. b]
-  (a, b) <- pure (clip a, clip b)
-  return $ if a <= above && b <= above || deck <= a && deck <= b then iter a b else
-    if a <= b then iter a above ++ iter deck b else iter b deck ++ iter above a
-
 ----------------------------------------------------------------------------------------------------
 
 -- | Create a copy of the 'bufferCurrentLine'.
