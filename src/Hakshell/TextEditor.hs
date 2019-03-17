@@ -1100,6 +1100,20 @@ insertString str = liftEditText $ use (bufferLineBreaker . lineBreaker) >>= loop
       writeLine line
       loop more
 
+-- Not for export: this code shared by 'forLinesInRangeM' and 'forLinesM' but requires knowledge of
+-- the 'TextBuffer' internals in order to use, so is not something end users should need to know
+-- about.
+forLinesLoopM
+  :: fold
+  -> (FoldMapLinesHalt void fold tags fold ->
+      TextLine tags -> FoldMapLines fold fold tags [TextLine tags])
+  -> Int
+  -> (EditText tags (TextLine tags), TextLine tags -> FoldMapLines fold fold tags ())
+  -> EditText tags fold
+forLinesLoopM fold f count (pop, push) = execFoldMapLines (callCC $ loop count) fold where
+  loop count halt = if count <= 0 then get else
+    liftEditText pop >>= f halt >>= mapM_ push >> loop (count - 1) halt
+
 -- | Move the cursor to the first @'Absolute' 'LineIndex'@ parameter given (will evaluate
 -- 'endInsertMode)', then evaluate a folding and mapping monadic function over a range of lines
 -- specified. If the first 'LineIndex' parameter is greater than the second 'LineIndex' parameter,
@@ -1132,12 +1146,9 @@ forLinesInRangeM (Absolute (LineIndex from)) (Absolute (LineIndex to)) fold f = 
   to   <- pure $ min lineCount $ max 0 to
   gotoLine $ Absolute $ LineIndex $ from
   let dist = to - from
-  let (pop, push) = if dist < 0
-         then (unsafePopLine Before, pushLine After)
-         else (unsafePopLine After, pushLine Before)
-  let loop count halt = if count <= 0 then get else
-        liftEditText pop >>= f halt >>= mapM_ push >> loop (count - 1) halt
-  execFoldMapLines (callCC $ loop $ abs dist + 1) fold
+  forLinesLoopM fold f (abs dist + 1) $ if dist < 0
+    then (unsafePopLine Before, pushLine After)
+    else (unsafePopLine After, pushLine Before)
 
 -- | Like 'forLinesInRangeM', but this function takes a 'RelativeToCursor' value, iteration begins
 -- at the 'bufferCurrentLine', and if the 'RelativeToCursor' value is 'After' then iteration goes
@@ -1152,12 +1163,9 @@ forLinesM
 forLinesM rel fold f = do
   above <- use linesAboveCursor
   below <- use linesBelowCursor
-  let (inRange, count, pop, push) = case rel of
-        Before -> (above >= 0, above, unsafePopLine Before, pushLine After)
-        After  -> (below >= 0, below, unsafePopLine After, pushLine Before)
-  let loop count halt = if count <= 0 then get else
-        liftEditText pop >>= f halt >>= mapM_ push >> loop (count - 1) halt
-  if inRange then execFoldMapLines (callCC $ loop count) fold else return fold
+  uncurry (forLinesLoopM fold f) $ case rel of
+    Before -> (above, (unsafePopLine Before, pushLine After))
+    After  -> (below, (unsafePopLine After, pushLine Before))
 
 ----------------------------------------------------------------------------------------------------
 
