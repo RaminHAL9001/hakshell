@@ -64,7 +64,7 @@ module Hakshell.TextEditor
     copyCurrentLine, replaceCurrentLine,
     pushLine, popLine,
     readLineIndex, writeLineIndex,
-    forLinesInRangeM,
+    forLinesM, forLinesInRangeM,
     -- ** Cursor Positions
     Relative, Absolute, LineIndex, CharIndex, TextLocation(..),
     RelativeToAbsoluteCursor, -- <- does not export members
@@ -1118,7 +1118,7 @@ insertString str = liftEditText $ use (bufferLineBreaker . lineBreaker) >>= loop
 -- which means the 'FoldMapLines' function you pass to this function can elect to halt the fold map
 -- operation by evaluating the stop function passed to it.
 forLinesInRangeM
-  :: forall fold tags void . Absolute LineIndex -> Absolute LineIndex
+  :: Absolute LineIndex -> Absolute LineIndex
   -> fold
   -> (FoldMapLinesHalt void fold tags fold ->
       TextLine tags -> FoldMapLines fold fold tags [TextLine tags])
@@ -1137,7 +1137,27 @@ forLinesInRangeM (Absolute (LineIndex from)) (Absolute (LineIndex to)) fold f = 
          else (unsafePopLine After, pushLine Before)
   let loop count halt = if count <= 0 then get else
         liftEditText pop >>= f halt >>= mapM_ push >> loop (count - 1) halt
-  execFoldMapLines (callCC $ \ halt -> loop (abs dist + 1) halt) fold
+  execFoldMapLines (callCC $ loop $ abs dist + 1) fold
+
+-- | Like 'forLinesInRangeM', but this function takes a 'RelativeToCursor' value, iteration begins
+-- at the 'bufferCurrentLine', and if the 'RelativeToCursor' value is 'After' then iteration goes
+-- forward to the end of the buffer, whereas if the 'RelativeToCursor' value is 'Before' then
+-- iteration goes backward to the start of the buffer.
+forLinesM
+  :: RelativeToCursor
+  -> fold
+  -> (FoldMapLinesHalt void fold tags fold ->
+      TextLine tags -> FoldMapLines fold fold tags [TextLine tags])
+  -> EditText tags fold
+forLinesM rel fold f = do
+  above <- use linesAboveCursor
+  below <- use linesBelowCursor
+  let (inRange, count, pop, push) = case rel of
+        Before -> (above >= 0, above, unsafePopLine Before, pushLine After)
+        After  -> (below >= 0, below, unsafePopLine After, pushLine Before)
+  let loop count halt = if count <= 0 then get else
+        liftEditText pop >>= f halt >>= mapM_ push >> loop (count - 1) halt
+  if inRange then execFoldMapLines (callCC $ loop count) fold else return fold
 
 ----------------------------------------------------------------------------------------------------
 
