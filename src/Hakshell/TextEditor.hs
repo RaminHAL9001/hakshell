@@ -60,8 +60,11 @@ module Hakshell.TextEditor
     clearCurrentLine, resetCurrentLine,
     deleteChars, deleteCharsWrap, textCursorTags,
     -- ** Manipulating Lines of Text
-    copyCurrentLine, readLineIndex, writeLineIndex, replaceCurrentLine,
     beginInsertMode, endInsertMode,
+    copyCurrentLine, replaceCurrentLine,
+    pushLine, popLine,
+    readLineIndex, writeLineIndex,
+    forLinesInRangeM,
     -- ** Cursor Positions
     Relative, Absolute, LineIndex, CharIndex, TextLocation(..),
     RelativeToAbsoluteCursor, -- <- does not export members
@@ -82,7 +85,7 @@ module Hakshell.TextEditor
     TextBufferState, LineBreaker(..), bufferLineBreaker, lineBreaker, lineBreakPredicate,
     theBufferCharCount, theBufferCharNumber,
     theBufferLineCount, theBufferLineNumber,
-    bufferCurrentLine, textLineString,
+    bufferCurrentLine, textLineString, bufferDefaultTags,
     lineBreakNLCR,
     -- ** Line Editing
     TextLine, TextCursor, newCursorFromLine, textCursorCharCount, textLineTags,
@@ -193,13 +196,13 @@ instance MonadError TextEditError (FoldMapLines r fold tags) where
 instance MonadCont (FoldMapLines r fold tags) where
   callCC f = FoldMapLines $ callCC $ unwrapFoldMapLines . f . (FoldMapLines .)
 
--- | When evaluating 'foldMapLinesM', a 'FoldMapLines' function is evaluated. The 'FoldMapLines'
+-- | When evaluating 'forLinesInRangeM', a 'FoldMapLines' function is evaluated. The 'FoldMapLines'
 -- function type instantiates the 'Control.Monad.Cont.Class.MonadCont' type class, and the
 -- 'Control.Monad.Class.callCC' function is evaluated before running the fold map operation,
 -- producing a halting function. The halting function is of this data type.
 --
 -- Suppose you would like to fold and map over lines 5 through 35 counting the lines as you go, but
--- halt if the line of text is @"stop\\n"@, you would evaluate 'foldMapLinesM' like so:
+-- halt if the line of text is @"stop\\n"@, you would evaluate 'forLinesInRangeM' like so:
 --
 -- @
 -- stopSymbol <- 'Data.List.head' 'Control.Applicative.<$>' 'textLines' "stop\n"
@@ -211,7 +214,7 @@ instance MonadCont (FoldMapLines r fold tags) where
 --     'Control.Monad.State.Class.put' (count + 1)
 --     return [thisLine]
 -- @
-type FoldMapLinesHalt fold tags a = forall void . (a -> FoldMapLines a fold tags void)
+type FoldMapLinesHalt void fold tags r = r -> FoldMapLines r fold tags void
 
 -- | Convert a 'FoldMapLines' into an 'EditText' function. This function is analogous to the
 -- 'runStateT' function. This function does not actually perform a fold or map operation, rather it
@@ -223,7 +226,7 @@ runFoldMapLines (FoldMapLines f) = runStateT (runExceptT $ runContT f return) >=
 
 -- | Like 'runFoldMapLines' but only returns the @fold@ result. This function is analogous to the
 -- 'execStateT' function.
-execFoldMapLines :: FoldMapLines fold fold tags a -> fold -> EditText tags fold
+execFoldMapLines :: FoldMapLines fold fold tags void -> fold -> EditText tags fold
 execFoldMapLines (FoldMapLines f) = runStateT (runExceptT $ runContT f $ const get) >=> \ case
   (Left err, _   ) -> throwError err
   (Right  _, fold) -> return fold
@@ -387,7 +390,7 @@ newtype TextBuffer tags = TextBuffer (MVar (TextBufferState tags))
 -- 'TextBuffer' data type. The constructor for this data type is not exposed because it is
 -- automatically constructed by the 'newTextBuffer' function, and it contains what object oriented
 -- programmers would call "private" variables. However some of the lenses for this data type, namely
--- 'bufferDefaultTag', 'bufferLineBreaker', and 'bufferCurrentLine', do allow you to modify the
+-- 'bufferDefaultTags', 'bufferLineBreaker', and 'bufferCurrentLine', do allow you to modify the
 -- variable fields of this data type.
 --
 -- The 'EditText' monad instantiates the 'MonadState' typeclass such that the stateful data is this
@@ -404,7 +407,7 @@ data TextBufferState tags
       -- ^ The total number of lines in this buffer.
     , theBufferLineNumber  :: !Int
       -- ^ The line number of the 'bufferCurrentLine'. The top-most line of any buffer is 1.
-    , theBufferDefaultTag  :: tags
+    , theBufferDefaultLine :: !(TextLine tags)
       -- ^ The tag value to use when new 'TextLine's are automatically constructed after a line
       -- break character is inserted.
     , theBufferLineBreaker :: LineBreaker
@@ -504,15 +507,18 @@ textCursorTags = lens theTextCursorTags $ \ a b -> a{ theTextCursorTags = b }
 -- tag, so it is necessary to pass an initializing tag value of type @tags@ -- if you need nothing
 -- but plain text editing, @tags@ can be unit @()@.
 newTextBuffer :: tags -> IO (TextBufferState tags)
-newTextBuffer tag = do
-  cur <- newTextCursor tag
+newTextBuffer tags = do
+  cur <- newTextCursor tags
   buf <- MVec.new 512
   return TextBufferState
     { theBufferCharNumber  = 0
     , theBufferCharCount   = 0
     , theBufferLineNumber  = 0
     , theBufferLineCount   = 0
-    , theBufferDefaultTag  = tag
+    , theBufferDefaultLine = TextLine
+        { theTextLineTags    = tags
+        , theTextLineString  = mempty
+        }
     , theBufferLineBreaker = lineBreakNLCR
     , theBufferVector      = buf
     , theLinesAboveCursor  = 0
@@ -613,12 +619,16 @@ bufferLineCount = lens theBufferLineCount $ \ a b -> a{ theBufferLineCount = b }
 bufferLineNumber :: Lens' (TextBufferState tags) Int
 bufferLineNumber = lens theBufferLineNumber $ \ a b -> a{ theBufferLineNumber = b }
 
+-- Not for export: this is only used to set empty lines in the buffer.
+bufferDefaultLine :: Lens' (TextBufferState tags) (TextLine tags)
+bufferDefaultLine = lens theBufferDefaultLine $ \ a b -> a{ theBufferDefaultLine = b }
+
 -- | Entering a line-breaking character (e.g. @'\n'@) into a 'TextBufferState' using 'insertChar' or
 -- 'insertString' results in several 'TextLine's being generated automatically. Whenever a
 -- 'TextLine' is constructed, there needs to be a default tag value that is assigned to it. This
 -- lens allows you to observe or set the default tag value.
-bufferDefaultTag :: Lens' (TextBufferState tags) tags
-bufferDefaultTag = lens theBufferDefaultTag $ \ a b -> a{ theBufferDefaultTag = b }
+bufferDefaultTags :: Lens' (TextBufferState tags) tags
+bufferDefaultTags = bufferDefaultLine . textLineTags
 
 -- | The function used to break strings into lines. This function is called every time a string is
 -- transferred from 'theBufferCursor' to 'theLinesAbove' or 'theLinesBelow'. Note that setting this
@@ -786,16 +796,36 @@ growBufferIfTooSmall grow = do
   below <- use linesBelowCursor
   liftIO (growVec buf above below grow) >>= assign bufferVector
 
--- Not for export: these functions, when evaluated alone, leave the 'TextBufferState' in an inconsistent
--- state. This function creates a 'TextLine' from the 'TextCursor' stored at 'bufferCurrentLine'. It
--- does nothing to replace the 'bufferCurrentLine', so essentially the line is duplicated and pushed
--- upward or downward, and it is then up to the calling context whether to open a new line, or
--- replace the current line with a line above or below.
-pushCurrentLine :: RelativeToCursor -> EditText tags ()
-pushCurrentLine rel = do
+-- | Push a 'TextLine' before or after the cursor. This function does not effect the content of the
+-- 'bufferCurrentLine'.
+pushLine
+  :: (MonadEditText editor, Monad (editor tags))
+  => RelativeToCursor -> TextLine tags -> editor tags ()
+pushLine rel line = liftEditText $ do
   growBufferIfTooSmall 1
-  MVec.write <$> use bufferVector <*> cursorIndex rel <*> copyCurrentLine >>= liftIO
+  MVec.write <$> use bufferVector <*> cursorIndex rel <*> pure line >>= liftIO
   relativeToLine rel += 1
+
+unsafePopLine :: RelativeToCursor -> EditText tags (TextLine tags)
+unsafePopLine rel = do
+  vec <- use bufferVector
+  i   <- cursorIndex rel
+  nil <- use bufferDefaultLine
+  liftIO (MVec.read vec i <* MVec.write vec i nil) <*
+    ((case rel of{ Before -> linesAboveCursor; After -> linesBelowCursor; }) -= 1)
+
+-- | Pop a 'TextLine' from before or after the cursor. This function does not effect the content of
+-- the 'bufferCurrentLine'. If you 'popLine' from 'Before' the cursor when the 'bufferCurrentLine'
+-- is at the beginning of the buffer, or if you 'popLine' from 'After' the cursor when the
+-- 'bufferCurrentLine' is at the end of the buffer, 'Prelude.Nothing' will be returned.
+popLine
+  :: (MonadEditText editor, Monad (editor tags))
+  => RelativeToCursor -> editor tags (Maybe (TextLine tags))
+popLine = liftEditText . \ case
+  Before -> use linesAboveCursor >>= \ before ->
+    if before == 0 then return Nothing else Just <$> unsafePopLine Before
+  After  -> use linesBelowCursor >>= \ after ->
+    if after == 0 then return Nothing else Just <$> unsafePopLine After
 
 -- Not for export: exposes internal structure of buffer array. I am not sure if this function will
 -- be useful. This function produces a list of "physical" indicies between two "logical" @'Absolute'
@@ -878,7 +908,7 @@ beginInsertMode = liftEditText $ do
       liftIO (MVec.read vec $ MVec.length vec - below) >>= replaceCurrentLine cur
       linesBelowCursor %= subtract 1
      else do
-      use bufferDefaultTag >>= liftIO . newTextCursor >>= assign bufferCurrentLine
+      use bufferDefaultTags >>= liftIO . newTextCursor >>= assign bufferCurrentLine
     bufferInsertMode .= True
 
 -- | If in 'bufferInsertMode', this function places the 'bufferCurrentLine' back into the text
@@ -887,10 +917,8 @@ beginInsertMode = liftEditText $ do
 endInsertMode :: (MonadEditText editor, Monad (editor tags)) => editor tags ()
 endInsertMode = liftEditText $ do
   insMode <- use bufferInsertMode
-  when insMode $ do
-    --growBufferIfTooSmall 1
-    MVec.write <$> use bufferVector <*> use linesAboveCursor <*> copyCurrentLine >>= liftIO
-    bufferInsertMode .= False
+  when insMode $
+    (copyCurrentLine <* clearCurrentLine) >>= pushLine Before >> bufferInsertMode .= False
 
 -- | Replace the content in the 'bufferCurrentLine' with the content in the given 'TextLine'. Pass
 -- an integer value indicating where the cursor position should be set. This function does not
@@ -1064,9 +1092,8 @@ insertString
   :: (MonadEditText editor, Monad (editor tags))
   => String -> editor tags ()
 insertString str = liftEditText $ use (bufferLineBreaker . lineBreaker) >>= loop . ($ str) where
-  push = pushCurrentLine Before >> clearCurrentLine
   writeStr = mapM_ $ insertChar Before
-  writeLine (str, lbrk) = writeStr str >> writeStr lbrk >> push
+  writeLine (str, lbrk) = writeStr str >> writeStr lbrk >> endInsertMode
   loop = \ case
     []          -> return ()
     [(str, "")] -> writeStr str
@@ -1090,24 +1117,44 @@ insertString str = liftEditText $ use (bufferLineBreaker . lineBreaker) >>= loop
       writeLine line
       loop more
 
--- | Evaluate a folding and mapping monadic function over a range of lines specified. If the first
--- 'LineIndex' parameter is greater than the second 'LineIndex' parameter, the fold map operation
--- evaluates in reverse line order.
+-- | Move the cursor to the first @'Absolute' 'LineIndex'@ parameter given (will evaluate
+-- 'endInsertMode)', then evaluate a folding and mapping monadic function over a range of lines
+-- specified. If the first 'LineIndex' parameter is greater than the second 'LineIndex' parameter,
+-- the fold map operation evaluates in reverse line order.
+--
+-- If you do not want to lose the current cursor position, be sure to wrap the evaluation of this
+-- function in a call to the 'saveCursorEval'.
+--
+-- The 'FoldMapLines' function you pass to this function will receive every 'TextLine' on and
+-- between the two @'Absolute' 'TextIndex'@ parameters given, and can return zero or more updated
+-- 'TextLine' values to replace the 'TextLine' received at each evaluation. Return an empty list to
+-- delete the line, return the given 'TextLine' alone as a list of a single element to perform no
+-- updating action to it.
 --
 -- Remember that the 'FoldMapLines' function type instantiates 'Control.Monad.Cont.State.MonadCont',
 -- which means the 'FoldMapLines' function you pass to this function can elect to halt the fold map
 -- operation by evaluating the stop function passed to it.
-foldMapLinesM
-  :: Absolute LineIndex
-  -> Absolute LineIndex
-  -> ( FoldMapLinesHalt fold tags [TextLine tags] -> TextLine tags ->
-       FoldMapLines [TextLine tags] fold tags [TextLine tags]
-     )
-  -> EditText tags ()
-foldMapLinesM from@(Absolute (LineIndex a)) to@(Absolute (LineIndex b)) f = do
-  --vec  <- use bufferVector
-  --idxs <- iterateLineIndicies from to
-  error "TODO: foldMapLinesM"
+forLinesInRangeM
+  :: forall fold tags void . Absolute LineIndex -> Absolute LineIndex
+  -> fold
+  -> (FoldMapLinesHalt void fold tags fold ->
+      TextLine tags -> FoldMapLines fold fold tags [TextLine tags])
+  -> EditText tags fold
+forLinesInRangeM (Absolute (LineIndex from)) (Absolute (LineIndex to)) fold f = do
+  endInsertMode
+  above <- use linesAboveCursor
+  below <- use linesBelowCursor
+  let lineCount = above + below
+  from <- pure $ min lineCount $ max 0 from
+  to   <- pure $ min lineCount $ max 0 to
+  gotoLine $ Absolute $ LineIndex $ from
+  let dist = to - from
+  let (pop, push) = if dist < 0
+         then (unsafePopLine Before, pushLine After)
+         else (unsafePopLine After, pushLine Before)
+  let loop count halt = if count <= 0 then get else
+        liftEditText pop >>= f halt >>= mapM_ push >> loop (count - 1) halt
+  execFoldMapLines (callCC $ \ halt -> loop (abs dist + 1) halt) fold
 
 ----------------------------------------------------------------------------------------------------
 
