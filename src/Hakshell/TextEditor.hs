@@ -825,14 +825,40 @@ copyCurrentLine = liftEditText $ use bufferCurrentLine >>= liftIO . unsafeMakeLi
 readLineIndex
   :: (MonadEditText editor, Monad (editor tags))
   => Absolute LineIndex -> editor tags (Maybe (TextLine tags))
-readLineIndex (Absolute (LineIndex i)) = error "TODO: writeLineTo"
+readLineIndex (Absolute (LineIndex i')) = liftEditText $ let i = i' - 1 in
+  if i < 0 then return Nothing else do
+    above <- use linesAboveCursor
+    vec   <- use bufferVector
+    let len = MVec.length vec
+    if i < above then liftIO $ Just <$> MVec.read vec i else do
+      below <- use linesBelowCursor
+      i <- pure $ i - above
+      if i >= below then return Nothing else liftIO $ Just <$> MVec.read vec (len - below + i - 1)
 
 -- | Write a 'TextLine' (as produced by 'copyCurrentLine' or readLineIndex') to an @('Absolute'
--- 'LineIndex')@ address. If the index is out of bounds, it is written to the end of the buffer.
+-- 'LineIndex')@ address. If the index is out of bounds, 'Prelude.False' is returned.
 writeLineIndex
   :: (MonadEditText editor, Monad (editor tags))
-  => Absolute LineIndex -> TextLine tags -> editor tags ()
-writeLineIndex (Absolute (LineIndex i)) line = error "TODO: writeLineIndex"
+  => Absolute LineIndex -> TextLine tags -> editor tags Bool
+writeLineIndex (Absolute (LineIndex i')) line = liftEditText $ let i = i' - 1 in
+  if i < 0 then return False else do
+    above <- use linesAboveCursor
+    vec   <- use bufferVector
+    let len = MVec.length vec
+    if i <= above
+     then do
+      liftIO $ MVec.write vec i line
+      when (i == above) $ linesAboveCursor += 1
+      return True
+     else do
+      below <- use linesBelowCursor
+      i     <- pure $ i - above
+      if i >= below
+       then if i /= below then return False else do
+        liftIO $ MVec.write vec (len - below - 1) line
+        linesBelowCursor += 1
+        return True
+       else liftIO (MVec.write vec (len - below + i - 1) line) >> return True
 
 -- | If not in 'bufferInsertMode', this function removes the current line under the cursor from the
 -- text buffer and places it into the 'bufferCurrentLine' line editor so that character-by-character
