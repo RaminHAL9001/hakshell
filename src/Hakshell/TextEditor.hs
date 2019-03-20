@@ -516,8 +516,11 @@ textCursorTags = lens theTextCursorTags $ \ a b -> a{ theTextCursorTags = b }
 -- 'lineBreakNLCR'. A 'TextBufferState' always contains one empty line, but a line must have a @tags@
 -- tag, so it is necessary to pass an initializing tag value of type @tags@ -- if you need nothing
 -- but plain text editing, @tags@ can be unit @()@.
-newTextBuffer :: tags -> IO (TextBufferState tags)
-newTextBuffer tags = do
+newTextBuffer :: tags -> IO (TextBuffer tags)
+newTextBuffer = fmap TextBuffer . (newTextBufferState >=> newMVar)
+
+newTextBufferState :: tags -> IO (TextBufferState tags)
+newTextBufferState tags = do
   cur <- newTextCursor tags
   buf <- MVec.new 512
   return TextBufferState
@@ -1096,9 +1099,7 @@ deleteCharsWrap
   :: forall editor tags . (MonadEditText editor, Monad (editor tags))
   => Relative CharIndex -> editor tags ()
 deleteCharsWrap (Relative (CharIndex n)) = liftEditText $ if n == 0 then return () else do
-  (count, (push, rel)) <- pure (abs n, if n > 0 then (Before, After) else (After, Before))
-  above   <- use linesAboveCursor
-  below   <- use linesBelowCursor
+  (push, rel) <- pure $ if n > 0 then (Before, After) else (After, Before)
   let cutLine = sliceLineToEnd rel . Absolute . CharIndex
   let insAdjust charsLens = let cursor = bufferCurrentLine . charsLens in
         ( state $ \ st -> let count = st ^. cl cursor in
