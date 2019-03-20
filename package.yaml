@@ -53,10 +53,12 @@ default-extensions:
 - FlexibleContexts
 - FlexibleInstances
 - FunctionalDependencies
+- GADTs
 - GeneralizedNewtypeDeriving
 - ImplicitParams
 - LambdaCase
 - MultiParamTypeClasses
+- NoMonomorphismRestriction
 - OverloadedStrings
 - RankNTypes
 - ScopedTypeVariables
