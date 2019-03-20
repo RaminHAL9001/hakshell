@@ -480,8 +480,6 @@ data TextLine tags
     }
   deriving Functor
 
-instance IntSized (TextLine tags) where { intSize = UVec.length . theTextLineString; }
-
 -- | The current line that is being edited.
 data TextCursor tags
   = TextCursor
@@ -491,6 +489,9 @@ data TextCursor tags
     , theTextCursorTags    :: tags
     }
   deriving Functor
+
+instance IntSized (TextLine tags) where { intSize = UVec.length . theTextLineString; }
+instance Unpackable (TextLine tags) where { unpack = UVec.toList . theTextLineString; }
 
 -- Not for export: this buffer is formatted such that characters before the cursror are near index
 -- zero, while characters after the cursor are near the final index.
