@@ -64,7 +64,7 @@ module Hakshell.TextEditor
     copyCurrentLine, replaceCurrentLine,
     pushLine, popLine,
     readLineIndex, writeLineIndex,
-    forLinesM, forLinesInRangeM,
+    forLinesM, forLinesInRangeM, forLinesInBufferM,
     -- ** Cursor Positions
     Relative, Absolute, LineIndex, CharIndex, TextLocation(..),
     RelativeToAbsoluteCursor, -- <- does not export members
@@ -144,14 +144,14 @@ newtype Absolute a = Absolute a
 -- inference will automatically declare a 'LineIndex' without you needing to write @(LineIndex 1)@
 -- constructor unless you really want to.
 newtype LineIndex = LineIndex Int
-  deriving (Eq, Ord, Show, Read, Enum, Num)
+  deriving (Eq, Ord, Show, Read, Bounded, Enum, Num)
 
 -- | A number for indexing a column, i.e. a character within a line. This data type instantiates
 -- the 'Prelude.Num' typeclass so that you can write an integer literal in your code and (if used in
 -- the correct context) the type inference will automatically declare a 'CharIndex' without you
 -- needing to write @(LineIndex 1)@ constructor unless you really want to.
 newtype CharIndex = CharIndex Int
-  deriving (Eq, Ord, Show, Read, Enum, Num)
+  deriving (Eq, Ord, Show, Read, Bounded, Enum, Num)
 
 ----------------------------------------------------------------------------------------------------
 
@@ -1197,6 +1197,15 @@ forLinesInRangeM (Absolute (LineIndex from)) (Absolute (LineIndex to)) fold f = 
   forLinesLoopM fold f (abs dist + 1) $ if dist < 0
     then (unsafePopLine Before, pushLine After)
     else (unsafePopLine After, pushLine Before)
+
+-- | Conveniently calls 'forLinesInRangeM' with the first two parameters as @('Absolute' 1)@ and
+-- @('Absolute' 'maxBound')@.
+forLinesInBufferM
+  :: fold
+  -> (FoldMapLinesHalt void fold tags fold ->
+      TextLine tags -> FoldMapLines fold fold tags [TextLine tags])
+  -> EditText tags fold
+forLinesInBufferM = forLinesInRangeM (Absolute 1) (Absolute maxBound)
 
 -- | Like 'forLinesInRangeM', but this function takes a 'RelativeToCursor' value, iteration begins
 -- at the 'bufferCurrentLine', and if the 'RelativeToCursor' value is 'After' then iteration goes
