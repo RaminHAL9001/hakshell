@@ -75,3 +75,13 @@ library:
   - Hakshell
   - Hakshell.String
   - Hakshell.Struct
+  - Hakshell.TextEditor
+
+tests:
+  HakshellTests:
+    main:         HakshellTests.hs
+    source-dirs:  tests
+    ghc-options:
+    -   -threaded
+    dependencies:
+    - hakshell
