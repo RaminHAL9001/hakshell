@@ -76,6 +76,7 @@ library:
   - Hakshell.String
   - Hakshell.Struct
   - Hakshell.TextEditor
+  - Hakshell.UTFUnit
 
 tests:
   HakshellTests:
