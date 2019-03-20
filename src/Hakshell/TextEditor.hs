@@ -88,7 +88,8 @@ module Hakshell.TextEditor
     bufferCurrentLine, textLineString, bufferDefaultTags,
     lineBreakNLCR,
     -- ** Line Editing
-    TextLine, TextCursor, newCursorFromLine, textCursorCharCount, textLineTags,
+    TextLine, sliceLineToEnd,
+    TextCursor, newCursorFromLine, textCursorCharCount, textLineTags,
     -- ** Errors
     TextEditError(..),
     -- * Re-Exports
@@ -119,6 +120,13 @@ import qualified Data.Vector.Mutable         as MVec
 import qualified Data.Vector.Unboxed         as UVec
 import qualified Data.Vector.Generic.Mutable as GMVec
 import qualified Data.Vector.Unboxed.Mutable as UMVec
+
+----------------------------------------------------------------------------------------------------
+
+-- I create let bindings for lenses often, so I often need the 'cloneLens' function. It is very
+-- convenient to shorten the name to 'cl'.
+cl :: ALens s t a b -> Lens s t a b
+cl = cloneLens
 
 ----------------------------------------------------------------------------------------------------
 
@@ -472,6 +480,8 @@ data TextLine tags
     }
   deriving Functor
 
+instance IntSized (TextLine tags) where { intSize = UVec.length . theTextLineString; }
+
 -- | The current line that is being edited.
 data TextCursor tags
   = TextCursor
@@ -559,6 +569,13 @@ unsafeMakeLine cur = do
     { theTextLineString = packSize (textCursorCharCount cur) $ before ++ after
     , theTextLineTags   = theTextCursorTags cur
     }
+
+-- | Cut a line at some index, keeping the characters 'Before' or 'After' the index.
+sliceLineToEnd :: RelativeToCursor -> Absolute CharIndex -> TextLine tags -> TextLine tags
+sliceLineToEnd rel (Absolute (CharIndex n)) = textLineString %~ \ vec ->
+  let len = UVec.length vec in case rel of
+    Before -> UVec.slice  0  (len - n) vec
+    After  -> UVec.slice (len - n) len vec
 
 -- | Create a new 'TextCursor' from a 'TextLine'. The 'TextCursor' can be updated with an 'EditLine'
 -- function. Note that this function works in any monadic function type @m@ which instantiates
@@ -873,21 +890,27 @@ writeLineIndex (Absolute (LineIndex i')) line = liftEditText $ let i = i' - 1 in
         return True
        else liftIO (MVec.write vec (len - below + i - 1) line) >> return True
 
--- | If not in 'bufferInsertMode', this function removes the current line under the cursor from the
--- text buffer and places it into the 'bufferCurrentLine' line editor so that character-by-character
--- editing may be performed. If already in 'bufferInsertMode' this function performs no operation.
-beginInsertMode ::  (MonadEditText editor, Monad (editor tags)) => editor tags ()
-beginInsertMode = liftEditText $ do
+-- | If not in 'bufferInsertMode', this function removes the current line under the cursor (actually
+-- the line immediately 'Before' or immediately 'After' the cursor depending on which
+-- 'RelativeToCursor' value you pass as the first parameter). The current line is removed from the
+-- text buffer and placed into the 'bufferCurrentLine' line editor so that character-by-character
+-- editing may be performed. If already in 'bufferInsertMode', or if you select a line 'Before' the
+-- cursor while the cursor has no lines before it, or if you select a line 'After' the cursor while
+-- the cursor has no lines after it, this function simply creates a new empty line.
+beginInsertMode
+  :: (MonadEditText editor, Monad (editor tags))
+  => RelativeToCursor -> editor tags ()
+beginInsertMode rel = liftEditText $ do
   insMode <- use bufferInsertMode
   unless insMode $ do
     cur   <- Absolute . CharIndex . subtract 1 <$> use (bufferCurrentLine . charsBeforeCursor)
     vec   <- use bufferVector
     above <- use linesAboveCursor
     below <- use linesBelowCursor
-    if above > 0 then do
+    if rel == Before && above > 0 then do
       liftIO (MVec.read vec above) >>= replaceCurrentLine cur
       linesAboveCursor %= subtract 1
-     else if below > 0 then do
+     else if rel == After && below > 0 then do
       liftIO (MVec.read vec $ MVec.length vec - below) >>= replaceCurrentLine cur
       linesBelowCursor %= subtract 1
      else do
@@ -896,12 +919,18 @@ beginInsertMode = liftEditText $ do
 
 -- | If in 'bufferInsertMode', this function places the 'bufferCurrentLine' back into the text
 -- buffer, clears the 'bufferCurrentLine' cursor, and sets the 'bufferInsertMode' to
--- 'Prelude.False'. If not in 'bufferInsertMode', this function performs no operation.
-endInsertMode :: (MonadEditText editor, Monad (editor tags)) => editor tags ()
-endInsertMode = liftEditText $ do
+-- 'Prelude.False'. If not in 'bufferInsertMode', this function performs no operation. Pass 'Before'
+-- or 'After' as a parameter to indicate whether the 'bufferCurrentLine' should be placed
+-- before\/above or after\/below the cursor when pushing it back into the buffer.
+endInsertMode
+  :: (MonadEditText editor, Monad (editor tags))
+  => RelativeToCursor -> editor tags Bool
+endInsertMode rel = liftEditText $ do
   insMode <- use bufferInsertMode
-  when insMode $
-    (copyCurrentLine <* clearCurrentLine) >>= pushLine Before >> bufferInsertMode .= False
+  if not insMode then return False else do
+    (copyCurrentLine <* clearCurrentLine) >>= pushLine rel
+    bufferInsertMode .= False
+    return True
 
 -- | Replace the content in the 'bufferCurrentLine' with the content in the given 'TextLine'. Pass
 -- an integer value indicating where the cursor position should be set. This function does not
@@ -1064,9 +1093,26 @@ deleteChars (Relative (CharIndex n)) = liftEditLine $
 -- adjacent lines such that the travel of deletion wraps to the end of the prior line or the
 -- beginning of the next line, depending on the direction of travel.
 deleteCharsWrap
-  :: (MonadEditText editor, Monad (editor tags))
+  :: forall editor tags . (MonadEditText editor, Monad (editor tags))
   => Relative CharIndex -> editor tags ()
-deleteCharsWrap = error "TODO: deleteCharsWrap"
+deleteCharsWrap (Relative (CharIndex n)) = liftEditText $ if n == 0 then return () else do
+  (count, (push, rel)) <- pure (abs n, if n > 0 then (Before, After) else (After, Before))
+  above   <- use linesAboveCursor
+  below   <- use linesBelowCursor
+  let cutLine = sliceLineToEnd rel . Absolute . CharIndex
+  let insAdjust charsLens = let cursor = bufferCurrentLine . charsLens in
+        ( state $ \ st -> let count = st ^. cl cursor in
+            if n < count
+            then (0, st & cl cursor .~ count - n)
+            else (n - count, st & cl cursor .~ 0)
+        ) <* endInsertMode push
+  insMode <- use bufferInsertMode
+  n <- if not insMode then return n else case rel of
+    Before -> insAdjust charsBeforeCursor
+    After  -> insAdjust charsAfterCursor
+  void $ forLinesM rel n $ \ halt line -> get >>= \ n -> if n <= 0 then halt n else do
+    let len = UVec.length $ line ^. textLineString
+    state $ const $ if len < n then ([], n - len) else ([cutLine n line], 0)
 
 -- | This function evaluates the 'lineBreaker' function on the given string, and beginning from the
 -- current cursor position, begins inserting all the lines of text produced by the 'lineBreaker'
@@ -1076,7 +1122,7 @@ insertString
   => String -> editor tags ()
 insertString str = liftEditText $ use (bufferLineBreaker . lineBreaker) >>= loop . ($ str) where
   writeStr = mapM_ $ insertChar Before
-  writeLine (str, lbrk) = writeStr str >> writeStr lbrk >> endInsertMode
+  writeLine (str, lbrk) = writeStr str >> writeStr lbrk >> endInsertMode Before
   loop = \ case
     []          -> return ()
     [(str, "")] -> writeStr str
@@ -1138,7 +1184,7 @@ forLinesInRangeM
       TextLine tags -> FoldMapLines fold fold tags [TextLine tags])
   -> EditText tags fold
 forLinesInRangeM (Absolute (LineIndex from)) (Absolute (LineIndex to)) fold f = do
-  endInsertMode
+  endInsertMode Before
   above <- use linesAboveCursor
   below <- use linesBelowCursor
   let lineCount = above + below
