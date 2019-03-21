@@ -8,9 +8,12 @@ import           Control.Monad.IO.Class
 ----------------------------------------------------------------------------------------------------
 
 main :: IO ()
-main = newTextBuffer defaultTags >>= runEditText editTextTests >>= \ case
+main = begin >> newTextBuffer defaultTags >>= runEditText editTextTests >>= \ case
   Left (TextEditError err) -> putStrLn $ unpack err
   Right () -> return ()
+
+begin :: IO ()
+begin = putStrLn "\n-------------------------\nBegin HakshellTest Log\n-------------------------\n"
 
 ----------------------------------------------------------------------------------------------------
 
@@ -29,7 +32,7 @@ editTextTests = do
         insertString str
   reportInsert "one two three\n"
   reportInsert "four five six\nseven eight nine\nten eleven twelve\n"
-  report "OK"
+  report "OK\n"
   forLinesInBufferM (1::Int) $ \ _ line -> do
     n <- state $ \ n -> (n, n+1)
     liftIO $ putStrLn $ show n ++ ": " ++ unpack line

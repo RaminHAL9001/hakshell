@@ -121,6 +121,10 @@ import qualified Data.Vector.Unboxed         as UVec
 import qualified Data.Vector.Generic.Mutable as GMVec
 import qualified Data.Vector.Unboxed.Mutable as UMVec
 
+-----------------------------------
+import Debug.Trace
+import Control.Exception (evaluate)
+
 ----------------------------------------------------------------------------------------------------
 
 -- I create let bindings for lenses often, so I often need the 'cloneLens' function. It is very
@@ -578,8 +582,8 @@ unsafeMakeLine cur = do
 sliceLineToEnd :: RelativeToCursor -> Absolute CharIndex -> TextLine tags -> TextLine tags
 sliceLineToEnd rel (Absolute (CharIndex n)) = textLineString %~ \ vec ->
   let len = UVec.length vec in case rel of
-    Before -> UVec.slice  0  (len - n) vec
-    After  -> UVec.slice (len - n) len vec
+    Before -> UVec.slice  0 (len - n) vec
+    After  -> UVec.slice (len - n) n  vec
 
 -- | Create a new 'TextCursor' from a 'TextLine'. The 'TextCursor' can be updated with an 'EditLine'
 -- function. Note that this function works in any monadic function type @m@ which instantiates
@@ -796,8 +800,8 @@ growVec vec beforeElems afterElems addElems = do
     newVec <- GMVec.new newSize
     GMVec.copy (GMVec.slice 0 beforeElems newVec) (GMVec.slice 0 beforeElems vec)
     GMVec.copy
-      (GMVec.slice (len - afterElems) (len - 1) newVec)
-      (GMVec.slice (len - afterElems) (len - 1) vec)
+      (GMVec.slice (len - afterElems) afterElems newVec)
+      (GMVec.slice (len - afterElems) afterElems vec)
     return newVec
 
 -- Not for export: should be executed automatically by insertion operations. Increases the size of
@@ -912,12 +916,15 @@ beginInsertMode rel = liftEditText $ do
     above <- use linesAboveCursor
     below <- use linesBelowCursor
     if rel == Before && above > 0 then do
-      liftIO (MVec.read vec above) >>= replaceCurrentLine cur
+      traceM $ "beginInserMode Before (above="++show above++")"
+      liftIO (MVec.read vec $ above - 1) >>= replaceCurrentLine cur
       linesAboveCursor %= subtract 1
      else if rel == After && below > 0 then do
+      traceM $ "beginInserMode After (below="++show below++")"
       liftIO (MVec.read vec $ MVec.length vec - below) >>= replaceCurrentLine cur
       linesBelowCursor %= subtract 1
      else do
+      traceM $ "newTextCursor"
       use bufferDefaultTags >>= liftIO . newTextCursor >>= assign bufferCurrentLine
     bufferInsertMode .= True
 
@@ -1002,7 +1009,7 @@ shiftElems nil vec select before after =
     noop = return (before, after)
     done = return (before + select, after - select)
     clamp i = max 0 $ min i $ len - 1
-    slice a b = (if a < b then GMVec.slice a b else GMVec.slice b a) vec
+    slice a b = (if a < b then GMVec.slice a (b - a) else GMVec.slice b (a - b)) vec
     upper = slice after  $ clamp $ after  + select
     lower = slice before $ clamp $ before + select
     clear slice = forM_ [0 .. GMVec.length slice - 1] $ flip (GMVec.write slice) nil
@@ -1122,9 +1129,10 @@ deleteCharsWrap (Relative (CharIndex n)) = liftEditText $ if n == 0 then return 
 insertString
   :: (MonadEditText editor, Monad (editor tags))
   => String -> editor tags ()
-insertString str = liftEditText $ use (bufferLineBreaker . lineBreaker) >>= loop . ($ str) where
+insertString str = liftEditText $ beginInsertMode Before >> use (bufferLineBreaker . lineBreaker) >>= loop . ($ str) where
   writeStr = mapM_ $ insertChar Before
-  writeLine (str, lbrk) = writeStr str >> writeStr lbrk >> endInsertMode Before
+  writeLine (str, lbrk) = traceM ("writeLine str="++show str++" lbrk="++show lbrk) >>
+    writeStr str >> writeStr lbrk >> when (not $ null lbrk) (void $ endInsertMode Before)
   loop = \ case
     []          -> return ()
     [(str, "")] -> writeStr str
@@ -1135,7 +1143,15 @@ insertString str = liftEditText $ use (bufferLineBreaker . lineBreaker) >>= loop
         tags <- use textCursorTags
         let len = UMVec.length vec
         if cur <= 0 then return $ pure () else do
-          cut <- liftIO $ UVec.freeze $ UMVec.slice (len - cur - 1) (len - 1) vec
+          traceM $ "(vector length = "++show (UMVec.length vec)++")"
+          sl <- liftIO $! evaluate $!
+            UMVec.slice (len - cur - 1) cur $ trace
+              ( "UMVec.slice "++
+                show(len - cur - 1)++' ':show(len - 1)++" BEGIN"
+              ) vec
+          traceM "UVec.slice END"
+          cut <- liftIO $ trace "UVec.freeze BEGIN" $ UVec.unsafeFreeze sl
+          traceM "UVec.freeze END"
           --cut <- liftIO $ packSize cur <$> forM [len - cur - 1 .. len - 1] (UMVec.read vec)
           return $ do
             vec <- use bufferVector
