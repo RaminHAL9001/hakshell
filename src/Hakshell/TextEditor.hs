@@ -626,7 +626,7 @@ lineBreakNLCR = LineBreaker
       (line, "") -> [(line, "")]
       (line, '\n':'\r':more) -> (line, "\n\r") : lines more
       (line, '\r':'\n':more) -> (line, "\r\n") : lines more
-      (line, c:more)         -> [(line, [c]), (more, "")]
+      (line, c:more)         -> (line, [c])    : lines more
 
 -- Not for export: updated when characters are added to the 'TextBufferState'.
 bufferCharNumber :: Lens' (TextBufferState tags) Int
@@ -1130,8 +1130,8 @@ insertString
   :: (MonadEditText editor, Monad (editor tags))
   => String -> editor tags ()
 insertString str = liftEditText $ beginInsertMode Before >> use (bufferLineBreaker . lineBreaker) >>= loop . ($ str) where
-  writeStr = mapM_ $ insertChar Before
-  writeLine (str, lbrk) = traceM ("writeLine str="++show str++" lbrk="++show lbrk) >>
+  writeStr str = traceM ("writeStr "++show str) >> mapM_ (insertChar Before) str
+  writeLine (str, lbrk) =
     writeStr str >> writeStr lbrk >> when (not $ null lbrk) (void $ endInsertMode Before)
   loop = \ case
     []          -> return ()
