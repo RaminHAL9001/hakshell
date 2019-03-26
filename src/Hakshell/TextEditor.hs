@@ -504,7 +504,7 @@ lineEditBuffer = lens theLineEditBuffer $ \ a b -> a{ theLineEditBuffer = b }
 
 -- Not for export: this gets updated when inserting or deleting characters before the cursor.
 charsBeforeCursor :: Lens' (TextCursor tags) Int
-charsBeforeCursor = lens theCharsBeforeCursor $ \ a b -> a{ theCharsAfterCursor = b }
+charsBeforeCursor = lens theCharsBeforeCursor $ \ a b -> a{ theCharsBeforeCursor = b }
 
 -- Not for export: this gets updated when inserting or deleting characters after the cursor.
 charsAfterCursor :: Lens' (TextCursor tags) Int
@@ -570,11 +570,17 @@ unsafeMakeLine :: TextCursor tags -> IO (TextLine tags)
 unsafeMakeLine cur = do
   let buf = theLineEditBuffer cur
   let len = UMVec.length buf
-  let chars = mapM $ UMVec.read buf
-  before <- chars [0  .. theCharsBeforeCursor cur - 1] 
-  after  <- chars [len - theCharsAfterCursor  cur .. len - 1]
+  let chars start count =
+        if count <= 0 then pure "" else forM [start .. start + count - 1] $ UMVec.read buf
+  traceM $
+    "unsafeMakeLine before="++show (theCharsBeforeCursor cur)
+    ++" after="++show (theCharsAfterCursor cur)
+  let beforeCount = cur ^. charsBeforeCursor
+  let afterCount  = cur ^. charsAfterCursor
+  beforeChars <- chars 0 beforeCount 
+  afterChars  <- chars (len - 1 - afterCount) afterCount
   return TextLine
-    { theTextLineString = packSize (textCursorCharCount cur) $ before ++ after
+    { theTextLineString = packSize (textCursorCharCount cur) $ beforeChars ++ afterChars
     , theTextLineTags   = theTextCursorTags cur
     }
 
@@ -1057,14 +1063,13 @@ insertChar rel c = liftEditText $ do
   isBreak <- use $ bufferLineBreaker . lineBreakPredicate
   if isBreak c then return () else do
     growLineIfTooSmall 1
-    cur <- use bufferCurrentLine
-    let buf = cur ^. lineEditBuffer
-    let len = UMVec.length buf
-    let (diff, topMinus) = case rel of { Before -> (1, id); After -> ((-1), (len -)); }
-    i   <- topMinus <$> use (relativeToChar rel)
     buf <- use $ bufferCurrentLine . lineEditBuffer
+    off <- use $ relativeToChar rel
+    let len = UMVec.length buf
+    let i   = case rel of { Before -> off; After -> len - off - 1; }
+    relativeToChar rel += 1
+    traceM $ "insertChar "++show rel++" i="++show i++" c="++show c
     liftIO $ UMVec.write buf i c
-    relativeToChar rel += diff
 
 -- | Go to an absolute line number, the first line is 1 (line 0 and below all send the cursor to
 -- line 1), the last line is 'Prelude.maxBound'.
@@ -1129,10 +1134,22 @@ deleteCharsWrap (Relative (CharIndex n)) = liftEditText $ if n == 0 then return 
 insertString
   :: (MonadEditText editor, Monad (editor tags))
   => String -> editor tags ()
-insertString str = liftEditText $ beginInsertMode Before >> use (bufferLineBreaker . lineBreaker) >>= loop . ($ str) where
+insertString str = liftEditText $ use (bufferLineBreaker . lineBreaker) >>= loop . ($ str) where
   writeStr str = traceM ("writeStr "++show str) >> mapM_ (insertChar Before) str
-  writeLine (str, lbrk) =
-    writeStr str >> writeStr lbrk >> when (not $ null lbrk) (void $ endInsertMode Before)
+  writeLine (str, lbrk) = do
+    writeStr str
+    writeStr lbrk
+    when (not $ null lbrk) $ do
+      relativeToChar Before += length lbrk
+      cur <- use bufferCurrentLine
+      let buf = cur ^. lineEditBuffer
+      let beforeCount = cur ^. charsBeforeCursor
+      beforeChars <- liftIO $ forM [0 .. beforeCount - 1] $ UMVec.read buf
+      pushLine Before $ TextLine
+        { theTextLineString = packSize beforeCount beforeChars
+        , theTextLineTags   = cur ^. textCursorTags
+        }
+      clearCurrentLine
   loop = \ case
     []          -> return ()
     [(str, "")] -> writeStr str
