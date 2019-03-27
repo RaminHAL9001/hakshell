@@ -121,10 +121,6 @@ import qualified Data.Vector.Unboxed         as UVec
 import qualified Data.Vector.Generic.Mutable as GMVec
 import qualified Data.Vector.Unboxed.Mutable as UMVec
 
------------------------------------
-import Debug.Trace
-import Control.Exception (evaluate)
-
 ----------------------------------------------------------------------------------------------------
 
 -- I create let bindings for lenses often, so I often need the 'cloneLens' function. It is very
@@ -573,9 +569,6 @@ unsafeMakeLine cur = do
   let len = UMVec.length buf
   let chars start count =
         if count <= 0 then pure "" else forM [start .. start + count - 1] $ UMVec.read buf
-  traceM $
-    "unsafeMakeLine before="++show (theCharsBeforeCursor cur)
-    ++" after="++show (theCharsAfterCursor cur)
   let beforeCount = cur ^. charsBeforeCursor
   let afterCount  = cur ^. charsAfterCursor
   beforeChars <- chars 0 beforeCount 
@@ -923,16 +916,12 @@ beginInsertMode rel = liftEditText $ do
     above <- use linesAboveCursor
     below <- use linesBelowCursor
     if rel == Before && above > 0 then do
-      traceM $ "beginInserMode Before (above="++show above++")"
       liftIO (MVec.read vec $ above - 1) >>= replaceCurrentLine cur
       linesAboveCursor %= subtract 1
      else if rel == After && below > 0 then do
-      traceM $ "beginInserMode After (below="++show below++")"
       liftIO (MVec.read vec $ MVec.length vec - below) >>= replaceCurrentLine cur
       linesBelowCursor %= subtract 1
-     else do
-      traceM $ "newTextCursor"
-      use bufferDefaultTags >>= liftIO . newTextCursor >>= assign bufferCurrentLine
+     else use bufferDefaultTags >>= liftIO . newTextCursor >>= assign bufferCurrentLine
     bufferInsertMode .= True
 
 -- | If in 'bufferInsertMode', this function places the 'bufferCurrentLine' back into the text
@@ -1003,12 +992,7 @@ shiftElems nil vec select before after =
   if select == 0 then noop
   else if select ==   1  then moveSingle after before $ len - after
   else if select == (-1) then moveSingle before (len - 1 - after) $ before - 1
-  else do
-    forM_ [0 .. GMVec.length from - 1] $ \ i -> do
-      traceM $ "shiftElem (i="++show i++")"
-      elem <- GMVec.read from i
-      traceM $ "shiftElem "++show elem
-    GMVec.move to from >> clear from >> done
+  else GMVec.move to from >> clear from >> done
   where
     len  = GMVec.length vec
     noop = return (before, after)
@@ -1028,11 +1012,8 @@ shiftElems nil vec select before after =
     clear slice = forM_ [0 .. GMVec.length slice - 1] $ flip (GMVec.write slice) nil
     boundSelect = clamped * signum select
     done = return (before + boundSelect, after - boundSelect)
-    moveSingle count to from = if count <= 0 then noop else do
-      elem <- GMVec.read vec from
-      traceM $ "moveSingle (to="++show to++") from="++show from++' ':show elem
-      GMVec.write vec to elem
-      GMVec.write vec from nil >> done
+    moveSingle count to from = if count <= 0 then noop else
+      GMVec.read vec from >>= GMVec.write vec to >> GMVec.write vec from nil >> done
 
 -- | This function calls 'moveByLine' and then 'moveByChar' to move the cursor by a number of lines
 -- and characters relative to the current cursor position.
@@ -1047,12 +1028,10 @@ moveCursor row col = moveByLine row >> moveByChar col
 moveByLine
   :: (MonadEditText editor, Monad (editor tags))
   => Relative LineIndex -> editor tags ()
-moveByLine rel@(Relative (LineIndex select)) = liftEditText $ do
-  traceM $ "moveByLine "++show rel
+moveByLine (Relative (LineIndex select)) = liftEditText $ do
   vec <- use bufferVector
   (before, after) <- (,) <$> use linesAboveCursor <*> use linesBelowCursor >>=
     liftIO . uncurry (shiftElems (error "empty line") vec select)
-  traceM $ "(new cursor: before="++show before++" after="++show after++")"
   linesAboveCursor .= before
   linesBelowCursor .= after
 
@@ -1062,8 +1041,7 @@ moveByLine rel@(Relative (LineIndex select)) = liftEditText $ do
 moveByChar
   :: (MonadEditLine editor, Monad (editor tags))
   => Relative CharIndex -> editor tags ()
-moveByChar rel@(Relative (CharIndex select)) = liftEditLine $ do
-  traceM $ "moveByChar "++show rel
+moveByChar (Relative (CharIndex select)) = liftEditLine $ do
   vec <- use lineEditBuffer
   (before, after) <- (,) <$> use charsBeforeCursor <*> use charsAfterCursor >>=
     liftIO . uncurry (shiftElems '\0' vec select)
@@ -1155,10 +1133,7 @@ insertString
   :: (MonadEditText editor, Monad (editor tags))
   => String -> editor tags ()
 insertString str = liftEditText $ use (bufferLineBreaker . lineBreaker) >>= loop . ($ str) where
-  writeStr str = do
-    cursor <- (,) <$> use linesAboveCursor <*> use linesBelowCursor
-    traceM $ "writeStr "++show cursor++' ':show str
-    mapM_ (unsafeInsertChar Before) str
+  writeStr = mapM_ $ unsafeInsertChar Before
   writeLine (str, lbrk) = do
     writeStr str
     writeStr lbrk
@@ -1183,15 +1158,7 @@ insertString str = liftEditText $ use (bufferLineBreaker . lineBreaker) >>= loop
         tags <- use textCursorTags
         let len = UMVec.length vec
         if cur <= 0 then return $ pure () else do
-          traceM $ "(vector length = "++show (UMVec.length vec)++")"
-          sl <- liftIO $! evaluate $!
-            UMVec.slice (len - cur - 1) cur $ trace
-              ( "UMVec.slice "++
-                show(len - cur - 1)++' ':show(len - 1)++" BEGIN"
-              ) vec
-          traceM "UVec.slice END"
-          cut <- liftIO $ trace "UVec.freeze BEGIN" $ UVec.unsafeFreeze sl
-          traceM "UVec.freeze END"
+          cut <- liftIO $! UVec.unsafeFreeze $! UMVec.slice (len - cur - 1) cur vec
           --cut <- liftIO $ packSize cur <$> forM [len - cur - 1 .. len - 1] (UMVec.read vec)
           return $ do
             vec <- use bufferVector
