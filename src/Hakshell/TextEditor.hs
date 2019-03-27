@@ -1166,7 +1166,7 @@ insertString str = liftEditText $ use (bufferLineBreaker . lineBreaker) >>= loop
       relativeToChar Before += length lbrk
       cur <- use bufferCurrentLine
       let buf = cur ^. lineEditBuffer
-      let beforeCount = cur ^. charsBeforeCursor
+      let beforeCount = cur ^. charsBeforeCursor - 1
       beforeChars <- liftIO $ forM [0 .. beforeCount - 1] $ UMVec.read buf
       pushLine Before $ TextLine
         { theTextLineString = packSize beforeCount beforeChars
