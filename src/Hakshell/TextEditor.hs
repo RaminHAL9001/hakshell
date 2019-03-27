@@ -788,7 +788,7 @@ relativeToChar =
 cursorIndex :: RelativeToCursor -> EditText tags Int
 cursorIndex = \ case
   Before -> use linesAboveCursor
-  After  -> (-) <$> (MVec.length <$> use bufferVector) <*> (subtract 1 <$> use linesBelowCursor)
+  After  -> (-) <$> (subtract 1 . MVec.length <$> use bufferVector) <*> use linesBelowCursor
 
 -- Not for export: unsafe, requires correct accounting of cursor positions, otherwise segfaults may
 -- occur. The cursor is implemented by keeping a mutable array in which elements before the cursor
