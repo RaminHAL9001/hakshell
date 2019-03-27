@@ -997,28 +997,31 @@ shiftElems
   :: (GMVec.MVector vector a, PrimMonad m)
   => a -> vector (PrimState m) a -> Int -> Int -> Int -> m (Int, Int)
 shiftElems nil vec select before after =
-  if select == 0
-  then noop
-  else if select == 1
-  then if after  == 0 then noop else
-    GMVec.read vec after  >>= GMVec.write vec before >> GMVec.write vec after nil >> done
-  else if select == (-1)
-  then if before == 0 then noop else
-    GMVec.read vec before >>= GMVec.write vec after >> GMVec.write vec before nil >> done
-  else if select > 1
-  then GMVec.move lower upper >> clear upper >> done
-  else if select < 1
-  then GMVec.move upper lower >> clear lower >> done
-  else error "shiftElems: this should never happen"
+  if select == 0 then noop
+  else if select ==   1  then moveSingle after before $ len - after
+  else if select == (-1) then moveSingle before (len - 1 - after) $ before - 1
+  else GMVec.move to from >> clear from >> done
   where
     len  = GMVec.length vec
     noop = return (before, after)
-    done = return (before + select, after - select)
-    clamp i = max 0 $ min i $ len - 1
-    slice a b = (if a < b then GMVec.slice a (b - a) else GMVec.slice b (a - b)) vec
-    upper = slice after  $ clamp $ after  + select
-    lower = slice before $ clamp $ before + select
+    clamp = max 0 . min (abs select)
+    (clamped, to, from) =
+      if select > 1 then
+        ( clamp after
+        , GMVec.slice before clamped vec
+        , GMVec.slice (len - 1 - after) clamped vec
+        )
+      else if select < (-1) then
+        ( clamp before
+        , GMVec.slice (len - 1 - after - clamped) clamped vec
+        , GMVec.slice (before - clamped) clamped vec
+        )
+      else error "shiftElems: this should never happen"
     clear slice = forM_ [0 .. GMVec.length slice - 1] $ flip (GMVec.write slice) nil
+    boundSelect = clamped * signum select
+    done = return (before + boundSelect, after - boundSelect)
+    moveSingle count to from = if count <= 0 then noop else
+      GMVec.read vec from >>= GMVec.write vec to >> GMVec.write vec from nil >> done
 
 -- | This function calls 'moveByLine' and then 'moveByChar' to move the cursor by a number of lines
 -- and characters relative to the current cursor position.
@@ -1033,7 +1036,8 @@ moveCursor row col = moveByLine row >> moveByChar col
 moveByLine
   :: (MonadEditText editor, Monad (editor tags))
   => Relative LineIndex -> editor tags ()
-moveByLine (Relative (LineIndex select)) = liftEditText $ do
+moveByLine rel@(Relative (LineIndex select)) = liftEditText $ do
+  traceM $ "moveByLine "++show rel
   vec <- use bufferVector
   (before, after) <- (,) <$> use linesAboveCursor <*> use linesBelowCursor >>=
     liftIO . uncurry (shiftElems (error "empty line") vec select)
@@ -1046,7 +1050,8 @@ moveByLine (Relative (LineIndex select)) = liftEditText $ do
 moveByChar
   :: (MonadEditLine editor, Monad (editor tags))
   => Relative CharIndex -> editor tags ()
-moveByChar (Relative (CharIndex select)) = liftEditLine $ do
+moveByChar rel@(Relative (CharIndex select)) = liftEditLine $ do
+  traceM $ "moveByChar "++show rel
   vec <- use lineEditBuffer
   (before, after) <- (,) <$> use charsBeforeCursor <*> use charsAfterCursor >>=
     liftIO . uncurry (shiftElems '\0' vec select)
@@ -1225,7 +1230,7 @@ forLinesInRangeM (Absolute (LineIndex from)) (Absolute (LineIndex to)) fold f = 
   let lineCount = above + below
   from <- pure $ min lineCount $ max 0 from
   to   <- pure $ min lineCount $ max 0 to
-  gotoLine $ Absolute $ LineIndex $ from
+  gotoLine $ Absolute $ LineIndex from
   let dist = to - from
   forLinesLoopM fold f (abs dist + 1) $ if dist < 0
     then (unsafePopLine Before, pushLine After)
