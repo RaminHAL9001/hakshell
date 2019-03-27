@@ -496,6 +496,7 @@ data TextCursor tags
 
 instance IntSized (TextLine tags) where { intSize = UVec.length . theTextLineString; }
 instance Unpackable (TextLine tags) where { unpack = UVec.toList . theTextLineString; }
+instance Show (TextLine tags) where { show = show . theTextLineString; }
 
 -- Not for export: this buffer is formatted such that characters before the cursror are near index
 -- zero, while characters after the cursor are near the final index.
@@ -994,13 +995,20 @@ resetCurrentLine = liftEditText $
 -- elements before the cursor, positive means after the cursor. Returns updated before and after
 -- values.
 shiftElems
-  :: (GMVec.MVector vector a, PrimMonad m)
+  :: (GMVec.MVector vector a, PrimMonad m
+     , Show a
+     )
   => a -> vector (PrimState m) a -> Int -> Int -> Int -> m (Int, Int)
 shiftElems nil vec select before after =
   if select == 0 then noop
   else if select ==   1  then moveSingle after before $ len - after
   else if select == (-1) then moveSingle before (len - 1 - after) $ before - 1
-  else GMVec.move to from >> clear from >> done
+  else do
+    forM_ [0 .. GMVec.length from - 1] $ \ i -> do
+      traceM $ "shiftElem (i="++show i++")"
+      elem <- GMVec.read from i
+      traceM $ "shiftElem "++show elem
+    GMVec.move to from >> clear from >> done
   where
     len  = GMVec.length vec
     noop = return (before, after)
@@ -1020,8 +1028,11 @@ shiftElems nil vec select before after =
     clear slice = forM_ [0 .. GMVec.length slice - 1] $ flip (GMVec.write slice) nil
     boundSelect = clamped * signum select
     done = return (before + boundSelect, after - boundSelect)
-    moveSingle count to from = if count <= 0 then noop else
-      GMVec.read vec from >>= GMVec.write vec to >> GMVec.write vec from nil >> done
+    moveSingle count to from = if count <= 0 then noop else do
+      elem <- GMVec.read vec from
+      traceM $ "moveSingle (to="++show to++") from="++show from++' ':show elem
+      GMVec.write vec to elem
+      GMVec.write vec from nil >> done
 
 -- | This function calls 'moveByLine' and then 'moveByChar' to move the cursor by a number of lines
 -- and characters relative to the current cursor position.
@@ -1041,6 +1052,7 @@ moveByLine rel@(Relative (LineIndex select)) = liftEditText $ do
   vec <- use bufferVector
   (before, after) <- (,) <$> use linesAboveCursor <*> use linesBelowCursor >>=
     liftIO . uncurry (shiftElems (error "empty line") vec select)
+  traceM $ "(new cursor: before="++show before++" after="++show after++")"
   linesAboveCursor .= before
   linesBelowCursor .= after
 
@@ -1058,6 +1070,17 @@ moveByChar rel@(Relative (CharIndex select)) = liftEditLine $ do
   charsBeforeCursor .= before
   charsAfterCursor  .= after
 
+-- Not for export: does not filter line-breaking characters.
+unsafeInsertChar :: RelativeToCursor -> Char -> EditText tags ()
+unsafeInsertChar rel c = do
+  growLineIfTooSmall 1
+  buf <- use $ bufferCurrentLine . lineEditBuffer
+  off <- use $ relativeToChar rel
+  let len = UMVec.length buf
+  let i   = case rel of { Before -> off; After -> len - off - 1; }
+  relativeToChar rel += 1
+  liftIO $ UMVec.write buf i c
+
 -- | Insert a single character. If the 'lineBreakPredicate' function evaluates to 'Prelude.True',
 -- meaning the given character is a line breaking character, this function does nothing. To insert
 -- line breaks, using 'insertString'.
@@ -1066,15 +1089,7 @@ insertChar
   => RelativeToCursor -> Char -> editor tags ()
 insertChar rel c = liftEditText $ do
   isBreak <- use $ bufferLineBreaker . lineBreakPredicate
-  if isBreak c then return () else do
-    growLineIfTooSmall 1
-    buf <- use $ bufferCurrentLine . lineEditBuffer
-    off <- use $ relativeToChar rel
-    let len = UMVec.length buf
-    let i   = case rel of { Before -> off; After -> len - off - 1; }
-    relativeToChar rel += 1
-    traceM $ "insertChar "++show rel++" i="++show i++" c="++show c
-    liftIO $ UMVec.write buf i c
+  if isBreak c then return () else unsafeInsertChar rel c
 
 -- | Go to an absolute line number, the first line is 1 (line 0 and below all send the cursor to
 -- line 1), the last line is 'Prelude.maxBound'.
@@ -1140,7 +1155,10 @@ insertString
   :: (MonadEditText editor, Monad (editor tags))
   => String -> editor tags ()
 insertString str = liftEditText $ use (bufferLineBreaker . lineBreaker) >>= loop . ($ str) where
-  writeStr str = traceM ("writeStr "++show str) >> mapM_ (insertChar Before) str
+  writeStr str = do
+    cursor <- (,) <$> use linesAboveCursor <*> use linesBelowCursor
+    traceM $ "writeStr "++show cursor++' ':show str
+    mapM_ (unsafeInsertChar Before) str
   writeLine (str, lbrk) = do
     writeStr str
     writeStr lbrk
