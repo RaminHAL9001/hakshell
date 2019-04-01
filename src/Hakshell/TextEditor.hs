@@ -82,7 +82,8 @@ module Hakshell.TextEditor
     MapChars, runMapChars,
     -- * Text Editor Data Structures
     -- ** Text Buffer
-    TextBufferState, LineBreaker(..), bufferLineBreaker, lineBreaker, lineBreakPredicate,
+    TextBufferState, LineBreaker(..),
+    bufferLineBreaker, lineBreaker, lineBreakPredicate, defaultLineBreak,
     theBufferCharCount, theBufferCharNumber,
     theBufferLineCount, theBufferLineNumber,
     bufferCurrentLine, textLineString, bufferDefaultTags,
@@ -120,6 +121,7 @@ import qualified Data.Vector.Mutable         as MVec
 import qualified Data.Vector.Unboxed         as UVec
 import qualified Data.Vector.Generic.Mutable as GMVec
 import qualified Data.Vector.Unboxed.Mutable as UMVec
+import           Data.Word
 
 ----------------------------------------------------------------------------------------------------
 
@@ -458,8 +460,9 @@ data LineBreaker
       -- a line of text. For each returned tuple, the first element of the tuple should be a string
       -- without line breaks, the second element should contain a string with only line breaks, or
       -- an empty string if the string was not terminated with a line break.
+    , theDefaultLineBreak :: !CharVector
+      -- ^ This defines the default line break to be used by the line breaking function.
     }
-
 -- | 'EditText' functions operate on units of text, and each unit of text is the "line," which is
 -- usually a @'\n'@ character terminated line of text in a text file, although it could represent
 -- other things, like files in a directory, or rows in a table of a database. Since a 'ExitText'
@@ -475,8 +478,9 @@ data LineBreaker
 -- 'TextLine', but on a 'Prelude.String' (list of 'Char's) stored in the 'TextBufferState' state.
 data TextLine tags
   = TextLine
-    { theTextLineString :: !CharVector
-    , theTextLineTags   :: !tags
+    { theTextLineString    :: !CharVector
+    , theTextLineTags      :: !tags
+    , theTextLineBreakSize :: !Word16
     }
   deriving Functor
 
@@ -531,8 +535,9 @@ newTextBufferState tags = do
     , theBufferLineNumber  = 0
     , theBufferLineCount   = 0
     , theBufferDefaultLine = TextLine
-        { theTextLineTags    = tags
-        , theTextLineString  = mempty
+        { theTextLineTags      = tags
+        , theTextLineString    = mempty
+        , theTextLineBreakSize = 0
         }
     , theBufferLineBreaker = lineBreakNLCR
     , theBufferVector      = buf
@@ -574,8 +579,9 @@ unsafeMakeLine cur = do
   beforeChars <- chars 0 beforeCount 
   afterChars  <- chars (len - 1 - afterCount) afterCount
   return TextLine
-    { theTextLineString = packSize (textCursorCharCount cur) $ beforeChars ++ afterChars
-    , theTextLineTags   = theTextCursorTags cur
+    { theTextLineString    = packSize (textCursorCharCount cur) $ beforeChars ++ afterChars
+    , theTextLineTags      = theTextCursorTags cur
+    , theTextLineBreakSize = 0
     }
 
 -- | Cut a line at some index, keeping the characters 'Before' or 'After' the index.
@@ -619,6 +625,7 @@ lineBreakNLCR :: LineBreaker
 lineBreakNLCR = LineBreaker
   { theLineBreakPredicate = nlcr
   , theLineBreaker = lines
+  , theDefaultLineBreak = UVec.fromList "\n"
   } where
     nlcr c = c == '\n' || c == '\r'
     lines  = break nlcr >>> \ case
@@ -677,6 +684,10 @@ lineBreakPredicate = lens theLineBreakPredicate $ \ a b -> a{ theLineBreakPredic
 -- of text.
 lineBreaker :: Lens' LineBreaker (String -> [(String, String)])
 lineBreaker = lens theLineBreaker $ \ a b -> a{ theLineBreaker = b }
+
+-- | This defines the default line break to be used by the line breaking function.
+defaultLineBreak :: Lens' LineBreaker CharVector
+defaultLineBreak = lens theDefaultLineBreak $ \ a b -> a{ theDefaultLineBreak = b }
 
 -- Not for export: requires correct accounting of line numbers to avoid segment faults.
 linesAboveCursor :: Lens' (TextBufferState tags) Int
@@ -1144,8 +1155,9 @@ insertString str = liftEditText $ use (bufferLineBreaker . lineBreaker) >>= loop
       let beforeCount = cur ^. charsBeforeCursor - 1
       beforeChars <- liftIO $ forM [0 .. beforeCount - 1] $ UMVec.read buf
       pushLine Before $ TextLine
-        { theTextLineString = packSize beforeCount beforeChars
-        , theTextLineTags   = cur ^. textCursorTags
+        { theTextLineString    = packSize beforeCount beforeChars
+        , theTextLineTags      = cur ^. textCursorTags
+        , theTextLineBreakSize = fromIntegral $ length lbrk
         }
       clearCurrentLine
   loop = \ case
@@ -1165,8 +1177,9 @@ insertString str = liftEditText $ use (bufferLineBreaker . lineBreaker) >>= loop
             linesBelowCursor += 1
             cur <- use linesBelowCursor
             liftIO $ MVec.write vec (MVec.length vec - cur) $ TextLine
-              { theTextLineString = cut
-              , theTextLineTags   = tags
+              { theTextLineString    = cut
+              , theTextLineTags      = tags
+              , theTextLineBreakSize = 0
               }
       writeLine line
       loop more
