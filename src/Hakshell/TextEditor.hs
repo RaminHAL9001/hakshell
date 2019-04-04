@@ -87,7 +87,7 @@ module Hakshell.TextEditor
     theBufferCharCount, theBufferCharNumber,
     theBufferLineCount, theBufferLineNumber,
     bufferCurrentLine, textLineString, bufferDefaultTags,
-    lineBreakNLCR,
+    lineBreakerNLCR,
     -- ** Line Editing
     TextLine, sliceLineToEnd,
     TextCursor, newCursorFromLine, textCursorCharCount, textLineTags,
@@ -448,7 +448,7 @@ data TextEditError
 -- If you choose to use your own 'LineBreaker' function, be sure that the function obeys this law:
 --
 -- @
--- 'Prelude.concat' ('lineBreakNLCR' str) == str
+-- 'Prelude.concat' ('lineBreakerNLCR' str) == str
 -- @
 data LineBreaker
   = LineBreaker
@@ -519,7 +519,7 @@ textCursorTags :: Lens' (TextCursor tags) tags
 textCursorTags = lens theTextCursorTags $ \ a b -> a{ theTextCursorTags = b }
 
 -- | Use this to initialize a new empty 'TextBufferState'. The default 'bufferLineBreaker' is set to
--- 'lineBreakNLCR'. A 'TextBufferState' always contains one empty line, but a line must have a @tags@
+-- 'lineBreakerNLCR'. A 'TextBufferState' always contains one empty line, but a line must have a @tags@
 -- tag, so it is necessary to pass an initializing tag value of type @tags@ -- if you need nothing
 -- but plain text editing, @tags@ can be unit @()@.
 newTextBuffer :: tags -> IO (TextBuffer tags)
@@ -539,7 +539,7 @@ newTextBufferState tags = do
         , theTextLineString    = mempty
         , theTextLineBreakSize = 0
         }
-    , theBufferLineBreaker = lineBreakNLCR
+    , theBufferLineBreaker = lineBreakerNLCR
     , theBufferVector      = buf
     , theLinesAboveCursor  = 0
     , theLinesBelowCursor  = 0
@@ -619,10 +619,10 @@ newCursorFromLine cur line = liftIO $ do
 
 -- | This is the default line break function. It will split the line on the character sequence
 -- @"\n"@, or @"\r"@, or @"\n\r"@, or @"\r\n"@. The line terminators must be included at the end of
--- each broken string, so that the rule that the law @'Prelude.concat' ('lineBreakNLCR' str) == str@
--- is obeyed.
-lineBreakNLCR :: LineBreaker
-lineBreakNLCR = LineBreaker
+-- each broken string, so that the rule that the law
+-- @'Prelude.concat' ('theLineBreaker' 'lineBreakerNLCR' str) == str@ is obeyed.
+lineBreakerNLCR :: LineBreaker
+lineBreakerNLCR = LineBreaker
   { theLineBreakPredicate = nlcr
   , theLineBreaker = lines
   , theDefaultLineBreak = UVec.fromList "\n"
@@ -670,7 +670,7 @@ bufferDefaultTags = bufferDefaultLine . textLineTags
 -- If you choose to use your own 'LineBreaker' function, be sure that the function obeys this law:
 --
 -- @
--- 'Prelude.concat' ('lineBreakNLCR' str) == str
+-- 'Prelude.concat' ('lineBreakerNLCR' str) == str
 -- @
 bufferLineBreaker :: Lens' (TextBufferState tags) LineBreaker
 bufferLineBreaker = lens theBufferLineBreaker $ \ a b -> a{ theBufferLineBreaker = b }
