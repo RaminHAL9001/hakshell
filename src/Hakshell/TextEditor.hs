@@ -1065,7 +1065,10 @@ moveByChar
   :: (MonadEditLine editor, Monad (editor tags))
   => Relative CharIndex -> editor tags ()
 moveByChar (Relative (CharIndex select)) = liftEditLine $ do
-  vec <- use lineEditBuffer
+  after  <- use charsAfterCursor
+  lbrksz <- use cursorBreakSize
+  select <- pure $ if select <= 0 then select else min select $ max 0 (after - fromIntegral lbrksz)
+  vec    <- use lineEditBuffer
   (before, after) <- (,) <$> use charsBeforeCursor <*> use charsAfterCursor >>=
     liftIO . uncurry (shiftElems '\0' vec select)
   charsBeforeCursor .= before
