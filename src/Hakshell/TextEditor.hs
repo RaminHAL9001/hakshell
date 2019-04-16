@@ -56,7 +56,7 @@ module Hakshell.TextEditor
     runEditText, runMapLines, runFoldMapLines, execFoldMapLines, evalFoldMapLines,
     -- ** Text Editing Combinators
     RelativeToCursor(..),
-    insertString, insertChar,
+    insertString, insertChar, lineBreak,
     clearCurrentLine, resetCurrentLine,
     deleteChars, deleteCharsWrap, textCursorTags,
     -- ** Manipulating Lines of Text
@@ -490,6 +490,7 @@ data TextCursor tags
     { theLineEditBuffer    :: !(UMVec.IOVector Char)
     , theCharsBeforeCursor :: !Int
     , theCharsAfterCursor  :: !Int
+    , theCursorBreakSize   :: !Word16
     , theTextCursorTags    :: tags
     }
   deriving Functor
@@ -510,6 +511,14 @@ charsBeforeCursor = lens theCharsBeforeCursor $ \ a b -> a{ theCharsBeforeCursor
 -- Not for export: this gets updated when inserting or deleting characters after the cursor.
 charsAfterCursor :: Lens' (TextCursor tags) Int
 charsAfterCursor = lens theCharsAfterCursor $ \ a b -> a{ theCharsAfterCursor = b}
+
+-- Not for export: controls line break information within the cursor. If this value is zero, it
+-- indicates that no line breaking characters have been entered into the cursor yet. If this value
+-- is non-zero, it indicates that the line breaking characters do exist after the cursor at some
+-- point, and if additional line breaks are inserted the characters after the cursor need to be
+-- split off into a new 'TextLine'.
+cursorBreakSize :: Lens' (TextCursor tags) Word16
+cursorBreakSize = lens theCursorBreakSize $ \ a b -> a{ theCursorBreakSize = b }
 
 -- | A 'Control.Lens.Lens' to get or set tags for the line currently under the cursor. To use or
 -- modify the tags value of the line under the cursor, evaluate one of the functions 'use',
@@ -559,6 +568,7 @@ newTextCursor tag = do
     { theLineEditBuffer    = buf
     , theCharsBeforeCursor = 0
     , theCharsAfterCursor  = 0
+    , theCursorBreakSize   = 0
     , theTextCursorTags    = tag
     }
 
@@ -602,7 +612,8 @@ newCursorFromLine cur line = liftIO $ do
   -- exported.
   let str = line ^. textLineString
   let len = intSize str
-  cur <- pure $ min len $ max 0 cur
+  let breakSize = theTextLineBreakSize line
+  cur <- pure $ min (max 0 $ len - fromIntegral breakSize) $ max 0 cur
   let (before, after) = splitAt cur $ unpack str
   let (lenBefore, lenAfter) = (length before, length after)
   let strlen = lenBefore + lenAfter
@@ -614,6 +625,7 @@ newCursorFromLine cur line = liftIO $ do
     { theLineEditBuffer = buf
     , theCharsBeforeCursor = lenBefore
     , theCharsAfterCursor  = lenAfter
+    , theCursorBreakSize   = breakSize
     , theTextCursorTags    = theTextLineTags line
     }
 
@@ -1070,6 +1082,18 @@ unsafeInsertChar rel c = do
   relativeToChar rel += 1
   liftIO $ UMVec.write buf i c
 
+-- Not for export: does not filter line-breaking characters.
+unsafeInsertString :: RelativeToCursor -> CharVector -> EditText tags ()
+unsafeInsertString rel str = do
+  let strlen = intSize str
+  growLineIfTooSmall strlen
+  buf <- use $ bufferCurrentLine . lineEditBuffer
+  off <- use $ relativeToChar rel
+  let len = UMVec.length buf
+  let i0  = case rel of { Before -> off; After -> len - off - strlen; }
+  relativeToChar rel += strlen
+  liftIO $ forM_ (zip [0 ..] $ unpack str) $ \ (i, c) -> UMVec.write buf (i0 + i) c
+
 -- | Insert a single character. If the 'lineBreakPredicate' function evaluates to 'Prelude.True',
 -- meaning the given character is a line breaking character, this function does nothing. To insert
 -- line breaks, using 'insertString'.
@@ -1259,6 +1283,42 @@ forLinesM rel fold f = do
   uncurry (forLinesLoopM fold f) $ case rel of
     Before -> (above, (unsafePopLine Before, pushLine After))
     After  -> (below, (unsafePopLine After, pushLine Before))
+
+-- | Use the 'defaultLineBreak' value to break the line at the current cursor position.
+lineBreak
+  :: (MonadEditText editor, Monad (editor tags))
+  => RelativeToCursor -> editor tags ()
+lineBreak rel = liftEditText $ do
+  breaker <- use bufferLineBreaker
+  let lbrk     = breaker ^. defaultLineBreak
+  let lbrkSize = fromIntegral $ intSize lbrk
+  case rel of
+    Before -> do
+      unsafeInsertString Before lbrk
+      cursor <- use bufferCurrentLine
+      let vec = cursor ^. lineEditBuffer
+      let cur = cursor ^. charsBeforeCursor
+      str <- liftIO $! UVec.unsafeFreeze $! UMVec.slice 0 cur vec
+      pushLine Before $ TextLine
+        { theTextLineTags      = cursor ^. textCursorTags
+        , theTextLineString    = str
+        , theTextLineBreakSize = lbrkSize
+        }
+      bufferCurrentLine . charsBeforeCursor .= 0
+    After  -> do
+      cursor <- use bufferCurrentLine
+      let vec = cursor ^. lineEditBuffer
+      let len = UMVec.length vec
+      let cur = cursor ^. charsAfterCursor
+      when (cur > 0) $ do
+        str <- liftIO $! UVec.unsafeFreeze $! UMVec.slice (len - cur) cur vec
+        pushLine After $ TextLine
+          { theTextLineTags      = cursor ^. textCursorTags
+          , theTextLineString    = str
+          , theTextLineBreakSize = lbrkSize
+          }
+        bufferCurrentLine . charsAfterCursor .= 0
+      unsafeInsertString After lbrk
 
 ----------------------------------------------------------------------------------------------------
 
