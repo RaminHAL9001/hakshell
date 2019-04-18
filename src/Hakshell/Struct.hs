@@ -362,7 +362,14 @@ charFrom3CharCode :: Map.Map Strict.ByteString Char
 charFrom3CharCode =
   Map.insert "space"    ' ' .
   Map.insert "newline" '\n' .
+  Map.insert "BEL"     '\a' $
+  Map.insert "BS"      '\b' $
+  Map.insert "HT"      '\t' $
   Map.insert "tab"     '\t' $
+  Map.insert "LF"      '\n' $
+  Map.insert "VT"      '\v' $
+  Map.insert "FF"      '\f' $
+  Map.insert "CR"      '\r' $
   Map.fromList (Vec.toList charTo3CharCode `zip` (chr <$> [0 ..]))
 
 ----------------------------------------------------------------------------------------------------
