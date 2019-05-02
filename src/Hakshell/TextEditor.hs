@@ -53,7 +53,7 @@ module Hakshell.TextEditor
   ( -- * Text Editing API
     -- ** Create and Start Editing a 'TextBufferState'
     TextBuffer, newTextBuffer,
-    runEditText, runMapLines, runFoldMapLines, execFoldMapLines, evalFoldMapLines,
+    runEditTextIO, runMapLines, runFoldMapLines, execFoldMapLines, evalFoldMapLines,
     -- ** Text Editing Combinators
     RelativeToCursor(..),
     insertString, insertChar, lineBreak,
@@ -174,8 +174,8 @@ instance MonadTrans (EditText tags) where
   lift = EditText . lift . lift
 
 -- | Evaluate an 'EditText' function on the given 'TextBufferState'.
-runEditText :: MonadIO m => EditText tags m a -> TextBuffer tags -> m (Either TextEditError a)
-runEditText (EditText f) (TextBuffer mvar) = liftIO $ modifyMVar mvar $
+runEditTextIO :: EditText tags IO a -> TextBuffer tags -> IO (Either TextEditError a)
+runEditTextIO (EditText f) (TextBuffer mvar) = modifyMVar mvar $
   fmap (\ (a,b) -> (b,a)) . runStateT (runExceptT f)
   -- TODO: use MonadResource instead of modifyMVar
 

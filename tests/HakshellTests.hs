@@ -8,7 +8,7 @@ import           Control.Monad.IO.Class
 ----------------------------------------------------------------------------------------------------
 
 main :: IO ()
-main = begin >> newTextBuffer defaultTags >>= runEditText editTextTests >>= \ case
+main = begin >> newTextBuffer defaultTags >>= runEditTextIO editTextTests >>= \ case
   Left (TextEditError err) -> putStrLn $ unpack err
   Right () -> return ()
 
@@ -25,7 +25,7 @@ defaultTags = ()
 report :: MonadIO m => String -> m ()
 report = liftIO . putStr
 
-editTextTests :: EditText Tags ()
+editTextTests :: EditText Tags IO ()
 editTextTests = do
   let reportInsert str = do
         report $ "insertString " ++ show str ++ "\n"
