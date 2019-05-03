@@ -84,8 +84,6 @@ module Hakshell.TextEditor
     -- ** Text Buffer
     TextBufferState, LineBreaker(..),
     bufferLineBreaker, lineBreaker, lineBreakPredicate, defaultLineBreak,
-    theBufferCharCount, theBufferCharNumber,
-    theBufferLineCount, theBufferLineNumber,
     bufferCurrentLine, textLineString, bufferDefaultTags,
     lineBreakerNLCR,
     -- ** Line Editing
@@ -409,15 +407,7 @@ newtype TextBuffer tags = TextBuffer (MVar (TextBufferState tags))
 -- update these values from within a @do@ block of code when programming a text editing combinator.
 data TextBufferState tags
   = TextBufferState
-    { theBufferCharNumber  :: !Int
-      -- ^ The number of characters before the cursor position in the file.
-    , theBufferCharCount   :: !Int
-      -- ^ The total number of characters in this buffer.
-    , theBufferLineCount   :: !Int
-      -- ^ The total number of lines in this buffer.
-    , theBufferLineNumber  :: !Int
-      -- ^ The line number of the 'bufferCurrentLine'. The top-most line of any buffer is 1.
-    , theBufferDefaultLine :: !(TextLine tags)
+    { theBufferDefaultLine :: !(TextLine tags)
       -- ^ The tag value to use when new 'TextLine's are automatically constructed after a line
       -- break character is inserted.
     , theBufferLineBreaker :: LineBreaker
@@ -539,11 +529,7 @@ newTextBufferState tags = do
   cur <- newTextCursor tags
   buf <- MVec.new 512
   return TextBufferState
-    { theBufferCharNumber  = 0
-    , theBufferCharCount   = 0
-    , theBufferLineNumber  = 0
-    , theBufferLineCount   = 0
-    , theBufferDefaultLine = TextLine
+    { theBufferDefaultLine = TextLine
         { theTextLineTags      = tags
         , theTextLineString    = mempty
         , theTextLineBreakSize = 0
@@ -646,22 +632,6 @@ lineBreakerNLCR = LineBreaker
       (line, '\n':'\r':more) -> (line, "\n\r") : lines more
       (line, '\r':'\n':more) -> (line, "\r\n") : lines more
       (line, c:more)         -> (line, [c])    : lines more
-
--- Not for export: updated when characters are added to the 'TextBufferState'.
-bufferCharNumber :: Lens' (TextBufferState tags) Int
-bufferCharNumber = lens theBufferCharNumber $ \ a b -> a{ theBufferCharNumber = b }
-
--- Not for export: updated when characters are added to the 'TextBufferState'.
-bufferCharCount :: Lens' (TextBufferState tags) Int
-bufferCharCount = lens theBufferCharCount $ \ a b -> a{ theBufferCharCount = b }
-
--- Not for export: updated when characters are added to the 'TextBufferState'.
-bufferLineCount :: Lens' (TextBufferState tags) Int
-bufferLineCount = lens theBufferLineCount $ \ a b -> a{ theBufferLineCount = b }
-
--- Not for export: updated when characters are added to the 'TextBufferState'.
-bufferLineNumber :: Lens' (TextBufferState tags) Int
-bufferLineNumber = lens theBufferLineNumber $ \ a b -> a{ theBufferLineNumber = b }
 
 -- Not for export: this is only used to set empty lines in the buffer.
 bufferDefaultLine :: Lens' (TextBufferState tags) (TextLine tags)
