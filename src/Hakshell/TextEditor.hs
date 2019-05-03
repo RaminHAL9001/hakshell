@@ -1,6 +1,41 @@
--- | This module provides integrated text processing facilities to Hakshell.
+-- | This module integrates text processing facilities into Hakshell.
 --
--- * Why a shell needs a built-in editor
+-- * Overview
+--
+-- This module provides editable text in the form of a 'TextBuffer', and read-only text in the form
+-- of a 'TextView'.
+--
+-- Editing operations on a 'TextBuffer' are atomic and thread-safe, but do not alow for computations
+-- on the buffer to be evaluated in parallel. Create a 'TextBuffer' with 'newTextBuffer', and then
+-- evaluate 'EditText' functions using the 'runEditTextIO' function or 'runEditTextOnCopy'
+-- function. 'EditText' combinators allow for moving the cursor around with functions such as
+-- 'gotoPosition', and inserting text with functions such as 'insertChar' and 'insertString'.
+--
+-- Line breaks can be inserted using 'lineBreak'. Line breaks can be configured to follow the UNIX
+-- tradition of using a single character '\n', or the DOS and CP/M tradition of using the
+-- two-charater '\r\n' symbol. The default is UNIX style, with the 'defaultLineBreak', but the DOS
+-- style can be set with 'lineBreakerNLCR'.
+--
+-- The 'TextBuffer' contains a local mutable line editor called a 'TextCursor'. Any single line from
+-- within the buffer can be copied into the local 'TextCursor' using 'beginInsertMode'. The cursor
+-- can be moved around using 'gotoChar' or 'moveByChar', characters can be inserted or deleted, then
+-- the content of the 'TextCursor' can be copied back to the 'TextBuffer' using 'endInsertMode'.
+--
+-- Bulk edit operations can be performed using the 'forLinesInRangeM' function which evaluates a
+-- continuation of type 'FoldMapLines' using a control flow pattern similar to a "for loop" in the
+-- procedural programming style. The 'FoldMapLines' function lifts the ordinary 'EditText'
+-- combinators type so edits can be evaluated on every line in the loop range. The 'FoldMapLines'
+-- function type uses the 'Control.Monad.Cont.ContT' monad transformer internally so your bulk
+-- editing algorithm can break out of the for loop at any time by simply evaluating the
+-- 'FoldMapLinesHalt' function passed to your bulk editor function.
+--
+-- 'TextView's are a shallow, immutable snapshot of all, or a portion of, a 'TextBuffer'. The
+-- internal structure of a 'TextView' is identical to that of the 'TextBuffer' so no additional
+-- conversion or copying is necessary, making the creation of views extremely fast. Create a
+-- 'TextView' using 'textViewOnLines' or 'textViewOnRange'. Once a 'TextView' is created other
+-- threads may immediately resume performing updates on the 'TextBuffer'.
+--
+-- * Why a Hakshell needs a built-in editor
 -- 
 -- Any useful system shell needs some form of text editor. Some systems, like traditional UNIX
 -- systems, prefer to keep the editor separate from the shell's command line interpreter. In Linux,
@@ -17,9 +52,9 @@
 -- allowing programs to be designed around the idiom of processing files. Likewise, the UNIX
 -- userland tools were designed around automated text processing. The very notion of "pipes",
 -- introduced by UNIX, declares a formal methodology for defining composable text filters. So the
--- distinction between a shell and an editor is really not so distinct. Binary data is of course
--- also used throughout the UNIX system, but as often as possible there are tools for representing
--- the binary information as text, and even re-constructing binary from it's textual representation.
+-- distinction between a shell and an editor is really not so distinct. Binary data is of course can
+-- also be piped, but as often as possible there are tools for representing the binary information
+-- as text, and even re-constructing binary from it's textual representation.
 --
 -- Bash also has extensive functionality for manipulating text, for example, Globs and Regular
 -- Expressions, which are also provided by the text editor programs. It is even theoretically
@@ -52,8 +87,9 @@
 module Hakshell.TextEditor
   ( -- * Text Editing API
     -- ** Create and Start Editing a 'TextBufferState'
-    TextBuffer, newTextBuffer,
-    runEditTextIO, runMapLines, runFoldMapLines, execFoldMapLines, evalFoldMapLines,
+    TextBuffer, textBufferState, newTextBuffer, copyTextBuffer,
+    runEditTextIO, runEditTextOnCopy,
+    runMapLines, runFoldMapLines, execFoldMapLines, evalFoldMapLines,
     -- ** Text Editing Combinators
     RelativeToCursor(..),
     insertString, insertChar, lineBreak,
@@ -65,17 +101,22 @@ module Hakshell.TextEditor
     pushLine, popLine,
     readLineIndex, writeLineIndex,
     forLinesM, forLinesInRangeM, forLinesInBufferM,
-    -- ** Cursor Positions
+    -- * Text Views
+    TextView, textView, textViewOnLines, textViewAppend,
+    newTextBufferFromView, textViewCharCount, textViewVector,
+    FoldTextView, foldTextView,
+    -- * Cursor Positions
     Relative, Absolute, LineIndex, CharIndex, TextLocation(..),
     RelativeToAbsoluteCursor, -- <- does not export members
     relativeToAbsolute,
     relativeLine, relativeChar,
     cursorLineIndex, cursorCharIndex, getCursor, gotoCursor, saveCursorEval,
     gotoPosition, gotoLine, gotoChar, moveCursor, moveByLine, moveByChar,
+    -- * Function and Data Types
     -- ** Text Editing Typeclasses
     MonadEditText(..), MonadEditLine(..),
     -- ** Instances of Text Editing Type Classes
-    EditText, newTextCursor,
+    EditText, newTextCursor, copyTextCursor,
     FoldMapLines, MapLines, EditLine, editLine,
     FoldMapLinesHalt,
     FoldMapChars, foldMapChars, runFoldMapChars, execFoldMapChars, evalFoldMapChars,
@@ -118,6 +159,7 @@ import           Control.Monad.State
 import           Control.Monad.State.Class
 import           Control.Monad.Trans
 
+import qualified Data.Vector                 as Vec
 import qualified Data.Vector.Mutable         as MVec
 import qualified Data.Vector.Unboxed         as UVec
 import qualified Data.Vector.Generic.Mutable as GMVec
@@ -130,6 +172,10 @@ import           Data.Word
 -- convenient to shorten the name to 'cl'.
 cl :: ALens s t a b -> Lens s t a b
 cl = cloneLens
+
+-- Used by 'newTextBuffer' as a parameter to 'newTextBufferState'.
+defaultInitBufferSize :: Int
+defaultInitBufferSize = 512
 
 ----------------------------------------------------------------------------------------------------
 
@@ -173,11 +219,28 @@ instance Monad m => MonadError TextEditError (EditText tags m) where
 instance MonadTrans (EditText tags) where
   lift = EditText . lift . lift
 
--- | Evaluate an 'EditText' function on the given 'TextBufferState'.
+-- | Evaluate an 'EditText' function on the given 'TextBufferState'. The given 'EditText' function
+-- is evaluates all updates on the given 'TextBuffer' atomically and in-place (i.e. without copying
+-- anything unless instructed to do so). This is the most efficient way to evaluate an 'EditText'
+-- function, but is more restrictive in that it can only be evaluated when the 'EditText' data
+-- type's @m@ parameter is set to the @IO@ type, meaning you cannot use this function if the
+-- 'EditText's @m@ parameter is something other than @IO@, like for example a 'ReaderT' type.
 runEditTextIO :: EditText tags IO a -> TextBuffer tags -> IO (Either TextEditError a)
 runEditTextIO (EditText f) (TextBuffer mvar) = modifyMVar mvar $
   fmap (\ (a,b) -> (b,a)) . runStateT (runExceptT f)
-  -- TODO: use MonadResource instead of modifyMVar
+
+-- | Evaluate an 'EditText' function on the given 'TextBufferState', but unlike 'runEditTextIO', a
+-- copy of the entire text buffer is first created, and all updates are performed on the copy
+-- atomically. This function is less restrictive than 'runEditTextIO' because it will work for
+-- 'EditText' functions where the @m@ parameter is not just @IO@ but any member of the 'Monad'
+-- typeclass, however the trade-off is that a copy of the text buffer must be made.
+runEditTextOnCopy
+  :: MonadIO m
+  => EditText tags m a -> TextBuffer tags -> m (Either TextEditError a, TextBuffer tags)
+runEditTextOnCopy (EditText f) = copyTextBuffer >=> \ copy@(TextBuffer mvar) -> do
+  (result, st) <- liftIO (readMVar mvar) >>= runStateT (runExceptT f)
+  liftIO $ void $ swapMVar mvar st
+  return (result, copy)
 
 ----------------------------------------------------------------------------------------------------
 
@@ -460,7 +523,7 @@ data TextBufferState tags
     }
 
 data TextEditError
-  = TextEditError StrictBytes
+  = TextEditError !StrictBytes
   deriving (Eq, Ord)
 
 -- | A pair of functions used to break strings into lines. This function is called every time a
@@ -555,12 +618,20 @@ textCursorTags = lens theTextCursorTags $ \ a b -> a{ theTextCursorTags = b }
 -- tag, so it is necessary to pass an initializing tag value of type @tags@ -- if you need nothing
 -- but plain text editing, @tags@ can be unit @()@.
 newTextBuffer :: tags -> IO (TextBuffer tags)
-newTextBuffer = fmap TextBuffer . (newTextBufferState >=> newMVar)
+newTextBuffer = fmap TextBuffer . (newTextBufferState defaultInitBufferSize >=> newMVar)
 
-newTextBufferState :: tags -> IO (TextBufferState tags)
-newTextBufferState tags = do
+-- | Create a deep-copy of a 'TextBuffer'. Everything is copied perfectly, including the cursor
+-- position, and the content and state of the cursor.
+copyTextBuffer :: TextBuffer tags -> IO (TextBuffer tags)
+copyTextBuffer (TextBuffer mvar) = withMVar mvar $ \ old -> do
+  newBuf <- copyVec (theBufferVector old) (theLinesAboveCursor old) (theLinesBelowCursor old)
+  newCur <- copyTextCursor $ theBufferCursor old
+  fmap TextBuffer $ newMVar $ old{ theBufferCursor = cur, theBufferVector = buf }
+
+newTextBufferState :: Int -> tags -> IO (TextBufferState tags)
+newTextBufferState size tags = do
   cur <- newTextCursor tags
-  buf <- MVec.new 512
+  buf <- MVec.new size
   return TextBufferState
     { theBufferCharNumber  = 0
     , theBufferCharCount   = 0
@@ -594,6 +665,13 @@ newTextCursor tag = do
     , theCursorBreakSize   = 0
     , theTextCursorTags    = tag
     }
+
+-- | Use this to create a deep-copy of a 'TextCursor'. The cursor position within the 'TextCursor'
+-- is also copied.
+copyTextCursor :: TextCursor tags -> IO (TextCursor tags)
+copyTextCursor cur = do
+  buf <- copyVec (theLineEditBuffer cur) (theCharsBeforeCursor cur) (theCharsAfterCursor cur)
+  return cur{ theLineEditBuffer = buf }
 
 -- | Determine how many characters have been stored into this buffer.
 textCursorCharCount :: TextCursor tags -> Int
@@ -768,12 +846,12 @@ textLineTags = lens theTextLineTags $ \ a b -> a{ theTextLineTags = b }
 --
 -- There are two different function types which satisfy the @editor@ type variable: the 'TextEdit'
 -- function type which is evaluated by the 'runEditText' function, and the 'TextFoldMap' function
--- type which is evaluated by the 'runTextFoldMap' function.
+-- type which is evaluated by the 'runFoldMapLines' function.
 --
 -- So any function type you see in this module that evaluates to a polymorphic type variable
 -- @editor@, where @editor@ is a member of 'MonadEditText' (for example 'insertString'), can be used
 -- when building either a 'TextEdit' or 'TextFoldMap' function that is then passed as a parameter to
--- the 'runEditText' or 'runTextFoldMap' (respectively).
+-- the 'runEditText' or 'runFoldMapLines' (respectively).
 --
 -- This design pattern is similar to 'Control.Monad.IO.Class.liftIO', and then defining an API in
 -- which all functions evaluate to a function of type @'Control.Monad.IO.Class.MonadIO' m => m a@,
@@ -838,17 +916,34 @@ growVec
   :: (GMVec.MVector vector a, PrimMonad m)
   => vector (PrimState m) a
   -> Int -> Int -> Int -> m (vector (PrimState m) a)
-growVec vec beforeElems afterElems addElems = do
-  let reqSize = beforeElems + afterElems + addElems
+growVec vec before after addElems = do
+  let reqSize = before + after + addElems
   let len = GMVec.length vec
   if reqSize <= len then return vec else do
     let newSize = head $ dropWhile (< reqSize) $ iterate (* 2) len
+    let copy = GMVec.copy -- TODO: change this to 'unsafeCopy' after thorough testing
+    let slice = GMVec.slice -- TODO: change this to 'unsafeSlice' after thorough testing.
     newVec <- GMVec.new newSize
-    GMVec.copy (GMVec.slice 0 beforeElems newVec) (GMVec.slice 0 beforeElems vec)
-    GMVec.copy
-      (GMVec.slice (len - afterElems) afterElems newVec)
-      (GMVec.slice (len - afterElems) afterElems vec)
+    copy (slice 0 before newVec) (slice 0 before vec)
+    copy (slice (len - after) after newVec) (slice (len - after) after vec)
     return newVec
+
+-- Not for export: creates a deep-copy of a vector with a cursor, in which elements before the
+-- cursor are aligned at the start of the vector, and elements after the cursor are aligned at the
+-- end of the vector.
+copyVec
+  :: (VMVec.MVector vector a, PrimMonad m)
+  => vector (PrimState m) a
+  -> Int -> Int -> m (vector (PrimState m) a)
+copyVec oldVec before after = do
+  let len = GMVec.length oldVec
+  let upper = len - after
+  let copy = GMVec.copy -- TODO: change this to 'unsafeCopy' after thorough testing
+  let slice = GMVec.slice -- TODO: change this to 'unsafeSlice' after thorough testing
+  newVec <- MVar.new len
+  when (before > 0) $ copy (slice     0 before newBuf) (slice     0 before oldBuf)
+  when (after  > 0) $ copy (slice upper  after newBuf) (slice upper  after oldBuf)
+  return newVec
 
 -- Not for export: should be executed automatically by insertion operations. Increases the size of
 -- the 'lineEditBuffer' to be large enough to contain the current 'textCursorCharCount' plus the
@@ -1414,3 +1509,182 @@ instance RelativeToAbsoluteCursor CharIndex where
   relativeToAbsolute (Relative (CharIndex i)) = liftEditText $
     Absolute . CharIndex . (+ 1) . max 0 . app . (min &&& (+ i)) <$>
     liftEditLine (use charsBeforeCursor)
+
+----------------------------------------------------------------------------------------------------
+
+-- | 'TextView's are a shallow, immutable snapshot of all, or a portion of, a 'TextBuffer'. The
+-- internal structure of a 'TextView' is identical to that of the 'TextBuffer' so no additional
+-- conversion or copying is necessary, making the creation of views extremely fast. Create a
+-- 'TextView' using 'textViewOnLines' or 'textViewOnRange'. Once a 'TextView' is created other
+-- threads may immediately resume performing updates on the 'TextBuffer'.
+data TextView tags
+  = TextView
+    { textViewCharCount :: !Int
+      -- ^ Evaluates to how many characters exist in this buffer.
+    , textViewVector    :: !(Vec.Vector (TextLine tags))
+      -- ^ Evaluates to a vector of 'TextLine's so you can make use of the 'Vec.Vector' APIs to
+      -- define your own operations on a 'TextView'.
+    }
+  deriving (Eq, Ord)
+
+instance Semigroup tags => Semigroup (TextView tags) where
+  (<>) = textLineAppend (<>)
+
+instance Monoid tags => Semigroup (TextView tags) where
+  mempty = TextView{ textViewCharCount = 0, textViewVector = mempty }
+  mappend = textLineAppend mappend
+
+newtype FoldTextView r fold tags m a
+  = FoldTextView
+    { unwrapFoldTextView :: ContT r (StateT fold m) a
+    }
+  deriving (Functor, Applicative, Monad, MonadIO)
+
+instance Monad m => MonadState fold (FoldTextView r fold tags m) where
+  state = FoldTextView . lift . state
+
+instance Monad m => MonadCont (FoldTextView r fold tags m) where
+  callCC f = FoldTextView $ callCC $ unwrapFoldTextView . f . (FoldTextView .)
+
+instance MonadTrans (FoldTextView r fold tags) where
+  lift = FoldTextView . lift . lift
+
+type FoldTextViewHalt void fold tags m r = r -> FoldTextView r fold tags m void
+
+-- | This function works similar to 'Data.Monoid.mappend' or the @('Data.Semigroup.<>')@ operator,
+-- but allows you to provide your own appending function for the @tags@ value. Tags are appended if
+-- the final lines of the left 'TextView' has no line break and therefore must to be prepended to
+-- the first line of the right 'TextView'. If the left 'TextView' ends with a line break, the @tags@
+-- appending function is never evaluated.
+textViewAppend :: (tags -> tags -> tags) -> TextView tags -> TextView tags -> TextView tags
+textViewAppend =
+  TextView{textViewCharCount=countA,textViewVector=vecA} <>
+    TextView{textViewCharCount=countB,textViewVector=vecB} =
+      TextView
+      { textViewCharCount = countA + countB
+      , textViewVector = let { lenA = Vec.length vecA; lenB = Vec.length vecB; } in
+          if lenA == 0 then vecB else
+          if lenB == 0 then vecA else Vec.create
+            (do let lastA  = vecA Vec.! len - 1
+                let firstB = vecB Vec.! 0
+                let lenAB  = lenA + lenB
+                let lineAB = TextLine
+                      { theTextLineString    = vecA <> vecB
+                      , theTextLineTags      = theTextLineTags lastA <> theTextLineTags firstB
+                      , theTextLineBreakSize = theTextLineBreakSize firstB
+                      }
+                let listA = Vec.toList $ Vec.slice 0 (lenA - 1) vecA
+                let listB = Vec.toList $ Vec.slice 1 (lenB - 1) vecB
+                let (size, list) = if theTextLineBreakSize lastA > 0
+                      then (lenAB, listA ++ lastA : firstB : listB)
+                      else (lenAB - 1, listA ++ lineAB : listB)
+                newVec <- MVec.new size
+                forM_ (zip [0 ..] list) $ uncurry $ MVec.write newVec
+                return newVec
+            )
+      }
+
+-- | Create a 'TextView' from the content of a 'TextBuffer' in the given range delimited by the two
+-- given 'TextLocation' values.
+--
+-- __NOTE__ that if the range contains the current 'TextCursor', be sure to evaluate 'endInsertMode'
+-- function before evaluating 'textViewOnLines', otherwise the updates to the current line will not
+-- be reflected in the created 'TextView'.
+textView
+  :: MonadIO m
+  => TextLocation -> TextLocation
+  -> TextBuffer tags -> m (TextView tags)
+textView from0 to0 (TextBuffer mvar) = liftIO $ withMVar mvar $ \ st -> do
+  let (from, to) = (min from0 to, max from0 to0)
+  let fromLine0 = theCursorLineIndex  from
+  let toLine0   = theCursorLineIndex  to
+  let oldBuf    = theBufferVector     st
+  let lineCount = theBufferLineCount  st
+  let above     = theLinesAboveCursor st
+  let below     = theLinesBelowCursor st
+  let upper     = lineCount - below
+  let limit     = max (Absolute $ LineIndex 0) . min (Absolute $ LineIndex $ lineCount - 1)
+  let (Absolute (LineIndex fromLine), Absolute (LineIndex toLine)) =
+        (limit $ min fromLine0 toLine0, limit $ max fromLine0 toLine0)
+  let newLen = toLine - fromLine + 1
+  let copy   = MVec.copy -- TODO: change to 'unsafeCopy' after thorough testing
+  let slice  = MVec.slice -- TODO: change to 'unsafeSlice' after thorough testing
+  let freeze = MVec.freeze -- TODO: change to 'unsafeFreeze' after thorough testing
+  if lineCount == 0
+   then return (TextView{ textViewCharCount = 0, textViewVector = Vec.empty })
+   else do
+    newBuf <- MVec.new newLen
+    if fromLine <= above && toLine <= above
+      then copy newBuf (slice fromLine newLen oldBuf)
+      else if fromLine > above && toLine > above
+      then copy newBuf (slice (upper - above + fromLine) newLen oldBuf)
+      else if fromLine <= above && above < toLine
+      then do
+        let aboveLen = above - fromLine
+        when (aboveLen > 0) $
+          copy (slice 0 aboveLen newBuf) (slice 0 aboveLen oldBuf)
+        let belowLen = toLine - above - 1
+        when (belowLen > 0) $
+          copy (slice aboveLen belowLen newBuf) (slice upper belowLen oldBuf)
+      else error "textViewOnLines: this should never happen"
+    let (fromChar0, toChar0) = (theCursorCharIndex from, theCursorCharIndex to)
+    let (fromChar,  toChar ) = (max 0 $ min fromChar0 $ len - 1, max 0 $ min toChar0 $ len - 1)
+    let trim idx slice = do
+          line <- MVec.read newBuf 0
+          let vec = theTextLineString line
+          let len = UVec.length vec
+          MVec.write newBuf 0 $ line
+            { theTextLineString = UVec.force $
+                uncurry UVec.slice (slice len fromChar toChar) vec
+            }
+    if fromLine == toLine
+      then trim 0 $ \ _len from to -> (from, to - from + 1)
+      else do
+        trim 0 $ \ _len _from to -> (0, to)
+        trim (newLen - 1) $ \ len from _to -> (from + 1, len)
+    TextView <$> freeze newBuf
+
+-- | Like 'textView', creates a new text view, but rather than taking two 'TextLocation's to delimit
+-- the range, takes two @('Absolute' 'LineIndex')@ values to delimit the range.
+textViewOnLines
+  :: MonadIO m
+  => TextLocation -> TextLocation
+  -> TextBuffer tags -> m (TextView tags)
+textViewOnLines from to = textView
+  (TextLocation
+   { theCursorLineIndex = min from to
+   , theCursorCharIndex = Absolute $ CharIndex 0
+   })
+  (TextLocation
+   { theCursorLineIndex = max from to
+   , theCursorCharIndex = Absolute $ CharIndex maxBound
+   })
+
+-- | Create a new, editable 'TextBuffer' from a read-only 'TextView'. Pass 'Before' to place the
+-- text in the buffer before the cursor, meaning the cursor will start positioned at the end of the
+-- editable 'TextBuffer', or pass 'After' to place the text in the buffer after the cursor, meaning
+-- the cursor will start at the beginning of the editable 'TextBuffer'.
+newTextBufferFromView :: MonadIO m => RelativeToCursor -> TextView tags -> m (TextBuffer tags)
+newTextBufferFromView rel (TextView{textViewVector=vec}) = liftIO $ do
+  let oldLen = Vec.length vec
+  st0 <- newTextBufferState $ max 16 $ oldLen * 2
+  let newBuf = theBufferVector st
+  let newLen = MVec.length buf
+  let cursor = if oldLen == 0 then 0 else
+        if theTextLineBreakSize (vec Vec.! oldLen - 1) > 0 then oldLen else oldLen - 1
+  let (idx, st) = case rel of
+        Before -> ([0 ..], st & linesAboveCursor .~ cursor)
+        After  -> ([newLen - oldLen ..], st & linesBelowCursor .~ cursor)
+  forM_ (zip idx $ Vec.toList vec) $ uncurry $ MVec.write newBuf
+  TextBuffer <$> newMVar st
+
+-- | Perform a fold over every 'TextLine' in the 'TextView' using a function of type 'FoldTextView'.
+foldTextView
+  :: Monad m
+  => (FoldTextViewHalt void fold tags m fold -> TextLine tags -> FoldTextView fold fold tags m ())
+  -> TextView tags -> fold -> m fold
+foldTextView f fold (TextView{textViewVector=vec}) =
+  execStateT $ runContT (unwrapFoldTextView $ callCC $ loop $ Vec.toList vec) return where
+    loop lines halt = case lines of
+      []         -> return ()
+      line:lines -> f halt lines >> loop lines halt
