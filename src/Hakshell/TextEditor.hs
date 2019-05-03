@@ -100,12 +100,8 @@ module Hakshell.TextEditor
     copyCurrentLine, replaceCurrentLine,
     pushLine, popLine,
     readLineIndex, writeLineIndex,
-    forLinesM, forLinesInRangeM, forLinesInBufferM,
-    -- * Text Views
-    TextView, textView, textViewOnLines, textViewAppend,
-    newTextBufferFromView, textViewCharCount, textViewVector,
-    FoldTextView, foldTextView,
-    -- * Cursor Positions
+    forLines, forLinesInRange, forLinesInBuffer,
+    -- ** Cursor Positions
     Relative, Absolute, LineIndex, CharIndex, TextLocation(..),
     RelativeToAbsoluteCursor, -- <- does not export members
     relativeToAbsolute,
@@ -273,16 +269,13 @@ instance Monad m => MonadError TextEditError (FoldMapLines r fold tags m) where
 instance Monad m => MonadCont (FoldMapLines r fold tags m) where
   callCC f = FoldMapLines $ callCC $ unwrapFoldMapLines . f . (FoldMapLines .)
 
-instance MonadTrans (FoldMapLines r fold tags) where
-  lift = FoldMapLines . lift . lift . lift . lift
-
--- | When evaluating 'forLinesInRangeM', a 'FoldMapLines' function is evaluated. The 'FoldMapLines'
+-- | When evaluating 'forLinesInRange', a 'FoldMapLines' function is evaluated. The 'FoldMapLines'
 -- function type instantiates the 'Control.Monad.Cont.Class.MonadCont' type class, and the
 -- 'Control.Monad.Class.callCC' function is evaluated before running the fold map operation,
 -- producing a halting function. The halting function is of this data type.
 --
 -- Suppose you would like to fold and map over lines 5 through 35 counting the lines as you go, but
--- halt if the line of text is @"stop\\n"@, you would evaluate 'forLinesInRangeM' like so:
+-- halt if the line of text is @"stop\\n"@, you would evaluate 'forLinesInRange' like so:
 --
 -- @
 -- stopSymbol <- 'Data.List.head' 'Control.Applicative.<$>' 'textLines' "stop\n"
@@ -1252,7 +1245,7 @@ deleteCharsWrap (Relative (CharIndex n)) = liftEditText $ if n == 0 then return 
   n <- if not insMode then return n else case rel of
     Before -> insAdjust charsBeforeCursor
     After  -> insAdjust charsAfterCursor
-  void $ forLinesM rel n $ \ halt line -> get >>= \ n -> if n <= 0 then halt n else do
+  void $ forLines rel n $ \ halt line -> get >>= \ n -> if n <= 0 then halt n else do
     let len = UVec.length $ line ^. textLineString
     state $ const $ if len < n then ([], n - len) else ([cutLine n line], 0)
 
@@ -1303,18 +1296,17 @@ insertString str = liftEditText $ use (bufferLineBreaker . lineBreaker) >>= loop
       writeLine line
       loop more
 
--- Not for export: this code shared by 'forLinesInRangeM' and 'forLinesM' but requires knowledge of
+-- Not for export: this code shared by 'forLinesInRange' and 'forLines' but requires knowledge of
 -- the 'TextBuffer' internals in order to use, so is not something end users should need to know
 -- about.
-forLinesLoopM
-  :: Monad m
-  => fold
-  -> (FoldMapLinesHalt void fold tags m fold ->
-      TextLine tags -> FoldMapLines fold fold tags m [TextLine tags])
+forLinesLoop
+  :: fold
+  -> (FoldMapLinesHalt void fold tags fold ->
+      TextLine tags -> FoldMapLines fold fold tags [TextLine tags])
   -> Int
-  -> (EditText tags m (TextLine tags), TextLine tags -> FoldMapLines fold fold tags m ())
-  -> EditText tags m fold
-forLinesLoopM fold f count (pop, push) = execFoldMapLines (callCC $ loop count) fold where
+  -> (EditText tags (TextLine tags), TextLine tags -> FoldMapLines fold fold tags ())
+  -> EditText tags fold
+forLinesLoop fold f count (pop, push) = execFoldMapLines (callCC $ loop count) fold where
   loop count halt = if count <= 0 then get else
     liftEditText pop >>= f halt >>= mapM_ push >> loop (count - 1) halt
 
@@ -1335,14 +1327,13 @@ forLinesLoopM fold f count (pop, push) = execFoldMapLines (callCC $ loop count) 
 -- Remember that the 'FoldMapLines' function type instantiates 'Control.Monad.Cont.State.MonadCont',
 -- which means the 'FoldMapLines' function you pass to this function can elect to halt the fold map
 -- operation by evaluating the stop function passed to it.
-forLinesInRangeM
-  :: MonadIO m
-  => Absolute LineIndex -> Absolute LineIndex
+forLinesInRange
+  :: Absolute LineIndex -> Absolute LineIndex
   -> fold
-  -> (FoldMapLinesHalt void fold tags m fold ->
-      TextLine tags -> FoldMapLines fold fold tags m [TextLine tags])
-  -> EditText tags m fold
-forLinesInRangeM (Absolute (LineIndex from)) (Absolute (LineIndex to)) fold f = do
+  -> (FoldMapLinesHalt void fold tags fold ->
+      TextLine tags -> FoldMapLines fold fold tags [TextLine tags])
+  -> EditText tags fold
+forLinesInRange (Absolute (LineIndex from)) (Absolute (LineIndex to)) fold f = do
   endInsertMode Before
   above <- use linesAboveCursor
   below <- use linesBelowCursor
@@ -1351,35 +1342,33 @@ forLinesInRangeM (Absolute (LineIndex from)) (Absolute (LineIndex to)) fold f = 
   to   <- pure $ min lineCount $ max 0 to
   gotoLine $ Absolute $ LineIndex from
   let dist = to - from
-  forLinesLoopM fold f (abs dist + 1) $ if dist < 0
+  forLinesLoop fold f (abs dist + 1) $ if dist < 0
     then (unsafePopLine Before, pushLine After)
     else (unsafePopLine After, pushLine Before)
 
--- | Conveniently calls 'forLinesInRangeM' with the first two parameters as @('Absolute' 1)@ and
+-- | Conveniently calls 'forLinesInRange' with the first two parameters as @('Absolute' 1)@ and
 -- @('Absolute' 'maxBound')@.
-forLinesInBufferM
-  :: MonadIO m
-  => fold
-  -> (FoldMapLinesHalt void fold tags m fold ->
-      TextLine tags -> FoldMapLines fold fold tags m [TextLine tags])
-  -> EditText tags m fold
-forLinesInBufferM = forLinesInRangeM (Absolute 1) (Absolute maxBound)
+forLinesInBuffer
+  :: fold
+  -> (FoldMapLinesHalt void fold tags fold ->
+      TextLine tags -> FoldMapLines fold fold tags [TextLine tags])
+  -> EditText tags fold
+forLinesInBuffer = forLinesInRange (Absolute 1) (Absolute maxBound)
 
--- | Like 'forLinesInRangeM', but this function takes a 'RelativeToCursor' value, iteration begins
+-- | Like 'forLinesInRange', but this function takes a 'RelativeToCursor' value, iteration begins
 -- at the 'bufferCurrentLine', and if the 'RelativeToCursor' value is 'After' then iteration goes
 -- forward to the end of the buffer, whereas if the 'RelativeToCursor' value is 'Before' then
 -- iteration goes backward to the start of the buffer.
-forLinesM
-  :: MonadIO m
-  => RelativeToCursor
+forLines
+  :: RelativeToCursor
   -> fold
-  -> (FoldMapLinesHalt void fold tags m fold ->
-      TextLine tags -> FoldMapLines fold fold tags m [TextLine tags])
-  -> EditText tags m fold
-forLinesM rel fold f = do
+  -> (FoldMapLinesHalt void fold tags fold ->
+      TextLine tags -> FoldMapLines fold fold tags [TextLine tags])
+  -> EditText tags fold
+forLines rel fold f = do
   above <- use linesAboveCursor
   below <- use linesBelowCursor
-  uncurry (forLinesLoopM fold f) $ case rel of
+  uncurry (forLinesLoop fold f) $ case rel of
     Before -> (above, (unsafePopLine Before, pushLine After))
     After  -> (below, (unsafePopLine After, pushLine Before))
 
