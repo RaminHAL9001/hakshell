@@ -33,7 +33,7 @@ editTextTests = do
   reportInsert "one two three\n"
   reportInsert "four five six\nseven eight nine\nten eleven twelve\n"
   report "OK\n"
-  forLinesInBufferM (1::Int) $ \ _ line -> do
+  forLinesInBuffer (1::Int) $ \ _ line -> do
     n <- state $ \ n -> (n, n+1)
     liftIO $ putStrLn $ show n ++ ": " ++ unpack line
     return [line]
