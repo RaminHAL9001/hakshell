@@ -87,7 +87,7 @@
 module Hakshell.TextEditor
   ( -- * Text Editing API
     -- ** Create and Start Editing a 'TextBufferState'
-    TextBuffer, textBufferState, newTextBuffer, copyTextBuffer,
+    TextBuffer, newTextBuffer, copyTextBuffer,
     runEditTextIO, runEditTextOnCopy,
     runMapLines, runFoldMapLines, execFoldMapLines, evalFoldMapLines,
     -- ** Text Editing Combinators
@@ -157,8 +157,8 @@ import           Control.Monad.Error.Class
 import           Control.Monad.Primitive
 import           Control.Monad.State
 import           Control.Monad.State.Class
-import           Control.Monad.Trans
 
+import           Data.Semigroup
 import qualified Data.Vector                 as Vec
 import qualified Data.Vector.Mutable         as MVec
 import qualified Data.Vector.Unboxed         as UVec
@@ -237,7 +237,7 @@ runEditTextIO (EditText f) (TextBuffer mvar) = modifyMVar mvar $
 runEditTextOnCopy
   :: MonadIO m
   => EditText tags m a -> TextBuffer tags -> m (Either TextEditError a, TextBuffer tags)
-runEditTextOnCopy (EditText f) = copyTextBuffer >=> \ copy@(TextBuffer mvar) -> do
+runEditTextOnCopy (EditText f) = liftIO . copyTextBuffer >=> \ copy@(TextBuffer mvar) -> do
   (result, st) <- liftIO (readMVar mvar) >>= runStateT (runExceptT f)
   liftIO $ void $ swapMVar mvar st
   return (result, copy)
@@ -626,7 +626,7 @@ copyTextBuffer :: TextBuffer tags -> IO (TextBuffer tags)
 copyTextBuffer (TextBuffer mvar) = withMVar mvar $ \ old -> do
   newBuf <- copyVec (theBufferVector old) (theLinesAboveCursor old) (theLinesBelowCursor old)
   newCur <- copyTextCursor $ theBufferCursor old
-  fmap TextBuffer $ newMVar $ old{ theBufferCursor = cur, theBufferVector = buf }
+  fmap TextBuffer $ newMVar $ old{ theBufferCursor = newCur, theBufferVector = newBuf }
 
 newTextBufferState :: Int -> tags -> IO (TextBufferState tags)
 newTextBufferState size tags = do
@@ -932,7 +932,7 @@ growVec vec before after addElems = do
 -- cursor are aligned at the start of the vector, and elements after the cursor are aligned at the
 -- end of the vector.
 copyVec
-  :: (VMVec.MVector vector a, PrimMonad m)
+  :: (GMVec.MVector vector a, PrimMonad m)
   => vector (PrimState m) a
   -> Int -> Int -> m (vector (PrimState m) a)
 copyVec oldVec before after = do
@@ -940,9 +940,9 @@ copyVec oldVec before after = do
   let upper = len - after
   let copy = GMVec.copy -- TODO: change this to 'unsafeCopy' after thorough testing
   let slice = GMVec.slice -- TODO: change this to 'unsafeSlice' after thorough testing
-  newVec <- MVar.new len
-  when (before > 0) $ copy (slice     0 before newBuf) (slice     0 before oldBuf)
-  when (after  > 0) $ copy (slice upper  after newBuf) (slice upper  after oldBuf)
+  newVec <- GMVec.new len
+  when (before > 0) $ copy (slice     0 before newVec) (slice     0 before oldVec)
+  when (after  > 0) $ copy (slice upper  after newVec) (slice upper  after oldVec)
   return newVec
 
 -- Not for export: should be executed automatically by insertion operations. Increases the size of
@@ -1525,14 +1525,13 @@ data TextView tags
       -- ^ Evaluates to a vector of 'TextLine's so you can make use of the 'Vec.Vector' APIs to
       -- define your own operations on a 'TextView'.
     }
-  deriving (Eq, Ord)
 
 instance Semigroup tags => Semigroup (TextView tags) where
-  (<>) = textLineAppend (<>)
+  (<>) = textViewAppend (<>)
 
-instance Monoid tags => Semigroup (TextView tags) where
-  mempty = TextView{ textViewCharCount = 0, textViewVector = mempty }
-  mappend = textLineAppend mappend
+instance Monoid tags => Monoid (TextView tags) where
+  mempty  = TextView{ textViewCharCount = 0, textViewVector = mempty }
+  mappend = textViewAppend mappend
 
 newtype FoldTextView r fold tags m a
   = FoldTextView
@@ -1557,32 +1556,31 @@ type FoldTextViewHalt void fold tags m r = r -> FoldTextView r fold tags m void
 -- the first line of the right 'TextView'. If the left 'TextView' ends with a line break, the @tags@
 -- appending function is never evaluated.
 textViewAppend :: (tags -> tags -> tags) -> TextView tags -> TextView tags -> TextView tags
-textViewAppend =
-  TextView{textViewCharCount=countA,textViewVector=vecA} <>
-    TextView{textViewCharCount=countB,textViewVector=vecB} =
-      TextView
-      { textViewCharCount = countA + countB
-      , textViewVector = let { lenA = Vec.length vecA; lenB = Vec.length vecB; } in
-          if lenA == 0 then vecB else
-          if lenB == 0 then vecA else Vec.create
-            (do let lastA  = vecA Vec.! len - 1
-                let firstB = vecB Vec.! 0
-                let lenAB  = lenA + lenB
-                let lineAB = TextLine
-                      { theTextLineString    = vecA <> vecB
-                      , theTextLineTags      = theTextLineTags lastA <> theTextLineTags firstB
-                      , theTextLineBreakSize = theTextLineBreakSize firstB
-                      }
-                let listA = Vec.toList $ Vec.slice 0 (lenA - 1) vecA
-                let listB = Vec.toList $ Vec.slice 1 (lenB - 1) vecB
-                let (size, list) = if theTextLineBreakSize lastA > 0
-                      then (lenAB, listA ++ lastA : firstB : listB)
-                      else (lenAB - 1, listA ++ lineAB : listB)
-                newVec <- MVec.new size
-                forM_ (zip [0 ..] list) $ uncurry $ MVec.write newVec
-                return newVec
-            )
-      }
+textViewAppend appendTags
+  TextView{textViewCharCount=countA,textViewVector=vecA}
+  TextView{textViewCharCount=countB,textViewVector=vecB} = TextView
+    { textViewCharCount = countA + countB
+    , textViewVector = let { lenA = Vec.length vecA; lenB = Vec.length vecB; } in
+        if lenA == 0 then vecB else
+        if lenB == 0 then vecA else Vec.create
+          (do let lastA  = vecA Vec.! (lenA - 1)
+              let firstB = vecB Vec.! 0
+              let lenAB  = lenA + lenB
+              let lineAB = TextLine
+                    { theTextLineString = theTextLineString lastA <> theTextLineString firstB
+                    , theTextLineTags = appendTags (theTextLineTags lastA) (theTextLineTags firstB)
+                    , theTextLineBreakSize = theTextLineBreakSize firstB
+                    }
+              let listA = Vec.toList $ Vec.slice 0 (lenA - 1) vecA
+              let listB = Vec.toList $ Vec.slice 1 (lenB - 1) vecB
+              let (size, list) = if theTextLineBreakSize lastA > 0
+                    then (lenAB, listA ++ lastA : firstB : listB)
+                    else (lenAB - 1, listA ++ lineAB : listB)
+              newVec <- MVec.new size
+              forM_ (zip [0 ..] list) $ uncurry $ MVec.write newVec
+              return newVec
+          )
+    }
 
 -- | Create a 'TextView' from the content of a 'TextBuffer' in the given range delimited by the two
 -- given 'TextLocation' values.
@@ -1609,7 +1607,7 @@ textView from0 to0 (TextBuffer mvar) = liftIO $ withMVar mvar $ \ st -> do
   let newLen = toLine - fromLine + 1
   let copy   = MVec.copy -- TODO: change to 'unsafeCopy' after thorough testing
   let slice  = MVec.slice -- TODO: change to 'unsafeSlice' after thorough testing
-  let freeze = MVec.freeze -- TODO: change to 'unsafeFreeze' after thorough testing
+  let freeze = Vec.freeze -- TODO: change to 'unsafeFreeze' after thorough testing
   if lineCount == 0
    then return (TextView{ textViewCharCount = 0, textViewVector = Vec.empty })
    else do
@@ -1627,13 +1625,15 @@ textView from0 to0 (TextBuffer mvar) = liftIO $ withMVar mvar $ \ st -> do
         when (belowLen > 0) $
           copy (slice aboveLen belowLen newBuf) (slice upper belowLen oldBuf)
       else error "textViewOnLines: this should never happen"
-    let (fromChar0, toChar0) = (theCursorCharIndex from, theCursorCharIndex to)
-    let (fromChar,  toChar ) = (max 0 $ min fromChar0 $ len - 1, max 0 $ min toChar0 $ len - 1)
+    let (Absolute (CharIndex fromChar0), Absolute (CharIndex toChar0)) =
+          (theCursorCharIndex from, theCursorCharIndex to)
     let trim idx slice = do
-          line <- MVec.read newBuf 0
+          line <- MVec.read newBuf idx
           let vec = theTextLineString line
           let len = UVec.length vec
-          MVec.write newBuf 0 $ line
+          let lim = max 0 . min (len - 1)
+          let (fromChar, toChar) = (lim fromChar0, lim toChar0)
+          MVec.write newBuf idx $ line
             { theTextLineString = UVec.force $
                 uncurry UVec.slice (slice len fromChar toChar) vec
             }
@@ -1642,7 +1642,11 @@ textView from0 to0 (TextBuffer mvar) = liftIO $ withMVar mvar $ \ st -> do
       else do
         trim 0 $ \ _len _from to -> (0, to)
         trim (newLen - 1) $ \ len from _to -> (from + 1, len)
-    TextView <$> freeze newBuf
+    newBuf <- freeze newBuf
+    return TextView
+      { textViewCharCount = sum $ UVec.length . theTextLineString <$> Vec.toList newBuf
+      , textViewVector    = newBuf
+      }
 
 -- | Like 'textView', creates a new text view, but rather than taking two 'TextLocation's to delimit
 -- the range, takes two @('Absolute' 'LineIndex')@ values to delimit the range.
@@ -1652,11 +1656,11 @@ textViewOnLines
   -> TextBuffer tags -> m (TextView tags)
 textViewOnLines from to = textView
   (TextLocation
-   { theCursorLineIndex = min from to
+   { theCursorLineIndex = min (theCursorLineIndex from) (theCursorLineIndex to)
    , theCursorCharIndex = Absolute $ CharIndex 0
    })
   (TextLocation
-   { theCursorLineIndex = max from to
+   { theCursorLineIndex = max (theCursorLineIndex from) (theCursorLineIndex to)
    , theCursorCharIndex = Absolute $ CharIndex maxBound
    })
 
@@ -1664,14 +1668,14 @@ textViewOnLines from to = textView
 -- text in the buffer before the cursor, meaning the cursor will start positioned at the end of the
 -- editable 'TextBuffer', or pass 'After' to place the text in the buffer after the cursor, meaning
 -- the cursor will start at the beginning of the editable 'TextBuffer'.
-newTextBufferFromView :: MonadIO m => RelativeToCursor -> TextView tags -> m (TextBuffer tags)
-newTextBufferFromView rel (TextView{textViewVector=vec}) = liftIO $ do
+newTextBufferFromView :: MonadIO m => RelativeToCursor -> tags -> TextView tags -> m (TextBuffer tags)
+newTextBufferFromView rel tags (TextView{textViewVector=vec}) = liftIO $ do
   let oldLen = Vec.length vec
-  st0 <- newTextBufferState $ max 16 $ oldLen * 2
-  let newBuf = theBufferVector st
-  let newLen = MVec.length buf
+  st0 <- newTextBufferState (max 16 $ oldLen * 2) tags
+  let newBuf = theBufferVector st0
+  let newLen = MVec.length newBuf
   let cursor = if oldLen == 0 then 0 else
-        if theTextLineBreakSize (vec Vec.! oldLen - 1) > 0 then oldLen else oldLen - 1
+        if theTextLineBreakSize (vec Vec.! (oldLen - 1)) > 0 then oldLen else oldLen - 1
   let (idx, st) = case rel of
         Before -> ([0 ..], st & linesAboveCursor .~ cursor)
         After  -> ([newLen - oldLen ..], st & linesBelowCursor .~ cursor)
@@ -1683,8 +1687,8 @@ foldTextView
   :: Monad m
   => (FoldTextViewHalt void fold tags m fold -> TextLine tags -> FoldTextView fold fold tags m ())
   -> TextView tags -> fold -> m fold
-foldTextView f fold (TextView{textViewVector=vec}) =
+foldTextView f (TextView{textViewVector=vec}) =
   execStateT $ runContT (unwrapFoldTextView $ callCC $ loop $ Vec.toList vec) return where
     loop lines halt = case lines of
-      []         -> return ()
-      line:lines -> f halt lines >> loop lines halt
+      []         -> get
+      line:lines -> f halt line >> loop lines halt
