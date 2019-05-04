@@ -164,6 +164,8 @@ import qualified Data.Vector.Generic.Mutable as GMVec
 import qualified Data.Vector.Unboxed.Mutable as UMVec
 import           Data.Word
 
+import Debug.Trace
+
 ----------------------------------------------------------------------------------------------------
 
 -- I create let bindings for lenses often, so I often need the 'cloneLens' function. It is very
@@ -1219,8 +1221,9 @@ gotoChar (Absolute (CharIndex n)) = liftEditLine $
 -- number and characters (column) number.
 gotoPosition
   :: (MonadEditText editor, MonadEditLine editor, MonadIO (editor tags m), MonadIO m)
-  => Absolute LineIndex -> Absolute CharIndex -> editor tags m ()
-gotoPosition line col = liftEditText $ gotoLine line >> gotoChar col
+  => TextLocation -> editor tags m ()
+gotoPosition (TextLocation{theCursorLineIndex=line,theCursorCharIndex=col}) =
+  liftEditText $ gotoLine line >> gotoChar col
 
 -- | This function only deletes characters on the current line, if the cursor is at the start of the
 -- line and you evaluate @'deleteChars' 'Before'@, this function does nothing.
@@ -1579,14 +1582,14 @@ textView from0 to0 (TextBuffer mvar) = liftIO $ withMVar mvar $ \ st -> do
   let slice  = MVec.slice -- TODO: change to 'unsafeSlice' after thorough testing
   let freeze = Vec.freeze -- TODO: change to 'unsafeFreeze' after thorough testing
   if lineCount == 0
-   then return (TextView{ textViewCharCount = 0, textViewVector = Vec.empty })
+   then trace ("lineCount == 0") $ return (TextView{ textViewCharCount = 0, textViewVector = Vec.empty })
    else do
     newBuf <- MVec.new newLen
     if fromLine <= above && toLine <= above
-      then copy newBuf (slice fromLine newLen oldBuf)
+      then trace ("fromLine="++show fromLine++" <= above="++show above++" && toLine="++show toLine++" <= above="++show above) $ copy newBuf (slice fromLine newLen oldBuf)
       else if fromLine > above && toLine > above
-      then copy newBuf (slice (upper - above + fromLine) newLen oldBuf)
-      else if fromLine <= above && above < toLine
+      then trace ("fromLine="++show fromLine++" > above="++show above++" && toLine="++show toLine++" > above="++show above) $ copy newBuf (slice (upper - above + fromLine) newLen oldBuf)
+      else trace ("fromLine="++show fromLine++" <= above="++show above++" && above < toLine="++show toLine) $ if fromLine <= above && above < toLine
       then do
         let aboveLen = above - fromLine
         when (aboveLen > 0) $
@@ -1603,15 +1606,15 @@ textView from0 to0 (TextBuffer mvar) = liftIO $ withMVar mvar $ \ st -> do
           let len = UVec.length vec
           let lim = max 0 . min (len - 1)
           let (fromChar, toChar) = (lim fromChar0, lim toChar0)
-          MVec.write newBuf idx $ line
+          trace ("trim idx="++show idx++" (slice len="++show len++" fromChar="++show fromChar++" toChar="++show toChar++")="++show (slice len fromChar toChar)) $ MVec.write newBuf idx $ line
             { theTextLineString = UVec.force $
                 uncurry UVec.slice (slice len fromChar toChar) vec
             }
     if fromLine == toLine
-      then trim 0 $ \ _len from to -> (from, to - from + 1)
+      then trim 0 $ \ _len from to -> (from, to - from)
       else do
-        trim 0 $ \ _len _from to -> (0, to)
-        trim (newLen - 1) $ \ len from _to -> (from + 1, len)
+        trim 0 $ \ len from _to -> (from, len - from)
+        trim (newLen - 1) $ \ _len _from to -> (0, to)
     newBuf <- freeze newBuf
     return TextView
       { textViewCharCount = sum $ UVec.length . theTextLineString <$> Vec.toList newBuf

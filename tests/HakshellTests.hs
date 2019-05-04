@@ -34,9 +34,9 @@ showLoc
    ,theCursorCharIndex=Absolute (CharIndex char)
    }) = '(' : show line ++ ':' : show char ++ ")"
 
-testTextEditor :: EditText tags IO () -> TextBuffer tags -> IO ()
-testTextEditor f = runEditTextIO f >=> \ case
-  Left (TextEditError err) -> putStrLn $ unpack err
+testTextEditor :: (String -> IO ()) -> TextBuffer tags -> EditText tags IO () -> IO ()
+testTextEditor onErr buf f = runEditTextIO f buf >>= \ case
+  Left (TextEditError err) -> onErr $ unpack err
   Right a -> return a
 
 defaultTags :: Tags
@@ -60,7 +60,7 @@ showView view = void $ forLinesInView view (1 :: Int) $ \ _halt line -> do
   liftIO $ putStrLn $ show n ++ ": " ++ unpack line
 
 basicTests :: IO ()
-basicTests = newTextBuffer defaultTags >>= testTextEditor
+basicTests = newTextBuffer defaultTags >>= flip (testTextEditor error)
   (do report "--- basic tests ---\n"
       let reportInsert str = do
             report $ "insertString " ++ show str ++ "\n"
@@ -76,7 +76,7 @@ textViewTests = do
   report "--- text view tests ---\n"
   buf <- newTextBuffer defaultTags
   report "fill buffer...\n"
-  flip testTextEditor buf $ do
+  testTextEditor error buf $ do
     let chars = "0123456789ABCDEF"
     insertString $ chars >>= \ a -> unwords ((\ b -> [a,b]) <$> chars) ++ "\n"
     showBuffer
@@ -84,4 +84,23 @@ textViewTests = do
         report $ "view "++showLoc a++"->"++showLoc b++"\n"
         v <- textView a b buf
         showView v
-  reportView (mkLoc 2 23) (mkLoc 5 24)
+  reportView (mkLoc  2 23) (mkLoc  5 24)
+  reportView (mkLoc 13  0) (mkLoc 15 47)
+  reportView (mkLoc  0  0) (mkLoc  2 47)
+  reportView (mkLoc  0 11) (mkLoc  0 24)
+  reportView (mkLoc  8 11) (mkLoc  8 24)
+  report "\nMove cursor to start of buffer..."
+  testTextEditor error buf $ gotoPosition $ mkLoc 0 0
+  report "OK\n"
+  reportView (mkLoc  2 23) (mkLoc  5 24)
+  reportView (mkLoc 13  0) (mkLoc 15 47)
+  reportView (mkLoc  0  0) (mkLoc  2 47)
+  reportView (mkLoc  0 11) (mkLoc  0 24)
+  reportView (mkLoc  8 11) (mkLoc  8 24)
+  report "\nMove cursor to middle of buffer..."
+  testTextEditor error buf $ gotoPosition $ mkLoc 8 23
+  report "OK\n"
+  reportView (mkLoc  6 23) (mkLoc 10 24)
+  reportView (mkLoc  6  0) (mkLoc  7 47)
+  reportView (mkLoc  7  0) (mkLoc  8 47)
+  reportView (mkLoc  8  0) (mkLoc  9 47)
