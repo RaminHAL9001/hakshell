@@ -1573,7 +1573,7 @@ textView from0 to0 (TextBuffer mvar) = liftIO $ withMVar mvar $ \ st -> do
   let above     = theLinesAboveCursor st
   let below     = theLinesBelowCursor st
   let lineCount = above + below
-  let upper     = lineCount - below
+  let upper     = MVec.length oldBuf - below
   let limit     = max (Absolute $ LineIndex 0) . min (Absolute $ LineIndex $ lineCount - 1)
   let (Absolute (LineIndex fromLine), Absolute (LineIndex toLine)) =
         (limit $ min fromLine0 toLine0, limit $ max fromLine0 toLine0)
@@ -1588,7 +1588,7 @@ textView from0 to0 (TextBuffer mvar) = liftIO $ withMVar mvar $ \ st -> do
     if fromLine <= above && toLine <= above
       then trace ("fromLine="++show fromLine++" <= above="++show above++" && toLine="++show toLine++" <= above="++show above) $ copy newBuf (slice fromLine newLen oldBuf)
       else if fromLine > above && toLine > above
-      then trace ("fromLine="++show fromLine++" > above="++show above++" && toLine="++show toLine++" > above="++show above) $ copy newBuf (slice (upper - above + fromLine) newLen oldBuf)
+      then trace ("fromLine="++show fromLine++" > above="++show above++" && toLine="++show toLine++" > above="++show above++" -> slice (upper="++show upper++" - above="++show above++" + fromLine="++show fromLine++") newLen="++show newLen) $ copy newBuf (slice (upper - above + fromLine) newLen oldBuf)
       else trace ("fromLine="++show fromLine++" <= above="++show above++" && above < toLine="++show toLine) $ if fromLine <= above && above < toLine
       then do
         let aboveLen = above - fromLine
@@ -1601,7 +1601,7 @@ textView from0 to0 (TextBuffer mvar) = liftIO $ withMVar mvar $ \ st -> do
     let (Absolute (CharIndex fromChar0), Absolute (CharIndex toChar0)) =
           (theCursorCharIndex from, theCursorCharIndex to)
     let trim idx slice = do
-          line <- MVec.read newBuf idx
+          line <- trace ("MVec.read newBuf "++show idx) $ MVec.read newBuf idx
           let vec = theTextLineString line
           let len = UVec.length vec
           let lim = max 0 . min (len - 1)
