@@ -1585,11 +1585,14 @@ textView from0 to0 (TextBuffer mvar) = liftIO $ withMVar mvar $ \ st -> do
    then trace ("lineCount == 0") $ return (TextView{ textViewCharCount = 0, textViewVector = Vec.empty })
    else do
     newBuf <- MVec.new newLen
-    if fromLine <= above && toLine <= above
+    if fromLine == toLine
+      then MVec.write newBuf 0 =<<
+           MVec.read oldBuf (if fromLine < above then fromLine else upper - above + fromLine)
+      else if fromLine < above && toLine < above
       then trace ("fromLine="++show fromLine++" <= above="++show above++" && toLine="++show toLine++" <= above="++show above) $ copy newBuf (slice fromLine newLen oldBuf)
-      else if fromLine > above && toLine > above
-      then trace ("fromLine="++show fromLine++" > above="++show above++" && toLine="++show toLine++" > above="++show above++" -> slice (upper="++show upper++" - above="++show above++" + fromLine="++show fromLine++") newLen="++show newLen) $ copy newBuf (slice (upper - above + fromLine) newLen oldBuf)
-      else trace ("fromLine="++show fromLine++" <= above="++show above++" && above < toLine="++show toLine) $ if fromLine <= above && above < toLine
+      else if fromLine >= above && toLine >= above
+      then trace ("fromLine="++show fromLine++" > above="++show above++" && toLine="++show toLine++" > above="++show above++" -> slice ((upper="++show upper++" - above="++show above++" + fromLine="++show fromLine++") == "++(show $ upper - above + fromLine)++") newLen="++show newLen) $ copy newBuf (slice (upper - above + fromLine - 1) newLen oldBuf)
+      else trace ("fromLine="++show fromLine++" <= above="++show above++" && above < toLine="++show toLine) $ if fromLine < above && toLine >= above
       then do
         let aboveLen = above - fromLine
         when (aboveLen > 0) $

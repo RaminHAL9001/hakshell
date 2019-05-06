@@ -68,6 +68,24 @@ basicTests = newTextBuffer defaultTags >>= flip (testTextEditor error)
       reportInsert "one two three\n"
       reportInsert "four five six\nseven eight nine\nten eleven twelve\n"
       showBuffer
+      report "Move cursor up...\n"
+      gotoCursor TextLocation
+        { theCursorLineIndex = Absolute $ LineIndex 0
+        , theCursorCharIndex = Absolute $ CharIndex 0
+        }
+      showBuffer
+      report "Move cursor down...\n"
+      gotoCursor TextLocation
+        { theCursorLineIndex = Absolute $ LineIndex 3
+        , theCursorCharIndex = Absolute $ CharIndex 16
+        }
+      showBuffer
+      report "Move cursor to middle...\n"
+      gotoCursor TextLocation
+        { theCursorLineIndex = Absolute $ LineIndex 1
+        , theCursorCharIndex = Absolute $ CharIndex 6
+        }
+      showBuffer
       report "OK\n"
   )
 
