@@ -164,6 +164,8 @@ import qualified Data.Vector.Generic.Mutable as GMVec
 import qualified Data.Vector.Unboxed.Mutable as UMVec
 import           Data.Word
 
+import Debug.Trace
+
 ----------------------------------------------------------------------------------------------------
 
 -- Any vector operations that have a safe (bounds-chekced) version and an unsafe version will be
@@ -1612,16 +1614,17 @@ textView from0 to0 (TextBuffer mvar) = liftIO $ withMVar mvar $ \ st -> do
      else error "textViewOnLines: this should never happen"
     let (Absolute (CharIndex fromChar0), Absolute (CharIndex toChar0)) =
           (theCursorCharIndex from, theCursorCharIndex to)
-    let trim idx slice = do
-          line <- MVec.read newBuf idx
-          let vec = theTextLineString line
-          let len = UVec.length vec
-          let lim = max 0 . min (len - 1)
-          let (fromChar, toChar) = (lim fromChar0, lim toChar0)
-          MVec.write newBuf idx $ line
-            { theTextLineString = UVec.force $
-                uncurry UVec.slice (slice len fromChar toChar) vec
-            }
+    let trim idx slice = MVec.read newBuf idx >>= \ case
+          TextLineUndefined -> traceM $ "newBuf["++show idx++"] is undefined"
+          line              -> do
+            let vec = theTextLineString line
+            let len = UVec.length vec
+            let lim = max 0 . min (len - 1)
+            let (fromChar, toChar) = (lim fromChar0, lim toChar0)
+            MVec.write newBuf idx $ line
+              { theTextLineString =
+                  UVec.force $ uncurry UVec.slice (slice len fromChar toChar) vec
+              }
     if fromLine == toLine
       then trim 0 $ \ _len from to -> (from, to - from)
       else do
@@ -1629,7 +1632,9 @@ textView from0 to0 (TextBuffer mvar) = liftIO $ withMVar mvar $ \ st -> do
         trim (newLen - 1) $ \ _len _from to -> (0, to)
     newBuf <- freeze newBuf
     return TextView
-      { textViewCharCount = sum $ UVec.length . theTextLineString <$> Vec.toList newBuf
+      { textViewCharCount = sum $ Vec.toList newBuf >>= \ case
+          TextLineUndefined               -> []
+          TextLine{theTextLineString=vec} -> [UVec.length vec]
       , textViewVector    = newBuf
       }
 
