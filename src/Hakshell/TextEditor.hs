@@ -168,6 +168,11 @@ import Debug.Trace
 
 ----------------------------------------------------------------------------------------------------
 
+-- Any vector operations that have a safe (bounds-chekced) version and an unsafe version will be
+-- switched to the unsafe version when this constant is set to True.
+unsafeMode :: Bool
+unsafeMode = False
+
 -- I create let bindings for lenses often, so I often need the 'cloneLens' function. It is very
 -- convenient to shorten the name to 'cl'.
 cl :: ALens s t a b -> Lens s t a b
@@ -893,8 +898,8 @@ growVec vec before after addElems = do
   let len = GMVec.length vec
   if reqSize <= len then return vec else do
     let newSize = head $ dropWhile (< reqSize) $ iterate (* 2) len
-    let copy = GMVec.copy -- TODO: change this to 'unsafeCopy' after thorough testing
-    let slice = GMVec.slice -- TODO: change this to 'unsafeSlice' after thorough testing.
+    let copy  = if unsafeMode then GMVec.copy  else GMVec.unsafeCopy
+    let slice = if unsafeMode then GMVec.slice else GMVec.unsafeSlice
     newVec <- GMVec.new newSize
     copy (slice 0 before newVec) (slice 0 before vec)
     copy (slice (len - after) after newVec) (slice (len - after) after vec)
@@ -908,10 +913,10 @@ copyVec
   => vector (PrimState m) a
   -> Int -> Int -> m (vector (PrimState m) a)
 copyVec oldVec before after = do
-  let len = GMVec.length oldVec
+  let len   = GMVec.length oldVec
   let upper = len - after
-  let copy = GMVec.copy -- TODO: change this to 'unsafeCopy' after thorough testing
-  let slice = GMVec.slice -- TODO: change this to 'unsafeSlice' after thorough testing
+  let copy  = if unsafeMode then GMVec.unsafeCopy  else GMVec.copy
+  let slice = if unsafeMode then GMVec.unsafeSlice else GMVec.slice
   newVec <- GMVec.new len
   when (before > 0) $ copy (slice     0 before newVec) (slice     0 before oldVec)
   when (after  > 0) $ copy (slice upper  after newVec) (slice upper  after oldVec)
@@ -1578,9 +1583,9 @@ textView from0 to0 (TextBuffer mvar) = liftIO $ withMVar mvar $ \ st -> do
   let (Absolute (LineIndex fromLine), Absolute (LineIndex toLine)) =
         (limit $ min fromLine0 toLine0, limit $ max fromLine0 toLine0)
   let newLen = toLine - fromLine + 1
-  let copy   = MVec.copy -- TODO: change to 'unsafeCopy' after thorough testing
-  let slice  = MVec.slice -- TODO: change to 'unsafeSlice' after thorough testing
-  let freeze = Vec.freeze -- TODO: change to 'unsafeFreeze' after thorough testing
+  let copy   = if unsafeMode then MVec.unsafeCopy else MVec.copy
+  let slice  = if unsafeMode then MVec.unsafeSlice else MVec.slice
+  let freeze = if unsafeMode then Vec.unsafeFreeze else Vec.freeze
   if lineCount == 0
    then trace ("lineCount == 0") $ return (TextView{ textViewCharCount = 0, textViewVector = Vec.empty })
    else do
