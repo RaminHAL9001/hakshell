@@ -3,7 +3,6 @@ module Main where
 import           Hakshell.String
 import           Hakshell.TextEditor
 
-import           Control.Monad
 import           Control.Monad.IO.Class
 
 ----------------------------------------------------------------------------------------------------
@@ -48,16 +47,20 @@ report = liftIO . putStr
 countLine :: MonadState Int m => m Int
 countLine = state $ \ n -> (n, n + 1)
 
-showBuffer :: EditText tags IO ()
-showBuffer = void $ forLinesInBuffer (1 :: Int) $ \ _halt line -> do
-  n <- countLine
-  liftIO $ putStrLn $ show n ++ ": " ++ unpack line
-  return [line]
+showBuffer :: Show tags => EditText tags IO ()
+showBuffer = do
+  forLinesInBuffer (1 :: Int) $ \ _halt line -> do
+    n <- countLine
+    liftIO $ putStrLn $ show n ++ ": " ++ show line
+    return [line]
+  liftIO $ putStrLn ""
 
-showView :: MonadIO m => TextView tags -> m ()
-showView view = void $ forLinesInView view (1 :: Int) $ \ _halt line -> do
-  n <- countLine
-  liftIO $ putStrLn $ show n ++ ": " ++ unpack line
+showView :: (MonadIO m, Show tags) => TextView tags -> m ()
+showView view = do
+  forLinesInView view (1 :: Int) $ \ _halt line -> do
+    n <- countLine
+    liftIO $ putStrLn $ show n ++ ": " ++ show line
+  liftIO $ putStrLn ""
 
 basicTests :: IO ()
 basicTests = newTextBuffer defaultTags >>= flip (testTextEditor error)
@@ -118,7 +121,9 @@ textViewTests = do
   report "\nMove cursor to middle of buffer..."
   testTextEditor error buf $ gotoPosition $ mkLoc 8 23
   report "OK\n"
+  reportView (mkLoc  0  0) (mkLoc  7 47)
   reportView (mkLoc  6 23) (mkLoc 10 24)
   reportView (mkLoc  6  0) (mkLoc  7 47)
   reportView (mkLoc  7  0) (mkLoc  8 47)
   reportView (mkLoc  8  0) (mkLoc  9 47)
+  reportView (mkLoc  0  0) (mkLoc 15 47)

@@ -164,8 +164,6 @@ import qualified Data.Vector.Generic.Mutable as GMVec
 import qualified Data.Vector.Unboxed.Mutable as UMVec
 import           Data.Word
 
-import Debug.Trace
-
 ----------------------------------------------------------------------------------------------------
 
 -- Any vector operations that have a safe (bounds-chekced) version and an unsafe version will be
@@ -560,7 +558,8 @@ data LineBreaker
 -- Note that when a user user is editing text interactively, they are not operating on a
 -- 'TextLine', but on a 'Prelude.String' (list of 'Char's) stored in the 'TextBufferState' state.
 data TextLine tags
-  = TextLine
+  = TextLineUndefined
+  | TextLine
     { theTextLineString    :: !CharVector
     , theTextLineTags      :: !tags
     , theTextLineBreakSize :: !Word16
@@ -580,7 +579,11 @@ data TextCursor tags
 
 instance IntSized (TextLine tags) where { intSize = UVec.length . theTextLineString; }
 instance Unpackable (TextLine tags) where { unpack = UVec.toList . theTextLineString; }
-instance Show (TextLine tags) where { show = show . theTextLineString; }
+instance Show tags => Show (TextLine tags) where
+  show = \ case
+    TextLineUndefined -> "(null)"
+    TextLine{theTextLineString=vec,theTextLineTags=tags,theTextLineBreakSize=lbrksz} ->
+      '(' : show (unpack vec) ++ ' ' : show lbrksz ++ ' ' : show tags ++ ")"
 
 -- Not for export: this buffer is formatted such that characters before the cursror are near index
 -- zero, while characters after the cursor are near the final index.
@@ -628,13 +631,15 @@ copyTextBuffer (TextBuffer mvar) = withMVar mvar $ \ old -> do
 newTextBufferState :: Int -> tags -> IO (TextBufferState tags)
 newTextBufferState size tags = do
   cur <- newTextCursor tags
-  buf <- MVec.new size
-  return TextBufferState
-    { theBufferDefaultLine = TextLine
+  buf <- MVec.replicate size TextLineUndefined
+  let emptyLine = TextLine
         { theTextLineTags      = tags
         , theTextLineString    = mempty
         , theTextLineBreakSize = 0
         }
+  MVec.write buf 0 emptyLine
+  return TextBufferState
+    { theBufferDefaultLine = emptyLine
     , theBufferLineBreaker = lineBreakerNLCR
     , theBufferVector      = buf
     , theLinesAboveCursor  = 0
@@ -1153,7 +1158,7 @@ moveByLine
 moveByLine (Relative (LineIndex select)) = liftEditText $ do
   vec <- use bufferVector
   (before, after) <- (,) <$> use linesAboveCursor <*> use linesBelowCursor >>=
-    liftIO . uncurry (shiftElems (error "empty line") vec select)
+    liftIO . uncurry (shiftElems TextLineUndefined vec select)
   linesAboveCursor .= before
   linesBelowCursor .= after
 
@@ -1571,7 +1576,7 @@ textView
   => TextLocation -> TextLocation
   -> TextBuffer tags -> m (TextView tags)
 textView from0 to0 (TextBuffer mvar) = liftIO $ withMVar mvar $ \ st -> do
-  let (from, to) = (min from0 to, max from0 to0)
+  let (from, to) = (min from0 to0, max from0 to0)
   let fromLine0 = theCursorLineIndex  from
   let toLine0   = theCursorLineIndex  to
   let oldBuf    = theBufferVector     st
@@ -1579,42 +1584,41 @@ textView from0 to0 (TextBuffer mvar) = liftIO $ withMVar mvar $ \ st -> do
   let below     = theLinesBelowCursor st
   let lineCount = above + below
   let upper     = MVec.length oldBuf - below
-  let limit     = max (Absolute $ LineIndex 0) . min (Absolute $ LineIndex $ lineCount - 1)
-  let (Absolute (LineIndex fromLine), Absolute (LineIndex toLine)) =
-        (limit $ min fromLine0 toLine0, limit $ max fromLine0 toLine0)
+  let limit     = max (Absolute $ LineIndex 1) . min (Absolute $ LineIndex $ lineCount + 1)
+  (Absolute (LineIndex fromLine0), Absolute (LineIndex toLine0)) <- pure
+    (limit $ min fromLine0 toLine0, limit $ max fromLine0 toLine0)
+  let (fromLine, toLine) = (fromLine0 - 1, toLine0 - 1)
   let newLen = toLine - fromLine + 1
   let copy   = if unsafeMode then MVec.unsafeCopy else MVec.copy
   let slice  = if unsafeMode then MVec.unsafeSlice else MVec.slice
   let freeze = if unsafeMode then Vec.unsafeFreeze else Vec.freeze
   if lineCount == 0
-   then trace ("lineCount == 0") $ return (TextView{ textViewCharCount = 0, textViewVector = Vec.empty })
+   then return (TextView{ textViewCharCount = 0, textViewVector = Vec.empty })
    else do
     newBuf <- MVec.new newLen
     if fromLine == toLine
-      then MVec.write newBuf 0 =<<
-           MVec.read oldBuf (if fromLine < above then fromLine else upper - above + fromLine)
-      else if fromLine < above && toLine < above
-      then trace ("fromLine="++show fromLine++" <= above="++show above++" && toLine="++show toLine++" <= above="++show above) $ copy newBuf (slice fromLine newLen oldBuf)
-      else if fromLine >= above && toLine >= above
-      then trace ("fromLine="++show fromLine++" > above="++show above++" && toLine="++show toLine++" > above="++show above++" -> slice ((upper="++show upper++" - above="++show above++" + fromLine="++show fromLine++") == "++(show $ upper - above + fromLine)++") newLen="++show newLen) $ copy newBuf (slice (upper - above + fromLine - 1) newLen oldBuf)
-      else trace ("fromLine="++show fromLine++" <= above="++show above++" && above < toLine="++show toLine) $ if fromLine < above && toLine >= above
-      then do
-        let aboveLen = above - fromLine
-        when (aboveLen > 0) $
-          copy (slice 0 aboveLen newBuf) (slice 0 aboveLen oldBuf)
-        let belowLen = toLine - above - 1
-        when (belowLen > 0) $
-          copy (slice aboveLen belowLen newBuf) (slice upper belowLen oldBuf)
-      else error "textViewOnLines: this should never happen"
+     then MVec.write newBuf 0 =<<
+          MVec.read oldBuf (if fromLine < above then fromLine else upper - above + fromLine)
+     else if fromLine <= above && toLine <= above
+     then copy newBuf (slice fromLine newLen oldBuf)
+     else if fromLine > above && toLine > above
+     then copy newBuf (slice (upper - above + fromLine - 1) newLen oldBuf)
+     else if fromLine <= above && toLine > above
+     then do
+       let aboveLen = above - fromLine + 1
+       copy (slice 0 aboveLen newBuf) (slice fromLine aboveLen oldBuf)
+       let belowLen = toLine - above
+       copy (slice aboveLen belowLen newBuf) (slice upper belowLen oldBuf)
+     else error "textViewOnLines: this should never happen"
     let (Absolute (CharIndex fromChar0), Absolute (CharIndex toChar0)) =
           (theCursorCharIndex from, theCursorCharIndex to)
     let trim idx slice = do
-          line <- trace ("MVec.read newBuf "++show idx) $ MVec.read newBuf idx
+          line <- MVec.read newBuf idx
           let vec = theTextLineString line
           let len = UVec.length vec
           let lim = max 0 . min (len - 1)
           let (fromChar, toChar) = (lim fromChar0, lim toChar0)
-          trace ("trim idx="++show idx++" (slice len="++show len++" fromChar="++show fromChar++" toChar="++show toChar++")="++show (slice len fromChar toChar)) $ MVec.write newBuf idx $ line
+          MVec.write newBuf idx $ line
             { theTextLineString = UVec.force $
                 uncurry UVec.slice (slice len fromChar toChar) vec
             }
