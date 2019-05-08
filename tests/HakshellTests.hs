@@ -3,6 +3,8 @@ module Main where
 import           Hakshell.String
 import           Hakshell.TextEditor
 
+import qualified Data.Vector as Vec
+
 import           Control.Monad
 import           Control.Monad.IO.Class
 
@@ -62,6 +64,17 @@ showBuffer = do
   liftIO $ putStrLn ""
   when (errCount > 0) $ error $ "iterated over "++show errCount++" undefined lines"
 
+showBufferVector :: Show tags => TextBuffer tags -> IO ()
+showBufferVector = textBufferFreezeInternal >=> loop (0 :: Int) 0 where
+  loop nullCount lineCount vec = if lineCount >= Vec.length vec then return () else do
+    let line = vec Vec.! lineCount
+    let showLine = putStrLn $ ralign lineCount ++ ": " ++ show line
+    if textLineIsUndefined line
+     then do
+      if nullCount < 1 then showLine else if nullCount < 4 then putStrLn "...." else return ()
+      ((loop $! nullCount + 1) $! lineCount + 1) vec
+     else showLine >> (loop 0 $! lineCount + 1) vec
+
 showView :: (MonadIO m, Show tags) => TextView tags -> m ()
 showView view = do
   (_, errCount) <- forLinesInView view (1 :: Int, 0 :: Int) $ \ _halt line -> do
@@ -82,7 +95,6 @@ basicTests = newTextBuffer defaultTags >>= flip (testTextEditor error)
       showBuffer
       report "Move cursor up...\n"
       gotoCursor (mkLoc 1  1)
-      showBuffer
       report "Move cursor down...\n"
       gotoCursor (mkLoc 4 16)
       showBuffer
@@ -110,16 +122,18 @@ textViewTests = do
   reportView (mkLoc  1  1) (mkLoc  3 48)
   reportView (mkLoc  1 12) (mkLoc  1 28)
   reportView (mkLoc  1 12) (mkLoc  9 28)
-  report "\nMove cursor to start of buffer..."
+  report "Move cursor to start of buffer...\n"
   testTextEditor error buf $ gotoPosition $ mkLoc 0 0
+  showBufferVector buf
   report "OK\n"
   reportView (mkLoc  3 24) (mkLoc  5 25)
   reportView (mkLoc 14  1) (mkLoc 15 48)
   reportView (mkLoc  1  1) (mkLoc  2 48)
   reportView (mkLoc  1 12) (mkLoc  0 25)
   reportView (mkLoc  9 12) (mkLoc  8 25)
-  report "\nMove cursor to middle of buffer..."
+  report "Move cursor to middle of buffer...\n"
   testTextEditor error buf $ gotoPosition $ mkLoc 8 23
+  showBufferVector buf
   report "OK\n"
   reportView (mkLoc  1  1) (mkLoc  8 48)
   reportView (mkLoc  7 24) (mkLoc 11 25)

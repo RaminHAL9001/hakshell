@@ -132,7 +132,7 @@ module Hakshell.TextEditor
     TextLine, sliceLineToEnd, textLineIsUndefined,
     TextCursor, newCursorFromLine, textCursorCharCount, textLineTags,
     -- ** Errors
-    TextEditError(..),
+    TextEditError(..), textBufferFreezeInternal,
     -- * Re-Exports
     -- ** "Hakshell.String"
     module Hakshell.String,
@@ -635,6 +635,11 @@ copyTextBuffer (TextBuffer mvar) = withMVar mvar $ \ old -> do
   newBuf <- copyVec (theBufferVector old) (theLinesAboveCursor old) (theLinesBelowCursor old)
   newCur <- copyTextCursor $ theBufferCursor old
   fmap TextBuffer $ newMVar $ old{ theBufferCursor = newCur, theBufferVector = newBuf }
+
+-- | Create an exact copy of the buffer used internally and return it as an immutable vector of
+-- 'TextLine's.
+textBufferFreezeInternal :: TextBuffer tags -> IO (Vec.Vector (TextLine tags))
+textBufferFreezeInternal (TextBuffer mvar) = withMVar mvar $ Vec.unsafeFreeze . theBufferVector
 
 newTextBufferState :: Int -> tags -> IO (TextBufferState tags)
 newTextBufferState size tags = do
@@ -1143,27 +1148,32 @@ resetCurrentLine = liftEditText $
 shiftElems
   :: (GMVec.MVector vector a, PrimMonad m)
   => a -> vector (PrimState m) a -> Int -> Int -> Int -> m (Int, Int)
-shiftElems nil vec select before after =
-  if select == 0 then noop
-  else if select ==   1  then moveSingle after before $ len - after
-  else if select == (-1) then moveSingle before (len - 1 - after) $ before - 1
-  else GMVec.move to from >> clear from >> done
+shiftElems nil vec select before after = trace ("shiftElems select="++show select) $
+  if select == 0 then trace "noop" noop
+  else if select ==   1  then
+       trace ("moveSignal after="++show after++" before="++show before++" ((len="++show len++" - after="++show after++")="++show (len - after)) $
+       moveSingle after before $ len - after
+  else if select == (-1) then
+       trace ("moveSingle before="++show before++" (len="++show len++" - 1 - after="++show after++")="++show (len - 1 - after)) $
+       moveSingle before (len - 1 - after) $ before - 1
+  else trace ("GMVec.move toSlice fromSlice") $
+       GMVec.move toSlice fromSlice >> clear fromSlice >> done
   where
     len  = GMVec.length vec
     noop = return (before, after)
     clamp = max 0 . min (abs select)
-    (clamped, to, from) =
-      if select > 1 then
+    (clamped, toSlice, fromSlice) =
+      if select > 0 then
         ( clamp after
         , GMVec.slice before clamped vec
         , GMVec.slice (len - 1 - after) clamped vec
         )
-      else if select < (-1) then
+      else if select < 0 then
         ( clamp before
         , GMVec.slice (len - 1 - after - clamped) clamped vec
         , GMVec.slice (before - clamped) clamped vec
         )
-      else error "shiftElems: this should never happen"
+      else error $ "shiftElems: select="++show select++", this should never happen"
     clear slice = forM_ [0 .. GMVec.length slice - 1] $ flip (GMVec.write slice) nil
     boundSelect = clamped * signum select
     done = return (before + boundSelect, after - boundSelect)
