@@ -95,6 +95,7 @@ module Hakshell.TextEditor
     insertString, insertChar, lineBreak,
     clearCurrentLine, resetCurrentLine,
     deleteChars, deleteCharsWrap, textCursorTags,
+    currentTextLocation, currentLineNumber, currentColumnNumber,
     -- ** Manipulating Lines of Text
     beginInsertMode, endInsertMode,
     copyCurrentLine, replaceCurrentLine,
@@ -128,7 +129,7 @@ module Hakshell.TextEditor
     bufferCurrentLine, textLineString, bufferDefaultTags,
     lineBreakerNLCR,
     -- ** Line Editing
-    TextLine, sliceLineToEnd,
+    TextLine, sliceLineToEnd, textLineIsUndefined,
     TextCursor, newCursorFromLine, textCursorCharCount, textLineTags,
     -- ** Errors
     TextEditError(..),
@@ -587,6 +588,11 @@ instance Show tags => Show (TextLine tags) where
     TextLine{theTextLineString=vec,theTextLineTags=tags,theTextLineBreakSize=lbrksz} ->
       '(' : show (unpack vec) ++ ' ' : show lbrksz ++ ' ' : show tags ++ ")"
 
+-- | Evaluates toe True if the 'TextLine' is undefined. An undefined 'TextLine' is different from an
+-- empty string, it is similar to the 'Prelude.Nothing' constructor.
+textLineIsUndefined :: TextLine tags -> Bool
+textLineIsUndefined = \ case { TextLineUndefined -> True; _ -> False; }
+
 -- Not for export: this buffer is formatted such that characters before the cursror are near index
 -- zero, while characters after the cursor are near the final index.
 lineEditBuffer :: Lens' (TextCursor tags) (UMVec.IOVector Char)
@@ -978,6 +984,26 @@ popLine = liftEditText . \ case
     if after == 0 then return Nothing else Just <$> unsafePopLine After
 
 ----------------------------------------------------------------------------------------------------
+
+-- | Get the current line number of the cursor.
+currentLineNumber
+  :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m)
+  => editor tags m (Absolute LineIndex)
+currentLineNumber = liftEditText $
+  Absolute . LineIndex . (+ 1) <$> use linesAboveCursor
+
+-- | Get the current column number of the cursor.
+currentColumnNumber
+  :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m)
+  => editor tags m (Absolute CharIndex)
+currentColumnNumber = liftEditText $
+  Absolute . CharIndex . (+ 1) . theCharsBeforeCursor <$> use bufferCurrentLine
+
+-- | Get the current cursor position.
+currentTextLocation
+  :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m)
+  => editor tags m TextLocation
+currentTextLocation = TextLocation <$> currentLineNumber <*> currentColumnNumber
 
 -- | Create a copy of the 'bufferCurrentLine'.
 copyCurrentLine

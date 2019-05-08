@@ -3,6 +3,7 @@ module Main where
 import           Hakshell.String
 import           Hakshell.TextEditor
 
+import           Control.Monad
 import           Control.Monad.IO.Class
 
 ----------------------------------------------------------------------------------------------------
@@ -44,23 +45,31 @@ defaultTags = ()
 report :: MonadIO m => String -> m ()
 report = liftIO . putStr
 
-countLine :: MonadState Int m => m Int
-countLine = state $ \ n -> (n, n + 1)
+ralign :: Int -> String
+ralign n = case abs n of
+  i | i < 10 -> "   " ++ show i
+  i | i < 100 -> "  " ++ show i
+  i | i < 1000 -> " " ++ show i
+  i             ->       show i
 
 showBuffer :: Show tags => EditText tags IO ()
 showBuffer = do
-  forLinesInBuffer (1 :: Int) $ \ _halt line -> do
-    n <- countLine
-    liftIO $ putStrLn $ show n ++ ": " ++ show line
+  errCount <- forLinesInBuffer (0 :: Int) $ \ _halt line -> do
+    when (textLineIsUndefined line) $ modify (+ 1)
+    (Absolute (LineIndex lineNum)) <- currentLineNumber
+    liftIO $ putStrLn $ ralign lineNum ++ ": " ++ show line
     return [line]
   liftIO $ putStrLn ""
+  when (errCount > 0) $ error $ "iterated over "++show errCount++" undefined lines"
 
 showView :: (MonadIO m, Show tags) => TextView tags -> m ()
 showView view = do
-  forLinesInView view (1 :: Int) $ \ _halt line -> do
-    n <- countLine
-    liftIO $ putStrLn $ show n ++ ": " ++ show line
+  (_, errCount) <- forLinesInView view (1 :: Int, 0 :: Int) $ \ _halt line -> do
+    lineNum <- state $ \ (lineNum, errCount) ->
+      (lineNum, (lineNum + 1, errCount + if textLineIsUndefined line then 1 else 0))
+    liftIO $ putStrLn $ ralign lineNum ++ ": " ++ show line
   liftIO $ putStrLn ""
+  when (errCount > 0) $ error $ "iterated over "++show errCount++" undefined lines"
 
 basicTests :: IO ()
 basicTests = newTextBuffer defaultTags >>= flip (testTextEditor error)
@@ -72,22 +81,13 @@ basicTests = newTextBuffer defaultTags >>= flip (testTextEditor error)
       reportInsert "four five six\nseven eight nine\nten eleven twelve\n"
       showBuffer
       report "Move cursor up...\n"
-      gotoCursor TextLocation
-        { theCursorLineIndex = Absolute $ LineIndex 0
-        , theCursorCharIndex = Absolute $ CharIndex 0
-        }
+      gotoCursor (mkLoc 1  1)
       showBuffer
       report "Move cursor down...\n"
-      gotoCursor TextLocation
-        { theCursorLineIndex = Absolute $ LineIndex 3
-        , theCursorCharIndex = Absolute $ CharIndex 16
-        }
+      gotoCursor (mkLoc 4 16)
       showBuffer
       report "Move cursor to middle...\n"
-      gotoCursor TextLocation
-        { theCursorLineIndex = Absolute $ LineIndex 1
-        , theCursorCharIndex = Absolute $ CharIndex 6
-        }
+      gotoCursor (mkLoc 2  7)
       showBuffer
       report "OK\n"
   )
@@ -105,25 +105,25 @@ textViewTests = do
         report $ "view "++showLoc a++"->"++showLoc b++"\n"
         v <- textView a b buf
         showView v
-  reportView (mkLoc  2 23) (mkLoc  5 24)
-  reportView (mkLoc 13  0) (mkLoc 15 47)
-  reportView (mkLoc  0  0) (mkLoc  2 47)
-  reportView (mkLoc  0 11) (mkLoc  0 24)
-  reportView (mkLoc  8 11) (mkLoc  8 24)
+  reportView (mkLoc  3 24) (mkLoc  6 25)
+  reportView (mkLoc 14  1) (mkLoc 16 48)
+  reportView (mkLoc  1  1) (mkLoc  3 48)
+  reportView (mkLoc  1 12) (mkLoc  1 28)
+  reportView (mkLoc  1 12) (mkLoc  9 28)
   report "\nMove cursor to start of buffer..."
   testTextEditor error buf $ gotoPosition $ mkLoc 0 0
   report "OK\n"
-  reportView (mkLoc  2 23) (mkLoc  5 24)
-  reportView (mkLoc 13  0) (mkLoc 15 47)
-  reportView (mkLoc  0  0) (mkLoc  2 47)
-  reportView (mkLoc  0 11) (mkLoc  0 24)
-  reportView (mkLoc  8 11) (mkLoc  8 24)
+  reportView (mkLoc  3 24) (mkLoc  5 25)
+  reportView (mkLoc 14  1) (mkLoc 15 48)
+  reportView (mkLoc  1  1) (mkLoc  2 48)
+  reportView (mkLoc  1 12) (mkLoc  0 25)
+  reportView (mkLoc  9 12) (mkLoc  8 25)
   report "\nMove cursor to middle of buffer..."
   testTextEditor error buf $ gotoPosition $ mkLoc 8 23
   report "OK\n"
-  reportView (mkLoc  0  0) (mkLoc  7 47)
-  reportView (mkLoc  6 23) (mkLoc 10 24)
-  reportView (mkLoc  6  0) (mkLoc  7 47)
-  reportView (mkLoc  7  0) (mkLoc  8 47)
-  reportView (mkLoc  8  0) (mkLoc  9 47)
-  reportView (mkLoc  0  0) (mkLoc 15 47)
+  reportView (mkLoc  1  1) (mkLoc  8 48)
+  reportView (mkLoc  7 24) (mkLoc 11 25)
+  reportView (mkLoc  7  1) (mkLoc  8 48)
+  reportView (mkLoc  8  1) (mkLoc  9 48)
+  reportView (mkLoc  9  1) (mkLoc 10 48)
+  reportView (mkLoc  1  1) (mkLoc 16 48)
