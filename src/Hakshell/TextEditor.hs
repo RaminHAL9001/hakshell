@@ -1185,11 +1185,11 @@ resetCurrentLine = liftEditText $
 shiftElems
   :: (GMVec.MVector vector a, PrimMonad m)
   => a -> vector (PrimState m) a -> Int -> Int -> Int -> m (Int, Int)
-shiftElems nil vec select' before after = trace ("shiftElems select="++show select) $
+shiftElems nil vec select' before after = trace ("shiftElems select="++show select++" before="++show before++" after="++show after) $
   if select == 0 then trace "noop" noop
   else if select > 0
   then if after  <= 0 then noop else
-       if select ==   1  then moveSingle before $ len - after else moveBlock
+       if select ==   1  then moveSingle before (len - after) else moveBlock
   else if select < 0
   then if before <= 0 then noop else
        if select == (-1) then moveSingle (len - 1 - after) before else moveBlock
@@ -1199,19 +1199,24 @@ shiftElems nil vec select' before after = trace ("shiftElems select="++show sele
     noop   = return (before, after)
     select = max (negate before) . min after $ select'
     len    = GMVec.length vec
+    slice  = if unsafeMode then GMVec.unsafeSlice else GMVec.slice
     (toSlice, fromSlice) =
       if select > 0 then
-        ( GMVec.slice before select vec
-        , GMVec.slice (len - after) select vec
+        ( trace ("toSlice -> slice "++show before++' ':show select) $
+          slice before select vec
+        , trace ("fromSlice -> slice "++show (len - after)++' ':show select) $
+          slice (len - after) select vec
         )
       else if select < 0 then
-        ( GMVec.slice (len - after + select) (negate select) vec
-        , GMVec.slice (before + select) (negate select) vec
+        ( trace ("toSlice -> slice "++show (len - after + select)++' ':show (negate select)) $
+          slice (len - after + select) (negate select) vec
+        , trace ("fromSlice -> slice "++show (before + select)++' ':show (negate select)) $
+          slice (before + select) (negate select) vec
         )
       else error $ "shiftElems: select="++show select++", this should never happen"
     clear slice = forM_ [0 .. GMVec.length slice - 1] $ flip (GMVec.write slice) nil
     done = return (before + select, after - select)
-    moveSingle to from = trace ("moveSignal after="++show after++" before="++show before++" ((len="++show len++" - after="++show after++")="++show (len - after)) $
+    moveSingle to from = trace ("moveSingle to="++show to++" from="++show from) $
       GMVec.read vec from >>= GMVec.write vec to >> GMVec.write vec from nil >> done
     moveBlock = trace ("GMVec.move toSlice fromSlice") $
       GMVec.move toSlice fromSlice >> clear fromSlice >> done
@@ -1230,6 +1235,7 @@ moveByLine
   :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m)
   => Relative LineIndex -> editor tags m ()
 moveByLine (Relative (LineIndex select)) = liftEditText $ do
+  traceM $ "moveByLine " ++ show select
   vec <- use bufferVector
   (before, after) <- (,) <$> use linesAboveCursor <*> use linesBelowCursor
   (before, after) <- liftIO $ shiftElems TextLineUndefined vec select before after
@@ -1243,6 +1249,7 @@ moveByChar
   :: (MonadEditLine editor, MonadIO (editor tags m), MonadIO m)
   => Relative CharIndex -> editor tags m ()
 moveByChar (Relative (CharIndex select)) = liftEditLine $ do
+  traceM $ "moveByChar " ++ show select
   after  <- use charsAfterCursor
   lbrksz <- use cursorBreakSize
   select <- pure $ if select <= 0 then select else min select $ max 0 (after - fromIntegral lbrksz)
@@ -1292,7 +1299,7 @@ gotoLine
   => Absolute LineIndex -> editor tags m ()
 gotoLine (Absolute (LineIndex n)) = liftEditText $ do
   above <- use linesAboveCursor
-  moveByLine $ Relative $ LineIndex $ n - 1 - above
+  moveByLine $ Relative $ LineIndex $ n - above
 
 -- | Go to an absolute character (column) number, the first character is 1 (character 0 and below
 -- all send the cursor to column 1), the last line is 'Prelude.maxBound'.
@@ -1301,7 +1308,7 @@ gotoChar
   => Absolute CharIndex -> editor tags m ()
 gotoChar (Absolute (CharIndex n)) = liftEditLine $ do
   before <- use charsBeforeCursor
-  moveByChar $ Relative $ CharIndex $ n - 1 - before
+  moveByChar $ Relative $ CharIndex $ n - before
 
 -- | This function calls 'gotoLine' and then 'gotoChar' to move the cursor to an absolute a line
 -- number and characters (column) number.

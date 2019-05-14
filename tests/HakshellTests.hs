@@ -95,7 +95,7 @@ basicTests = do
         showBufferVector buf
   let reportMove msg line col = do
         testTextEditor error buf $ do
-          report $ "Move cursor "++msg++", "++show (line, col)++" ...\n"
+          report $ "Move cursor "++msg++", line="++show line++" col="++show col++" ...\n"
           gotoCursor $ mkLoc line col
         showBufferVector buf
   reportInsert "one two three\n"
