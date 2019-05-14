@@ -85,24 +85,25 @@ showView view = do
   when (errCount > 0) $ error $ "iterated over "++show errCount++" undefined lines"
 
 basicTests :: IO ()
-basicTests = newTextBuffer defaultTags >>= flip (testTextEditor error)
-  (do report "--- basic tests ---\n"
-      let reportInsert str = do
-            report $ "insertString " ++ show str ++ "\n"
-            insertString str
-      reportInsert "one two three\n"
-      reportInsert "four five six\nseven eight nine\nten eleven twelve\n"
-      showBuffer
-      report "Move cursor up...\n"
-      gotoCursor (mkLoc 1  1)
-      report "Move cursor down...\n"
-      gotoCursor (mkLoc 4 16)
-      showBuffer
-      report "Move cursor to middle...\n"
-      gotoCursor (mkLoc 2  7)
-      showBuffer
-      report "OK\n"
-  )
+basicTests = do
+  buf <- newTextBuffer defaultTags
+  report "--- basic tests ---\n"
+  let reportInsert str = do
+        testTextEditor error buf $ do
+          report $ "insertString " ++ show str ++ "\n"
+          insertString str
+        showBufferVector buf
+  let reportMove msg line col = do
+        testTextEditor error buf $ do
+          report $ "Move cursor "++msg++", "++show (line, col)++" ...\n"
+          gotoCursor $ mkLoc line col
+        showBufferVector buf
+  reportInsert "one two three\n"
+  reportInsert "four five six\nseven eight nine\nten eleven twelve\n"
+  reportMove        "up" 1  1
+  reportMove      "down" 4 16
+  reportMove "to middle" 2  7
+  report "OK\n"
 
 textViewTests :: IO ()
 textViewTests = do
