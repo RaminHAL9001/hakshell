@@ -223,12 +223,12 @@ defaultInitBufferSize = 512
 
 -- | Used for indexing lines and characters relative to the cursor.
 newtype Relative a = Relative a
-  deriving (Eq, Ord, Show, Read, Enum, Num)
+  deriving (Eq, Ord, Show, Read, Bounded, Enum, Num)
 
 -- | Used for indexing absolute lines and characters (relative to the start of the document, which
 -- is line 1).
 newtype Absolute a = Absolute a
-  deriving (Eq, Ord, Show, Read, Enum, Num)
+  deriving (Eq, Ord, Show, Read, Bounded, Enum, Num)
 
 -- | A number for indexing a line. This data type instantiates the 'Prelude.Num' typeclass so that
 -- you can write an integer literal in your code and (if used in the correct context) the type
@@ -936,7 +936,7 @@ relativeToChar =
 cursorIndex :: Monad m => RelativeToCursor -> EditText tags m Int
 cursorIndex = \ case
   Before -> use linesAboveCursor
-  After  -> (-) <$> (subtract 1 . MVec.length <$> use bufferVector) <*> use linesBelowCursor
+  After  -> (-) <$> (MVec.length <$> use bufferVector) <*> use linesBelowCursor
 
 -- Not for export: unsafe, requires correct accounting of cursor positions, otherwise segfaults may
 -- occur. The cursor is implemented by keeping a mutable array in which elements before the cursor
@@ -1007,6 +1007,7 @@ unsafePopLine :: MonadIO m => RelativeToCursor -> EditText tags m (TextLine tags
 unsafePopLine rel = do
   vec <- use bufferVector
   i   <- cursorIndex rel
+  traceM $ "unsafePopLine "++show i
   nil <- use bufferDefaultLine
   liftIO (MVec.read vec i <* MVec.write vec i nil) <*
     ((case rel of{ Before -> linesAboveCursor; After -> linesBelowCursor; }) -= 1)
@@ -1020,9 +1021,9 @@ popLine
   => RelativeToCursor -> editor tags m (Maybe (TextLine tags))
 popLine = liftEditText . \ case
   Before -> use linesAboveCursor >>= \ before ->
-    if before == 0 then return Nothing else Just <$> unsafePopLine Before
+    if before <= 0 then return Nothing else Just <$> unsafePopLine Before
   After  -> use linesBelowCursor >>= \ after ->
-    if after == 0 then return Nothing else Just <$> unsafePopLine After
+    if after <= 0 then return Nothing else Just <$> unsafePopLine After
 
 ----------------------------------------------------------------------------------------------------
 
@@ -1184,37 +1185,36 @@ resetCurrentLine = liftEditText $
 shiftElems
   :: (GMVec.MVector vector a, PrimMonad m)
   => a -> vector (PrimState m) a -> Int -> Int -> Int -> m (Int, Int)
-shiftElems nil vec select before after = trace ("shiftElems select="++show select) $
+shiftElems nil vec select' before after = trace ("shiftElems select="++show select) $
   if select == 0 then trace "noop" noop
-  else if select ==   1  then if before <= 1 || after <= 0 then noop else
-       trace ("moveSignal after="++show after++" before="++show before++" ((len="++show len++" - after="++show after++")="++show (len - after)) $
-       moveSingle after before $ len - after
-  else if select == (-1) then
-       trace ("moveSingle before="++show before++" (len="++show len++" - 1 - after="++show after++")="++show (len - 1 - after)) $
-       moveSingle before (len - 1 - after) $ before - 1
-  else trace ("GMVec.move toSlice fromSlice") $
-       GMVec.move toSlice fromSlice >> clear fromSlice >> done
+  else if select > 0
+  then if after  <= 0 then noop else
+       if select ==   1  then moveSingle before $ len - after else moveBlock
+  else if select < 0
+  then if before <= 0 then noop else
+       if select == (-1) then moveSingle (len - 1 - after) before else moveBlock
+  else error $ "internal error: this should never happen. " ++
+         "(shiftElems " ++ show select' ++ ' ':show before ++ ' ':show after ++ ")"
   where
-    len  = GMVec.length vec
-    noop = return (before, after)
-    clamp = max 0 . min (abs select)
-    (clamped, toSlice, fromSlice) =
+    noop   = return (before, after)
+    select = max (negate before) . min after $ select'
+    len    = GMVec.length vec
+    (toSlice, fromSlice) =
       if select > 0 then
-        ( clamp after
-        , GMVec.slice before clamped vec
-        , GMVec.slice (len - 1 - after) clamped vec
+        ( GMVec.slice before select vec
+        , GMVec.slice (len - after) select vec
         )
       else if select < 0 then
-        ( clamp before
-        , GMVec.slice (len - 1 - after - clamped) (clamped - 1) vec
-        , GMVec.slice (before - clamped + 1) (clamped - 1) vec
+        ( GMVec.slice (len - after + select) (negate select) vec
+        , GMVec.slice (before + select) (negate select) vec
         )
       else error $ "shiftElems: select="++show select++", this should never happen"
     clear slice = forM_ [0 .. GMVec.length slice - 1] $ flip (GMVec.write slice) nil
-    boundSelect = clamped * signum select
-    done = return (before + boundSelect, after - boundSelect)
-    moveSingle to from =
+    done = return (before + select, after - select)
+    moveSingle to from = trace ("moveSignal after="++show after++" before="++show before++" ((len="++show len++" - after="++show after++")="++show (len - after)) $
       GMVec.read vec from >>= GMVec.write vec to >> GMVec.write vec from nil >> done
+    moveBlock = trace ("GMVec.move toSlice fromSlice") $
+      GMVec.move toSlice fromSlice >> clear fromSlice >> done
 
 -- | This function calls 'moveByLine' and then 'moveByChar' to move the cursor by a number of lines
 -- and characters relative to the current cursor position.
@@ -1229,10 +1229,10 @@ moveCursor row col = moveByLine row >> moveByChar col
 moveByLine
   :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m)
   => Relative LineIndex -> editor tags m ()
-moveByLine (Relative (LineIndex select)) = liftEditText $ unless (select == 0) $ do
+moveByLine (Relative (LineIndex select)) = liftEditText $ do
   vec <- use bufferVector
-  (before, after) <- (,) <$> use linesAboveCursor <*> use linesBelowCursor >>=
-    liftIO . uncurry (shiftElems TextLineUndefined vec select)
+  (before, after) <- (,) <$> use linesAboveCursor <*> use linesBelowCursor
+  (before, after) <- liftIO $ shiftElems TextLineUndefined vec select before after
   linesAboveCursor .= before
   linesBelowCursor .= after
 
@@ -1292,7 +1292,7 @@ gotoLine
   => Absolute LineIndex -> editor tags m ()
 gotoLine (Absolute (LineIndex n)) = liftEditText $ do
   above <- use linesAboveCursor
-  moveByLine $ Relative $ LineIndex $ max 1 (min above n) - above
+  moveByLine $ Relative $ LineIndex $ n - 1 - above
 
 -- | Go to an absolute character (column) number, the first character is 1 (character 0 and below
 -- all send the cursor to column 1), the last line is 'Prelude.maxBound'.
@@ -1301,7 +1301,7 @@ gotoChar
   => Absolute CharIndex -> editor tags m ()
 gotoChar (Absolute (CharIndex n)) = liftEditLine $ do
   before <- use charsBeforeCursor
-  moveByChar $ Relative $ CharIndex $ max 1 (min before n) - before
+  moveByChar $ Relative $ CharIndex $ n - 1 - before
 
 -- | This function calls 'gotoLine' and then 'gotoChar' to move the cursor to an absolute a line
 -- number and characters (column) number.
@@ -1431,18 +1431,18 @@ forLinesInRange
   -> (FoldMapLinesHalt void fold tags m fold ->
       TextLine tags -> FoldMapLines fold fold tags m [TextLine tags])
   -> EditText tags m fold
-forLinesInRange (Absolute (LineIndex from)) (Absolute (LineIndex to)) fold f = do
+forLinesInRange absFrom@(Absolute (LineIndex from)) (Absolute (LineIndex to)) fold f = do
   endInsertMode Before
-  above <- use linesAboveCursor
-  below <- use linesBelowCursor
-  let lineCount = above + below
-  from <- pure $ min lineCount $ max 0 $ from - 1
-  to   <- pure $ min lineCount $ max 0 $ to   - 1
-  gotoLine $ Absolute $ LineIndex $ from + 1
+  (before, after) <- (,) <$> use linesAboveCursor <*> use linesBelowCursor -- DEBUG
+  traceM $ "forLinesInRange{before="++show before++",after="++show after++"}: gotoLine "++show from -- DEBUG
+  gotoLine absFrom
+  (before, after) <- (,) <$> use linesAboveCursor <*> use linesBelowCursor -- DEBUG
+  traceM $ "forLinesInRange{before="++show before++",after="++show after++"}" -- DEBUG
+  lineCount <- (+) <$> use linesAboveCursor <*> use linesBelowCursor
   let dist = to - from
-  forLinesLoop fold f (abs dist + 1) $ if dist < 0
+  forLinesLoop fold f (min lineCount . max 0 $ abs dist) $ if dist < 0
     then (unsafePopLine Before, pushLine After)
-    else (unsafePopLine After, pushLine Before)
+    else (unsafePopLine After,  pushLine Before)
 
 -- | Conveniently calls 'forLinesInRange' with the first two parameters as @('Absolute' 1)@ and
 -- @('Absolute' 'maxBound')@.
@@ -1452,7 +1452,7 @@ forLinesInBuffer
   -> (FoldMapLinesHalt void fold tags m fold ->
       TextLine tags -> FoldMapLines fold fold tags m [TextLine tags])
   -> EditText tags m fold
-forLinesInBuffer = forLinesInRange (Absolute 1) (Absolute maxBound)
+forLinesInBuffer = forLinesInRange (Absolute 1) maxBound
 
 -- | Like 'forLinesInRange', but this function takes a 'RelativeToCursor' value, iteration begins
 -- at the 'bufferCurrentLine', and if the 'RelativeToCursor' value is 'After' then iteration goes
