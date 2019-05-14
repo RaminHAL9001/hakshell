@@ -169,6 +169,42 @@ import Debug.Trace
 
 ----------------------------------------------------------------------------------------------------
 
+-- Programmer notes:
+--
+-- A text editor buffer is a boxed mutable vector containing 'TextLine' objects. 'TextLine' objects
+-- are ordinary data types which contain references to unboxed immutable vectors of characters. The
+-- 'TextLine' is a sum type similar to 'Maybe' in that there is a null 'TextLineUndefined'
+-- constructor used to instantiate an empty buffer. Buffers are pre-allocated to some exponent of 2
+-- so lines being added does not always result in a re-allocation of the whole buffer. The buffer
+-- usually contains 'TextLineUndefined' lines.
+--
+-- For efficient insertion, lines below the cursor are shifted toward the end of the vector, leaving
+-- a gap of many conecutive 'TextLineUndefined' lines which can be over-written in O(1) time.
+--
+-- Positioning the cursor is done with 1-based indexing, so the first line is line 1, not line zero.
+-- This means care must be taken to translate 'Absolute' addresses to vector indicies by subtracting
+-- 1 from every line number parameter passed by a public API.
+--
+-- There are two integer values tracked in the text buffer: 'linesAboveCursor' and
+-- 'linesBelowCursor'. The sum of these two numbers indicates how many lines there are in the
+-- buffer. The cursor position, and the number of lines of text, is accounted for these two values.
+--
+-- It is important to remember, conceptually, that the cursor exists "in between" lines. When put
+-- into "insert mode" (as in the Vi editor's way of doing things), a line is selected from just
+-- below the cursor. So if the 'linesAboveCursor' value is 0, think of the cursor as being just
+-- above the zero'th index in the buffer, and when a entering insert mode to begin editing a line,
+-- it selects the line at index 0, which is @'Absolute' ('LineIndex' 1)@.
+--
+-- Another important thing to remember is that users express __inclusive__ line ranges. So when
+-- selecting "from lines 2 to 3," the user expects both lines 2 and 3, so subtract 3 from 2 and add
+-- 1 to get the total number of lines in the range. There are no semantics for a range of zero
+-- lines, "lines 2 to 2" means select only line 2, a single line. Conceptually the end of the range
+-- "from lines 2 to 3" means the cursor is between lines 3 and 4, so when translating this to vector
+-- indicies, you want the cursor to end at just above line 4. If the buffer only contains 4 lines,
+-- index 4 does not exist but it is still valid for computing the range of lines.
+
+----------------------------------------------------------------------------------------------------
+
 -- Any vector operations that have a safe (bounds-chekced) version and an unsafe version will be
 -- switched to the unsafe version when this constant is set to True.
 unsafeMode :: Bool
@@ -1150,7 +1186,7 @@ shiftElems
   => a -> vector (PrimState m) a -> Int -> Int -> Int -> m (Int, Int)
 shiftElems nil vec select before after = trace ("shiftElems select="++show select) $
   if select == 0 then trace "noop" noop
-  else if select ==   1  then
+  else if select ==   1  then if before <= 1 || after <= 0 then noop else
        trace ("moveSignal after="++show after++" before="++show before++" ((len="++show len++" - after="++show after++")="++show (len - after)) $
        moveSingle after before $ len - after
   else if select == (-1) then
@@ -1170,14 +1206,14 @@ shiftElems nil vec select before after = trace ("shiftElems select="++show selec
         )
       else if select < 0 then
         ( clamp before
-        , GMVec.slice (len - 1 - after - clamped) clamped vec
-        , GMVec.slice (before - clamped) clamped vec
+        , GMVec.slice (len - 1 - after - clamped) (clamped - 1) vec
+        , GMVec.slice (before - clamped + 1) (clamped - 1) vec
         )
       else error $ "shiftElems: select="++show select++", this should never happen"
     clear slice = forM_ [0 .. GMVec.length slice - 1] $ flip (GMVec.write slice) nil
     boundSelect = clamped * signum select
     done = return (before + boundSelect, after - boundSelect)
-    moveSingle count to from = if count <= 0 then noop else
+    moveSingle to from =
       GMVec.read vec from >>= GMVec.write vec to >> GMVec.write vec from nil >> done
 
 -- | This function calls 'moveByLine' and then 'moveByChar' to move the cursor by a number of lines
@@ -1193,7 +1229,7 @@ moveCursor row col = moveByLine row >> moveByChar col
 moveByLine
   :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m)
   => Relative LineIndex -> editor tags m ()
-moveByLine (Relative (LineIndex select)) = liftEditText $ do
+moveByLine (Relative (LineIndex select)) = liftEditText $ unless (select == 0) $ do
   vec <- use bufferVector
   (before, after) <- (,) <$> use linesAboveCursor <*> use linesBelowCursor >>=
     liftIO . uncurry (shiftElems TextLineUndefined vec select)
@@ -1254,16 +1290,18 @@ insertChar rel c = liftEditText $ do
 gotoLine
   :: (MonadEditText editor, MonadEditLine editor, MonadIO (editor tags m), MonadIO m)
   => Absolute LineIndex -> editor tags m ()
-gotoLine (Absolute (LineIndex n)) = liftEditText $
-  use linesAboveCursor >>= moveByLine . Relative . LineIndex . ((n - 1) -)
+gotoLine (Absolute (LineIndex n)) = liftEditText $ do
+  above <- use linesAboveCursor
+  moveByLine $ Relative $ LineIndex $ max 1 (min above n) - above
 
 -- | Go to an absolute character (column) number, the first character is 1 (character 0 and below
 -- all send the cursor to column 1), the last line is 'Prelude.maxBound'.
 gotoChar
   :: (MonadEditLine editor, MonadIO (editor tags m), MonadIO m)
   => Absolute CharIndex -> editor tags m ()
-gotoChar (Absolute (CharIndex n)) = liftEditLine $
-  use charsBeforeCursor >>= moveByChar . Relative . CharIndex . ((n - 1) -)
+gotoChar (Absolute (CharIndex n)) = liftEditLine $ do
+  before <- use charsBeforeCursor
+  moveByChar $ Relative $ CharIndex $ max 1 (min before n) - before
 
 -- | This function calls 'gotoLine' and then 'gotoChar' to move the cursor to an absolute a line
 -- number and characters (column) number.
@@ -1398,9 +1436,9 @@ forLinesInRange (Absolute (LineIndex from)) (Absolute (LineIndex to)) fold f = d
   above <- use linesAboveCursor
   below <- use linesBelowCursor
   let lineCount = above + below
-  from <- pure $ min lineCount $ max 0 from
-  to   <- pure $ min lineCount $ max 0 to
-  gotoLine $ Absolute $ LineIndex from
+  from <- pure $ min lineCount $ max 0 $ from - 1
+  to   <- pure $ min lineCount $ max 0 $ to   - 1
+  gotoLine $ Absolute $ LineIndex $ from + 1
   let dist = to - from
   forLinesLoop fold f (abs dist + 1) $ if dist < 0
     then (unsafePopLine Before, pushLine After)
