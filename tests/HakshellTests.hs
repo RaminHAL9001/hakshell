@@ -123,7 +123,7 @@ textViewTests = do
   reportView (mkLoc  1 12) (mkLoc  1 28)
   reportView (mkLoc  1 12) (mkLoc  9 28)
   report "Move cursor to start of buffer...\n"
-  testTextEditor error buf $ gotoPosition $ mkLoc 0 0
+  testTextEditor error buf $ gotoPosition $ mkLoc 1 1
   showBufferVector buf
   report "OK\n"
   reportView (mkLoc  3 24) (mkLoc  5 25)
