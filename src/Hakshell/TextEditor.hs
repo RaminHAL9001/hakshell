@@ -1793,7 +1793,7 @@ ralign n = case abs n of
 -- | Print debugger information about the structured data that forms the 'TextView' to standard
 -- output. __WARNING:__ this print's every line of text in the view, so if your text view has
 -- thousands of lines of text, there will be a lot of output.
-debugPrintView :: (MonadIO m, Show tags) => TextView tags -> m ()
+debugPrintView :: (Show tags, MonadIO m) => TextView tags -> m ()
 debugPrintView view = do
   (_, errCount) <- forLinesInView view (1 :: Int, 0 :: Int) $ \ _halt line -> do
     lineNum <- state $ \ (lineNum, errCount) ->
@@ -1805,7 +1805,9 @@ debugPrintView view = do
 -- | Print debugger information about the structured data that forms the 'TextBuffer' to standard
 -- output. __WARNING:__ this print's every line of text in the buffer, so if your text buffer has
 -- thousands of lines of text, there will be a lot of output.
-debugPrintBuffer :: (MonadEditText editor, Show tags, MonadIO m) => editor tags m ()
+debugPrintBuffer
+  :: (MonadEditText editor, Show tags, MonadIO (editor tags m), MonadIO m)
+  => editor tags m ()
 debugPrintBuffer = liftEditText $ do
   lineVec <- use bufferVector
   let len = MVec.length lineVec
@@ -1832,7 +1834,9 @@ debugPrintBuffer = liftEditText $ do
 -- the 'TextBuffer', and it is often not necessary to know this information when debugging, so you
 -- can print debugging information about the 'TextCursor' by evaluating this function whenever it is
 -- necessary.
-debugPrintCursor :: (MonadEditText editor, Show tags, MonadIO m) => editor tags m ()
+debugPrintCursor
+  :: (MonadEditText editor, Show tags, MonadIO (editor tags m), MonadIO m)
+  => editor tags m ()
 debugPrintCursor = liftEditText $ do
   cur <- use bufferCurrentLine
   let charVec    = theLineEditBuffer cur
