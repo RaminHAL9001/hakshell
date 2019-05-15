@@ -132,7 +132,9 @@ module Hakshell.TextEditor
     TextLine, sliceLineToEnd, textLineIsUndefined,
     TextCursor, newCursorFromLine, textCursorCharCount, textLineTags,
     -- ** Errors
-    TextEditError(..), textBufferFreezeInternal,
+    TextEditError(..),
+    -- * Debugging
+    debugPrintBuffer, debugPrintView, debugPrintCursor,
     -- * Re-Exports
     -- ** "Hakshell.String"
     module Hakshell.String,
@@ -671,11 +673,6 @@ copyTextBuffer (TextBuffer mvar) = withMVar mvar $ \ old -> do
   newBuf <- copyVec (theBufferVector old) (theLinesAboveCursor old) (theLinesBelowCursor old)
   newCur <- copyTextCursor $ theBufferCursor old
   fmap TextBuffer $ newMVar $ old{ theBufferCursor = newCur, theBufferVector = newBuf }
-
--- | Create an exact copy of the buffer used internally and return it as an immutable vector of
--- 'TextLine's.
-textBufferFreezeInternal :: TextBuffer tags -> IO (Vec.Vector (TextLine tags))
-textBufferFreezeInternal (TextBuffer mvar) = withMVar mvar $ Vec.unsafeFreeze . theBufferVector
 
 newTextBufferState :: Int -> tags -> IO (TextBufferState tags)
 newTextBufferState size tags = do
@@ -1299,7 +1296,7 @@ gotoLine
   => Absolute LineIndex -> editor tags m ()
 gotoLine (Absolute (LineIndex n)) = liftEditText $ do
   above <- use linesAboveCursor
-  moveByLine $ Relative $ LineIndex $ n - above
+  moveByLine $ Relative $ LineIndex $ (n - 1) - above
 
 -- | Go to an absolute character (column) number, the first character is 1 (character 0 and below
 -- all send the cursor to column 1), the last line is 'Prelude.maxBound'.
@@ -1308,7 +1305,7 @@ gotoChar
   => Absolute CharIndex -> editor tags m ()
 gotoChar (Absolute (CharIndex n)) = liftEditLine $ do
   before <- use charsBeforeCursor
-  moveByChar $ Relative $ CharIndex $ n - before
+  moveByChar $ Relative $ CharIndex $ (n - 1) - before
 
 -- | This function calls 'gotoLine' and then 'gotoChar' to move the cursor to an absolute a line
 -- number and characters (column) number.
@@ -1414,10 +1411,10 @@ forLinesLoop fold f count (pop, push) = execFoldMapLines (callCC $ loop count) f
   loop count halt = if count <= 0 then get else
     liftEditText pop >>= f halt >>= mapM_ push >> loop (count - 1) halt
 
--- | Move the cursor to the first @'Absolute' 'LineIndex'@ parameter given (will evaluate
--- 'endInsertMode)', then evaluate a folding and mapping monadic function over a range of lines
--- specified. If the first 'LineIndex' parameter is greater than the second 'LineIndex' parameter,
--- the fold map operation evaluates in reverse line order.
+-- | This function moves the cursor to the first @'Absolute' 'LineIndex'@ parameter given (will
+-- evaluate 'endInsertMode)', then evaluate a folding and mapping monadic function over a range of
+-- lines specified. If the first 'LineIndex' parameter is greater than the second 'LineIndex'
+-- parameter, the fold map operation evaluates in reverse line order.
 --
 -- If you do not want to lose the current cursor position, be sure to wrap the evaluation of this
 -- function in a call to the 'saveCursorEval'.
@@ -1447,7 +1444,7 @@ forLinesInRange absFrom@(Absolute (LineIndex from)) (Absolute (LineIndex to)) fo
   traceM $ "forLinesInRange{before="++show before++",after="++show after++"}" -- DEBUG
   lineCount <- (+) <$> use linesAboveCursor <*> use linesBelowCursor
   let dist = to - from
-  forLinesLoop fold f (min lineCount . max 0 $ abs dist) $ if dist < 0
+  forLinesLoop fold f (min lineCount . max 1 $ abs dist) $ if dist < 0
     then (unsafePopLine Before, pushLine After)
     else (unsafePopLine After,  pushLine Before)
 
@@ -1554,8 +1551,8 @@ gotoCursor (TextLocation{theCursorLineIndex=line,theCursorCharIndex=char}) = lif
 -- completes, restore the location of the cursor (within range, as the location may no longer exist)
 -- and return the result of evaluation.
 saveCursorEval
-  :: (MonadEditText editor, MonadIO (editor line m), MonadIO m)
-  => editor line m a -> editor line m a
+  :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m)
+  => editor tags m a -> editor tags m a
 saveCursorEval f = do
   (cur, a) <- (,) <$> getCursor <*> f
   gotoCursor cur >> return a
@@ -1563,8 +1560,8 @@ saveCursorEval f = do
 class RelativeToAbsoluteCursor index where
   -- | Convert a 'Relative' index (either a 'LineIndex' or 'CharIndex') to an 'Absolute' index.
   relativeToAbsolute
-    :: (MonadEditText editor, Monad (editor line m), Monad m)
-    => Relative index -> editor line m (Absolute index)
+    :: (MonadEditText editor, Monad (editor tags m), Monad m)
+    => Relative index -> editor tags m (Absolute index)
 
 instance RelativeToAbsoluteCursor LineIndex where
   relativeToAbsolute (Relative (LineIndex i)) = liftEditText $
@@ -1764,3 +1761,74 @@ forLinesInView (TextView{textViewVector=vec}) fold f = flip execStateT fold $
     loop lines halt = case lines of
       []         -> get
       line:lines -> f halt line >> loop lines halt
+
+----------------------------------------------------------------------------------------------------
+
+ralign :: Int -> String
+ralign n = case abs n of
+  i | i < 10 -> "      " ++ show i
+  i | i < 100 -> "     " ++ show i
+  i | i < 1000 -> "    " ++ show i
+  i | i < 10000 -> "   " ++ show i
+  i | i < 100000 -> "  " ++ show i
+  i | i < 1000000 -> " " ++ show i
+  i                ->       show i
+
+-- | Print debugger information about the structured data that forms the 'TextView' to standard
+-- output. __WARNING:__ this print's every line of text in the view, so if your text view has
+-- thousands of lines of text, there will be a lot of output.
+debugPrintView :: (MonadIO m, Show tags) => TextView tags -> m ()
+debugPrintView view = do
+  (_, errCount) <- forLinesInView view (1 :: Int, 0 :: Int) $ \ _halt line -> do
+    lineNum <- state $ \ (lineNum, errCount) ->
+      (lineNum, (lineNum + 1, errCount + if textLineIsUndefined line then 1 else 0))
+    liftIO $ putStrLn $ ralign lineNum ++ ": " ++ show line
+  liftIO $ putStrLn ""
+  when (errCount > 0) $ error $ "iterated over "++show errCount++" undefined lines"
+
+-- | Print debugger information about the structured data that forms the 'TextBuffer' to standard
+-- output. __WARNING:__ this print's every line of text in the buffer, so if your text buffer has
+-- thousands of lines of text, there will be a lot of output.
+debugPrintBuffer :: (MonadEditText editor, Show tags, MonadIO m) => editor tags m ()
+debugPrintBuffer = liftEditText $ do
+  lineVec <- use bufferVector
+  let len = MVec.length lineVec
+  let printLines nullCount i = if i >= len then return () else do
+        line <- liftIO $ MVec.read lineVec i
+        let showLine = putStrLn $ ralign i ++ ": " ++ show line
+        if textLineIsUndefined line
+          then do
+            liftIO $ if nullCount < (1 :: Int) then showLine else
+              if nullCount < 4 then putStrLn "...." else return ()
+            (printLines $! nullCount + 1) $! i + 1
+          else liftIO showLine >> (printLines 0 $! i + 1)
+  printLines 0 0
+  above   <- use linesAboveCursor
+  below   <- use linesBelowCursor
+  insmode <- use bufferInsertMode
+  liftIO $ do
+    putStrLn $ "  linesAboveCursor: " ++ show above
+    putStrLn $ "  linesBelowCursor: " ++ show below
+    putStrLn $ "   bufferLineCount: " ++ show (above + below)
+    putStrLn $ "__bufferInsertMode: " ++ show insmode
+
+-- | The 'bufferCurrentLine', which is a 'TextCursor' is a separate data structure contained within
+-- the 'TextBuffer', and it is often not necessary to know this information when debugging, so you
+-- can print debugging information about the 'TextCursor' by evaluating this function whenever it is
+-- necessary.
+debugPrintCursor :: (MonadEditText editor, Show tags, MonadIO m) => editor tags m ()
+debugPrintCursor = liftEditText $ do
+  cur <- use bufferCurrentLine
+  let charVec    = theLineEditBuffer cur
+  let charVecLen = UMVec.length charVec
+  let before     = cur ^. charsBeforeCursor
+  let after      = cur ^. charsAfterCursor
+  liftIO $ do
+    str <- forM [0 .. charVecLen - 1] $ UMVec.read charVec
+    putStrLn $ "   bufferCurrentLine: " ++ show str
+    putStrLn $ "      textCursorTags: " ++ show (cur ^. textCursorTags)
+    putStrLn $ "__cursorVectorLength: " ++ show charVecLen
+    putStrLn $ "   charsBeforeCursor: " ++ show before
+    putStrLn $ "    charsAfterCursor: " ++ show after
+    putStrLn $ "     cursorInputSize: " ++ show (before + after)
+    putStrLn $ " cursorLineBreakSize: " ++ show (theCursorBreakSize cur)
