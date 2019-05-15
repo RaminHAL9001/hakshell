@@ -22,15 +22,15 @@ type Tags = ()
 
 mkLoc :: Int -> Int -> TextLocation
 mkLoc a b = TextLocation
-  { theCursorLineIndex = Absolute $ LineIndex a
-  , theCursorCharIndex = Absolute $ CharIndex b
+  { theLocationLineIndex = Absolute $ LineIndex a
+  , theLocationCharIndex = Absolute $ CharIndex b
   }
 
 showLoc :: TextLocation -> String
 showLoc
   (TextLocation
-   {theCursorLineIndex=Absolute(LineIndex line)
-   ,theCursorCharIndex=Absolute (CharIndex char)
+   {theLocationLineIndex=Absolute(LineIndex line)
+   ,theLocationCharIndex=Absolute (CharIndex char)
    }) = '(' : show line ++ ':' : show char ++ ")"
 
 testTextEditor :: (String -> IO ()) -> TextBuffer tags -> EditText tags IO () -> IO ()
