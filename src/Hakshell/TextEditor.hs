@@ -129,7 +129,7 @@ module Hakshell.TextEditor
     bufferCurrentLine, textLineString, bufferDefaultTags,
     lineBreakerNLCR,
     -- ** Line Editing
-    TextLine, sliceLineToEnd, textLineIsUndefined,
+    TextLine, emptyTextLine, nullTextLine, sliceLineToEnd, textLineIsUndefined,
     TextCursor, newCursorFromLine, textCursorCharCount, textLineTags,
     -- ** Errors
     TextEditError(..),
@@ -585,6 +585,9 @@ data LineBreaker
     , theDefaultLineBreak :: !CharVector
       -- ^ This defines the default line break to be used by the line breaking function.
     }
+
+----------------------------------------------------------------------------------------------------
+
 -- | 'EditText' functions operate on units of text, and each unit of text is the "line," which is
 -- usually a @'\n'@ character terminated line of text in a text file, although it could represent
 -- other things, like files in a directory, or rows in a table of a database. Since a 'ExitText'
@@ -607,6 +610,32 @@ data TextLine tags
     }
   deriving Functor
 
+-- | The empty 'TextLine' value.
+emptyTextLine :: tags -> TextLine tags
+emptyTextLine tags = TextLine
+  { theTextLineString    = UVec.empty
+  , theTextLineTags      = tags
+  , theTextLineBreakSize = 0
+  }
+
+-- | Evaluates to 'True' if the 'TextLine' is empty.
+nullTextLine :: (tags -> Bool) -> TextLine tags -> Bool
+nullTextLine nullTags line = UVec.null (theTextLineString line) && nullTags (theTextLineTags line)
+
+-- | Cut a line at some index, keeping the characters 'Before' or 'After' the index.
+sliceLineToEnd :: RelativeToCursor -> Absolute CharIndex -> TextLine tags -> TextLine tags
+sliceLineToEnd rel (Absolute (CharIndex n)) = textLineString %~ \ vec ->
+  let len = UVec.length vec in case rel of
+    Before -> UVec.slice  0 (len - n) vec
+    After  -> UVec.slice (len - n) n  vec
+
+-- | Evaluates toe True if the 'TextLine' is undefined. An undefined 'TextLine' is different from an
+-- empty string, it is similar to the 'Prelude.Nothing' constructor.
+textLineIsUndefined :: TextLine tags -> Bool
+textLineIsUndefined = \ case { TextLineUndefined -> True; _ -> False; }
+
+----------------------------------------------------------------------------------------------------
+
 -- | The current line that is being edited.
 data TextCursor tags
   = TextCursor
@@ -625,11 +654,6 @@ instance Show tags => Show (TextLine tags) where
     TextLineUndefined -> "(null)"
     TextLine{theTextLineString=vec,theTextLineTags=tags,theTextLineBreakSize=lbrksz} ->
       '(' : show (unpack vec) ++ ' ' : show lbrksz ++ ' ' : show tags ++ ")"
-
--- | Evaluates toe True if the 'TextLine' is undefined. An undefined 'TextLine' is different from an
--- empty string, it is similar to the 'Prelude.Nothing' constructor.
-textLineIsUndefined :: TextLine tags -> Bool
-textLineIsUndefined = \ case { TextLineUndefined -> True; _ -> False; }
 
 -- Not for export: this buffer is formatted such that characters before the cursror are near index
 -- zero, while characters after the cursor are near the final index.
@@ -738,13 +762,6 @@ unsafeMakeLine cur = do
     , theTextLineTags      = theTextCursorTags cur
     , theTextLineBreakSize = 0
     }
-
--- | Cut a line at some index, keeping the characters 'Before' or 'After' the index.
-sliceLineToEnd :: RelativeToCursor -> Absolute CharIndex -> TextLine tags -> TextLine tags
-sliceLineToEnd rel (Absolute (CharIndex n)) = textLineString %~ \ vec ->
-  let len = UVec.length vec in case rel of
-    Before -> UVec.slice  0 (len - n) vec
-    After  -> UVec.slice (len - n) n  vec
 
 -- | Create a new 'TextCursor' from a 'TextLine'. The 'TextCursor' can be updated with an 'EditLine'
 -- function. Note that this function works in any monadic function type @m@ which instantiates
