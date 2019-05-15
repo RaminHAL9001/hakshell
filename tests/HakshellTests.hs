@@ -3,9 +3,6 @@ module Main where
 import           Hakshell.String
 import           Hakshell.TextEditor
 
-import qualified Data.Vector as Vec
-
-import           Control.Monad
 import           Control.Monad.IO.Class
 
 ----------------------------------------------------------------------------------------------------
@@ -47,57 +44,18 @@ defaultTags = ()
 report :: MonadIO m => String -> m ()
 report = liftIO . putStr
 
-ralign :: Int -> String
-ralign n = case abs n of
-  i | i < 10 -> "   " ++ show i
-  i | i < 100 -> "  " ++ show i
-  i | i < 1000 -> " " ++ show i
-  i             ->       show i
-
-showBuffer :: Show tags => EditText tags IO ()
-showBuffer = do
-  errCount <- forLinesInBuffer (0 :: Int) $ \ _halt line -> do
-    when (textLineIsUndefined line) $ modify (+ 1)
-    (Absolute (LineIndex lineNum)) <- currentLineNumber
-    liftIO $ putStrLn $ ralign lineNum ++ ": " ++ show line
-    return [line]
-  liftIO $ putStrLn ""
-  when (errCount > 0) $ error $ "iterated over "++show errCount++" undefined lines"
-
-showBufferVector :: Show tags => TextBuffer tags -> IO ()
-showBufferVector = textBufferFreezeInternal >=> loop (0 :: Int) 0 where
-  loop nullCount lineCount vec = if lineCount >= Vec.length vec then return () else do
-    let line = vec Vec.! lineCount
-    let showLine = putStrLn $ ralign lineCount ++ ": " ++ show line
-    if textLineIsUndefined line
-     then do
-      if nullCount < 1 then showLine else if nullCount < 4 then putStrLn "...." else return ()
-      ((loop $! nullCount + 1) $! lineCount + 1) vec
-     else showLine >> (loop 0 $! lineCount + 1) vec
-
-showView :: (MonadIO m, Show tags) => TextView tags -> m ()
-showView view = do
-  (_, errCount) <- forLinesInView view (1 :: Int, 0 :: Int) $ \ _halt line -> do
-    lineNum <- state $ \ (lineNum, errCount) ->
-      (lineNum, (lineNum + 1, errCount + if textLineIsUndefined line then 1 else 0))
-    liftIO $ putStrLn $ ralign lineNum ++ ": " ++ show line
-  liftIO $ putStrLn ""
-  when (errCount > 0) $ error $ "iterated over "++show errCount++" undefined lines"
-
 basicTests :: IO ()
 basicTests = do
   buf <- newTextBuffer defaultTags
   report "--- basic tests ---\n"
-  let reportInsert str = do
-        testTextEditor error buf $ do
-          report $ "insertString " ++ show str ++ "\n"
-          insertString str
-        showBufferVector buf
-  let reportMove msg line col = do
-        testTextEditor error buf $ do
-          report $ "Move cursor "++msg++", line="++show line++" col="++show col++" ...\n"
-          gotoCursor $ mkLoc line col
-        showBufferVector buf
+  let reportInsert str = testTextEditor error buf $ do
+        report $ "insertString " ++ show str ++ "\n"
+        insertString str
+        debugPrintBuffer
+  let reportMove msg line col = testTextEditor error buf $ do
+        report $ "Move cursor "++msg++", line="++show line++" col="++show col++" ...\n"
+        gotoCursor $ mkLoc line col
+        debugPrintBuffer
   reportInsert "one two three\n"
   reportInsert "four five six\nseven eight nine\nten eleven twelve\n"
   reportMove        "up" 1  1
@@ -113,19 +71,23 @@ textViewTests = do
   testTextEditor error buf $ do
     let chars = "0123456789ABCDEF"
     insertString $ chars >>= \ a -> unwords ((\ b -> [a,b]) <$> chars) ++ "\n"
-    showBuffer
+    debugPrintBuffer
+  testTextEditor error buf $ do
+    gotoCursor $ mkLoc 1 1
+    debugPrintBuffer
   let reportView a b = do
         report $ "view "++showLoc a++"->"++showLoc b++"\n"
         v <- textView a b buf
-        showView v
+        debugPrintView v
   reportView (mkLoc  3 24) (mkLoc  6 25)
   reportView (mkLoc 14  1) (mkLoc 16 48)
   reportView (mkLoc  1  1) (mkLoc  3 48)
   reportView (mkLoc  1 12) (mkLoc  1 28)
   reportView (mkLoc  1 12) (mkLoc  9 28)
   report "Move cursor to start of buffer...\n"
-  testTextEditor error buf $ gotoPosition $ mkLoc 1 1
-  showBufferVector buf
+  testTextEditor error buf $ do
+    gotoPosition $ mkLoc 1 1
+    debugPrintBuffer
   report "OK\n"
   reportView (mkLoc  3 24) (mkLoc  5 25)
   reportView (mkLoc 14  1) (mkLoc 15 48)
@@ -133,8 +95,9 @@ textViewTests = do
   reportView (mkLoc  1 12) (mkLoc  0 25)
   reportView (mkLoc  9 12) (mkLoc  8 25)
   report "Move cursor to middle of buffer...\n"
-  testTextEditor error buf $ gotoPosition $ mkLoc 8 23
-  showBufferVector buf
+  testTextEditor error buf $ do
+    gotoPosition $ mkLoc 8 23
+    debugPrintBuffer
   report "OK\n"
   reportView (mkLoc  1  1) (mkLoc  8 48)
   reportView (mkLoc  7 24) (mkLoc 11 25)
