@@ -124,13 +124,14 @@ module Hakshell.TextEditor
     MapChars, runMapChars,
     -- * Text Editor Data Structures
     -- ** Text Buffer
-    TextBufferState, LineBreaker(..),
-    bufferLineBreaker, lineBreaker, lineBreakPredicate, defaultLineBreak,
+    TextBufferState,
     bufferCurrentLine, textLineString, bufferDefaultTags,
-    lineBreakerNLCR,
     -- ** Line Editing
     TextLine, emptyTextLine, nullTextLine, sliceLineToEnd, textLineIsUndefined,
     TextCursor, newCursorFromLine, textCursorCharCount, textLineTags,
+    -- ** The Line Breaker
+    LineBreaker, newLineBreaker, lineBreakerNLCR, getLineBreaker, setLineBreaker,
+    lineBreaker, lineBreakPredicate, defaultLineBreak,
     -- ** Errors
     TextEditError(..),
     -- * Debugging
@@ -159,6 +160,7 @@ import           Control.Monad.Primitive
 import           Control.Monad.State
 import           Control.Monad.State.Class
 
+import           Data.List                   (sortBy)
 import           Data.Semigroup
 import qualified Data.Vector                 as Vec
 import qualified Data.Vector.Mutable         as MVec
@@ -167,6 +169,7 @@ import qualified Data.Vector.Generic.Mutable as GMVec
 import qualified Data.Vector.Unboxed.Mutable as UMVec
 import           Data.Word
 
+import System.IO (hPutStrLn, stderr)
 import Debug.Trace
 
 ----------------------------------------------------------------------------------------------------
@@ -562,29 +565,88 @@ data TextEditError
   = TextEditError !StrictBytes
   deriving (Eq, Ord)
 
--- | A pair of functions used to break strings into lines. This function is called every time a
--- string is transferred from 'theBufferCursor' to to 'theLinesAbove' or 'theLinesBelow' to ensure
--- all strings entered into a buffer have no more than one line terminating character sequence at
--- the end of them.
---
--- If you choose to use your own 'LineBreaker' function, be sure that the function obeys this law:
---
--- @
--- 'Prelude.concat' ('lineBreakerNLCR' str) == str
--- @
+-- | A grouping of functions used to break strings into lines. 
 data LineBreaker
   = LineBreaker
-    { theLineBreakPredicate :: Char -> Bool
+    { lineBreakPredicate :: Char -> Bool
       -- ^ This function is called by 'insertChar' to determine if the 'bufferCurrentLine' should be
       -- terminated.
-    , theLineBreaker :: String -> [(String, String)]
+    , lineBreakReversePredicate :: Char -> Bool
+      -- ^ Like 'lineBreakPredicate' but is used when scanning backwards through a buffer or string.
+    , lineBreaker :: String -> [(String, String)]
       -- ^ This function scans through a string finding character sequences that delimit the end of
-      -- a line of text. For each returned tuple, the first element of the tuple should be a string
+      -- a line of text. For each returned tuple, the first element of the tuple will be a string
       -- without line breaks, the second element should contain a string with only line breaks, or
       -- an empty string if the string was not terminated with a line break.
-    , theDefaultLineBreak :: !CharVector
+    , defaultLineBreak :: !CharVector
       -- ^ This defines the default line break to be used by the line breaking function.
+    , lineBreakSymbols :: !(Vec.Vector CharVector)
+      -- ^ All possible line break symbols used in this buffer.
+    , lineBreakSymStrings :: !CharVector
+      -- ^ not for export: only used for testing equality. This string is the concatenation of
+      -- 'lineBreakSymbols'.
     }
+
+instance Eq LineBreaker where { a == b = lineBreakSymStrings a == lineBreakSymStrings b; }
+
+-- | This function will alter the 'LineBreaker' used by the 'TextBuffer', updating it to the given
+-- 'LineBreaker'. If the given 'LineBreaker' is the same as the current 'LineBreaker' (as determined
+-- by the @'=='@ function), then this function results no no operation. However if the new
+-- 'LineBreaker' is different from before, the entire buffer is re-scanned and re-divided into lines.
+setLineBreaker :: MonadIO m => EditText tags m ()
+setLineBreaker = liftIO $ hPutStrLn stderr "TODO: implement 'setLineBreaker'"
+
+getLineBreaker
+  :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m)
+  => editor tags m LineBreaker
+getLineBreaker = liftEditText $ use bufferLineBreaker
+
+-- | This is the default line break function. It will split the line on the character sequence
+-- @"\n"@, or @"\r"@, or @"\n\r"@, or @"\r\n"@. The line terminators must be included at the end of
+-- each broken string, so that the rule that the law
+-- @'Prelude.concat' ('theLineBreaker' 'lineBreakerNLCR' str) == str@ is obeyed.
+lineBreakerNLCR :: LineBreaker
+lineBreakerNLCR = this where
+  this = LineBreaker
+    { lineBreakPredicate        = nlcr
+    , lineBreakReversePredicate = nlcr
+    , lineBreaker               = lines
+    , defaultLineBreak          = UVec.singleton '\n'
+    , lineBreakSymbols          = Vec.fromList syms
+    , lineBreakSymStrings       = UVec.concat syms
+    }
+  syms = reverseSortCharVecs $ pack <$> ["\n\r", "\r\n", "\n", "\r"]
+  nlcr c = c == '\n' || c == '\r'
+  lines  = break nlcr >>> \ case
+    (""  , "") -> []
+    (line, "") -> [(line, "")]
+    (line, '\n':'\r':more) -> (line, "\n\r") : lines more
+    (line, '\r':'\n':more) -> (line, "\r\n") : lines more
+    (line, c:more)         -> (line, [c])    : lines more
+
+reverseSortCharVecs :: [CharVector] -> [CharVector]
+reverseSortCharVecs = sortBy (\ a b -> compare (UVec.length b) (UVec.length a) <> compare b a)
+
+-- | This function constructs a new 'LineBreaker' from a set of 'CharVector' strings. The first
+-- non-empty string becomes the 'defaultLineBreak'. Empty strings are removed, and the set is
+-- reverse sorted by length.
+newLineBreaker :: [CharVector] -> Maybe LineBreaker
+newLineBreaker vecs0 = case filter (not . UVec.null) vecs0 of
+  []        -> Nothing
+  def:vecs0 -> Just this where
+    syms   = reverseSortCharVecs $ def:vecs0
+    vecs   = Vec.fromList syms
+    firsts = UVec.fromList $ UVec.head <$> syms
+    lasts  = UVec.fromList $ UVec.last <$> syms
+    this   = LineBreaker
+      { lineBreakSymbols          = vecs
+      , lineBreakSymStrings       = UVec.concat syms
+      , lineBreakReversePredicate = flip UVec.elem lasts
+      , lineBreakPredicate        = flip UVec.elem firsts
+      , defaultLineBreak          = def
+      , lineBreaker               = error "TODO: implement 'lineBreaker' set by 'newLineBreaker'"
+      }
+  -- TODO: test all of this
 
 ----------------------------------------------------------------------------------------------------
 
@@ -791,24 +853,6 @@ newCursorFromLine cur line = liftIO $ do
     , theTextCursorTags    = theTextLineTags line
     }
 
--- | This is the default line break function. It will split the line on the character sequence
--- @"\n"@, or @"\r"@, or @"\n\r"@, or @"\r\n"@. The line terminators must be included at the end of
--- each broken string, so that the rule that the law
--- @'Prelude.concat' ('theLineBreaker' 'lineBreakerNLCR' str) == str@ is obeyed.
-lineBreakerNLCR :: LineBreaker
-lineBreakerNLCR = LineBreaker
-  { theLineBreakPredicate = nlcr
-  , theLineBreaker = lines
-  , theDefaultLineBreak = UVec.fromList "\n"
-  } where
-    nlcr c = c == '\n' || c == '\r'
-    lines  = break nlcr >>> \ case
-      (""  , "") -> []
-      (line, "") -> [(line, "")]
-      (line, '\n':'\r':more) -> (line, "\n\r") : lines more
-      (line, '\r':'\n':more) -> (line, "\r\n") : lines more
-      (line, c:more)         -> (line, [c])    : lines more
-
 -- Not for export: this is only used to set empty lines in the buffer.
 bufferDefaultLine :: Lens' (TextBufferState tags) (TextLine tags)
 bufferDefaultLine = lens theBufferDefaultLine $ \ a b -> a{ theBufferDefaultLine = b }
@@ -820,32 +864,9 @@ bufferDefaultLine = lens theBufferDefaultLine $ \ a b -> a{ theBufferDefaultLine
 bufferDefaultTags :: Lens' (TextBufferState tags) tags
 bufferDefaultTags = bufferDefaultLine . textLineTags
 
--- | The function used to break strings into lines. This function is called every time a string is
--- transferred from 'theBufferCursor' to 'theLinesAbove' or 'theLinesBelow'. Note that setting this
--- function doesn't restructure the buffer, the old line breaks will still exist as they were before
--- until the entire buffer is refreshed.
---
--- If you choose to use your own 'LineBreaker' function, be sure that the function obeys this law:
---
--- @
--- 'Prelude.concat' ('lineBreakerNLCR' str) == str
--- @
+-- not for export
 bufferLineBreaker :: Lens' (TextBufferState tags) LineBreaker
 bufferLineBreaker = lens theBufferLineBreaker $ \ a b -> a{ theBufferLineBreaker = b }
-
--- | This function is called by 'insertChar' to determine if the 'bufferCurrentLine' should be
--- terminated.
-lineBreakPredicate :: Lens' LineBreaker (Char -> Bool)
-lineBreakPredicate = lens theLineBreakPredicate $ \ a b -> a{ theLineBreakPredicate = b }
-
--- | This function scans through a string finding character sequences that delimit the end of a line
--- of text.
-lineBreaker :: Lens' LineBreaker (String -> [(String, String)])
-lineBreaker = lens theLineBreaker $ \ a b -> a{ theLineBreaker = b }
-
--- | This defines the default line break to be used by the line breaking function.
-defaultLineBreak :: Lens' LineBreaker CharVector
-defaultLineBreak = lens theDefaultLineBreak $ \ a b -> a{ theDefaultLineBreak = b }
 
 -- Not for export: requires correct accounting of line numbers to avoid segment faults.
 cursorLineIndex :: Lens' (TextBufferState tags) Int
@@ -1303,7 +1324,7 @@ insertChar
   :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m)
   => RelativeToCursor -> Char -> editor tags m ()
 insertChar rel c = liftEditText $ do
-  isBreak <- use $ bufferLineBreaker . lineBreakPredicate
+  isBreak <- lineBreakPredicate <$> use bufferLineBreaker
   if isBreak c then return () else unsafeInsertChar rel c
 
 -- | Go to an absolute line number, the first line is 1 (line 0 and below all send the cursor to
@@ -1372,7 +1393,7 @@ deleteCharsWrap (Relative (CharIndex n)) = liftEditText $ if n == 0 then return 
 insertString
   :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m)
   => String -> editor tags m ()
-insertString str = liftEditText $ use (bufferLineBreaker . lineBreaker) >>= loop . ($ str) where
+insertString str = liftEditText $ lineBreaker <$> use bufferLineBreaker >>= loop . ($ str) where
   writeStr = mapM_ $ unsafeInsertChar Before
   writeLine (str, lbrk) = do
     writeStr str
@@ -1499,7 +1520,7 @@ lineBreak
   => RelativeToCursor -> editor tags m ()
 lineBreak rel = liftEditText $ do
   breaker <- use bufferLineBreaker
-  let lbrk     = breaker ^. defaultLineBreak
+  let lbrk     = defaultLineBreak breaker
   let lbrkSize = fromIntegral $ intSize lbrk
   case rel of
     Before -> do
