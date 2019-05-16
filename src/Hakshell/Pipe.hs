@@ -16,6 +16,7 @@ import           Prelude hiding (fail)
 import           Hakshell.String
 
 import           Control.Applicative
+import           Control.Lens
 import           Control.Monad.Fail
 import           Control.Monad.State hiding (fail)
 
@@ -87,6 +88,40 @@ instance Functor m => Functor (Pipe m) where
     PipeStop        -> PipeStop
     PipeFail   msg  -> PipeFail msg
     PipeNext a next -> PipeNext (f a) $ fmap (fmap f) next
+
+instance Applicative m => Applicative (Pipe m) where
+  pure = flip PipeNext (pure PipeStop)
+  (<*>) = \ case
+    PipeStop         -> const PipeStop
+    PipeFail msg     -> const $ PipeFail msg
+    PipeNext f nextF -> \ case
+      PipeStop         -> PipeStop
+      PipeFail msg     -> PipeFail msg
+      PipeNext a nextA -> PipeNext (f a) $ (<*>) <$> nextF <*> pure (PipeNext a nextA)
+
+instance Applicative m => Alternative (Pipe m) where
+  empty = PipeStop
+  (<|>) = \ case
+    PipeStop        -> id
+    PipeFail msg    -> const $ PipeFail msg
+    PipeNext a next -> PipeNext a . (<$> next) . flip (<|>)
+
+instance Monad m => Monad (Pipe m) where
+  return = flip PipeNext (return PipeStop)
+  (>>=) = \ case
+    PipeStop         -> const PipeStop
+    PipeFail msg     -> const $ PipeFail msg
+    PipeNext a nextA -> \ m -> case m a of
+      PipeStop         -> PipeStop
+      PipeFail msg     -> PipeFail msg
+      PipeNext b nextB -> PipeNext b $ mplus <$> ((>>= m) <$> nextA) <*> nextB
+
+instance Monad m => MonadPlus (Pipe m) where
+  mzero = PipeStop
+  mplus = \ case
+    PipeStop     -> id
+    PipeFail msg -> const $ PipeFail msg
+    PipeNext a next -> PipeNext a . (<$> next) . flip mplus
 
 instance Functor m => Semigroup (Pipe m a) where
   (<>) = \ case
@@ -179,3 +214,55 @@ produce :: Monad m => st -> Producer st m a -> m (Pipe m a)
 produce st p@(Producer f) = runStateT f st >>= \ (next, st) -> return $ case next of
   Nothing -> PipeStop
   Just  a -> PipeNext a $ produce st p
+
+----------------------------------------------------------------------------------------------------
+
+-- | Functions like 'push', 'foreach', and 'pull' are good for simple @IO@ processes. But when your
+-- process becomes a little more complicated, it is better to define your @IO@ process in terms of
+-- an 'Engine', which manages input, output, an optional state, behind the scenes, allowing you to
+-- keep your function definitions clean and compact.
+--
+-- You define an 'Engine' using the engine combinators such as 'input', 'while', 'collect', and
+-- 'output'. You can also use the usual Monad Transformer Library combinators like 'get' and 'put'
+-- to update state, the state lenses like 'use' and @('=.')@, error control like 'throwError',
+-- 'catchError', and 'Alternative' combinators like @('<|>')@ and 'empty'.
+--
+-- The name 'Engine' was chosen because it serves as a metaphor for what functions of this type
+-- should do: they should take input from a 'Pipe', and produce output to another 'Pipe', typcially
+-- performing some work on the content of the input 'Pipe' to produce the output.
+newtype Engine st input m a
+  = Engine
+    { unwrapEngine ::
+        StateT (EngineState st input m) m (Pipe (Engine st input m) a)
+    }
+  deriving (Functor)
+
+data EngineState st input m
+  = EngineState
+    { theEngineInputPipe  :: !(Pipe m input)
+    , theEngineStateValue :: !st
+    }
+
+-- | You should never need to use this function.
+--
+-- This function used is internally to define the 'Engine' combinators which take elements from the
+-- input pipe. It operates on a value of the concrete 'EngineState' type and not the variable type
+-- @st@, meaning you cannot evaluate lens expressions such as 'use' or @('.=')@ or @('%=')@ unless
+-- you wrap these expressions in the 'Engine' constructor first. For example the 'putBackInput'
+-- function is defined as: @\\ elem -> 'Engine' ('engineInputPipe' '%=' 'PipeNext' elem . 'return')@
+--
+-- Again, just use the input combinators like 'input', 'collect', 'while', and 'putBackInput'.
+engineInputPipe :: Lens' (EngineState st input m) (Pipe m input)
+engineInputPipe = lens theEngineInputPipe $ \ a b -> a{ theEngineInputPipe = b }
+
+-- | You should never need to use this function.
+--
+-- This function is used to define the instnaces of 'get' and 'put' (of the 'MonadState' typeclass)
+-- for the 'Engine' function type.
+--
+-- @
+-- 'put' = 'Engine' '.' 'assign' 'engineStateValue'
+-- 'get' = Engine '$' 'use' 'engineStateValue'
+-- @
+engineStateValue :: Lens' (EngineState st input m) st
+engineStateValue = lens theEngineStateValue $ \ a b -> a{ theEngineStateValue = b }
