@@ -19,6 +19,8 @@ import           Control.Applicative
 import           Control.Monad.Fail
 import           Control.Monad.State hiding (fail)
 
+import           Data.Semigroup
+
 import qualified Data.ByteString.Char8 as BStr
 import qualified Data.ByteString.UTF8  as UTF8
 
@@ -86,15 +88,15 @@ instance Functor m => Functor (Pipe m) where
     PipeFail   msg  -> PipeFail msg
     PipeNext a next -> PipeNext (f a) $ fmap (fmap f) next
 
+instance Functor m => Semigroup (Pipe m a) where
+  (<>) = \ case
+    PipeStop       -> id
+    err@PipeFail{} -> const err
+    PipeNext  a  f -> \ b -> PipeNext a $ (<> b) <$> f
+
 instance Functor m => Monoid (Pipe m a) where
   mempty = PipeStop
-  mappend a b = case a of
-    PipeNext a nextA -> case b of
-      PipeNext{} -> PipeNext a $ flip mappend b <$> nextA
-      PipeFail{} -> PipeNext a $ flip mappend b <$> nextA
-      PipeStop   -> PipeNext a nextA
-    PipeFail{} -> a
-    PipeStop   -> b
+  mappend = (<>)
 
 -- | Yield a single value and then end.
 push :: Applicative m => a -> m (Pipe m a)
