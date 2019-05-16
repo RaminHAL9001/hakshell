@@ -13,6 +13,8 @@ module Hakshell.Pipe where
 
 import           Prelude hiding (fail)
 
+import           Hakshell.String
+
 import           Control.Applicative
 import           Control.Monad.Fail
 import           Control.Monad.State hiding (fail)
@@ -31,6 +33,15 @@ type ErrMsg = UTF8.ByteString
 -- it pattern match on the 'Pipe' to extract a value to be applied to your 'Applicative' function,
 -- and then another applicative function is also extracted and evaluated to produce another 'Pipe',
 -- and each successive 'Pipe' is recursively evaluated.
+--
+-- 'Pipe' instantiates the 'Show' class to show a status:
+--
+-- * @(OK)@ on the 'PipeNext' constructor, means you can begin extracting values using 'pull'.
+--
+-- * @(ERROR "some message")@ means an error occurred.
+--
+-- * An empty string indicates the 'PipeStop' constructor was returned, which means no error
+--   ocurred, and no result was returned either.
 --
 -- Construct a 'Pipe' using functions like 'push' and 'foreach'. Pipe is also a functor, so you can
 -- modify the type of @a@ by evaluating a function on it with 'fmap'. 'Pipe' is not an 'Applicative'
@@ -62,6 +73,12 @@ data Pipe m a
   = PipeStop
   | PipeFail !ErrMsg
   | PipeNext !a (m (Pipe m a))
+
+instance Show (Pipe m a) where
+  show = \ case
+    PipeStop     -> ""
+    PipeFail msg -> "(ERROR "++show (unpack msg)++")"
+    PipeNext{}   -> "(OK)"
 
 instance Functor m => Functor (Pipe m) where
   fmap f = \ case
