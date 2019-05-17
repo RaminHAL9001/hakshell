@@ -17,6 +17,7 @@ import           Hakshell.String
 
 import           Control.Applicative
 import           Control.Lens
+import           Control.Monad.Except
 import           Control.Monad.Fail
 import           Control.Monad.State hiding (fail)
 
@@ -123,15 +124,22 @@ instance Monad m => MonadPlus (Pipe m) where
     PipeFail msg -> const $ PipeFail msg
     PipeNext a next -> PipeNext a . (<$> next) . flip mplus
 
-instance Functor m => Semigroup (Pipe m a) where
-  (<>) = \ case
-    PipeStop       -> id
-    err@PipeFail{} -> const err
-    PipeNext  a  f -> \ b -> PipeNext a $ (<> b) <$> f
+instance Monad m => MonadError ErrMsg (Pipe m) where
+  throwError = PipeFail
+  catchError try catch = case try of
+    PipeStop      -> PipeStop
+    PipeFail  msg -> catch msg
+    ok@PipeNext{} -> ok
 
-instance Functor m => Monoid (Pipe m a) where
-  mempty = PipeStop
-  mappend = (<>)
+instance Monad m => MonadFail (Pipe m) where
+  fail = PipeFail . pack
+
+instance (Applicative m, Semigroup a) => Semigroup (Pipe m a) where
+  a <> b = (<>) <$> a <*> b
+
+instance (Applicative m, Monoid a) => Monoid (Pipe m a) where
+  mempty = pure mempty
+  mappend a b = mappend <$> a <*> b
 
 -- | Yield a single value and then end.
 push :: Applicative m => a -> m (Pipe m a)
@@ -172,7 +180,7 @@ pmap = flip foreach
 pull :: (MonadIO m, MonadFail m) => (a -> m void) -> Pipe m a -> m ()
 pull f = \ case
   PipeStop        -> return ()
-  PipeFail   msg  -> fail $ BStr.unpack msg
+  PipeFail   msg  -> Control.Monad.Except.fail $ BStr.unpack msg
   PipeNext a next -> f a >> next >>= pull f
 
 -- | Pull all values from the 'Pipe' until the pipe finishes.
@@ -180,7 +188,7 @@ pullList :: (Monad m, MonadFail m) => (a -> m b) -> Pipe m a -> m [b]
 pullList f = loop id where
   loop stack = \ case
     PipeStop        -> return $ stack []
-    PipeFail   msg  -> fail $ BStr.unpack msg
+    PipeFail   msg  -> Control.Monad.Except.fail $ BStr.unpack msg
     PipeNext a next -> f a >>= \ b -> next >>= loop (stack . (b :))
 
 ----------------------------------------------------------------------------------------------------
@@ -266,6 +274,26 @@ instance Monad m => MonadPlus (Engine st input m) where
   mzero = Engine $ return mzero
   mplus (Engine a) (Engine b) = Engine $
     a >>= \ a -> b >>= \ b -> return (mplus a b)
+
+instance MonadTrans (Engine st input) where
+  lift = Engine . lift . fmap return
+
+instance Monad m => MonadError ErrMsg (Engine st input m) where
+  throwError = Engine . return . PipeFail
+  catchError (Engine try) catch = Engine $ try >>= \ case
+    PipeStop      -> return PipeStop
+    PipeFail  msg -> unwrapEngine $ catch msg
+    ok@PipeNext{} -> return ok
+
+instance Monad m => MonadFail (Engine st input m) where
+  fail = throwError . pack
+
+instance (Monad m, Semigroup a) => Semigroup (Engine st input m a) where
+  a <> b = (<>) <$> a <*> b
+
+instance (Monad m, Monoid a) => Monoid (Engine st input m a) where
+  mappend a b = mappend <$> a <*> b
+  mempty      = return mempty
 
 -- | You should never need to use this function.
 --
