@@ -243,6 +243,30 @@ data EngineState st input m
     , theEngineStateValue :: !st
     }
 
+instance Monad m => Applicative (Engine st input m) where
+  pure = Engine . pure . flip PipeNext (Engine $ pure PipeStop)
+  (Engine f) <*> (Engine a) = Engine $ (<*>) <$> f <*> a
+
+instance Monad m => Alternative (Engine st input m) where
+  empty = Engine $ pure empty
+  (Engine a) <|> (Engine b) = Engine $ (<|>) <$> a <*> b
+
+instance Monad m => Monad (Engine st input m) where
+  return = Engine . return . return
+  (Engine a) >>= f = Engine $ do
+    let loop = \ case
+          PipeStop         -> return $ PipeStop
+          PipeFail msg     -> return $ PipeFail msg
+          PipeNext a nextA -> unwrapEngine $ mplus
+            (Engine $ unwrapEngine $ f a)
+            (Engine $ join <$> unwrapEngine nextA >>= loop)
+    a >>= loop
+
+instance Monad m => MonadPlus (Engine st input m) where
+  mzero = Engine $ return mzero
+  mplus (Engine a) (Engine b) = Engine $
+    a >>= \ a -> b >>= \ b -> return (mplus a b)
+
 -- | You should never need to use this function.
 --
 -- This function used is internally to define the 'Engine' combinators which take elements from the
