@@ -193,38 +193,6 @@ pullList f = loop id where
 
 ----------------------------------------------------------------------------------------------------
 
--- | A 'Control.Monad.State.StateT'-like monad that is used to produce values by unfolding things.
-newtype Producer st m a = Producer { unwrapProducer :: StateT st m (Maybe a) }
-
-instance Functor m => Functor (Producer st m) where
-  fmap f (Producer g) = Producer $ fmap (fmap f) g
-
-instance Monad m => Monad (Producer st m) where
-  return = Producer . return . Just
-  (Producer f) >>= m = Producer $ f >>= maybe (return Nothing) (unwrapProducer . m)
-
-instance Monad m => MonadPlus (Producer st m) where
-  mzero = Producer $ return Nothing
-  mplus (Producer a) (Producer b) = Producer $ a >>= maybe b (return . Just)
-
-instance Monad m => Applicative (Producer st m) where
-  pure = Producer . pure . Just
-  (Producer f) <*> (Producer a) = Producer $ (<*>) <$> f <*> a
-
-instance Monad m => Alternative (Producer st m) where
-  empty = Producer $ return Nothing
-  (Producer a) <|> (Producer b) = Producer $ (<|>) <$> a <*> b
-
--- | Similar to an 'Data.List.unfold', but produces a 'Pipe' of several items. The value to be
--- unfolded can be accessed with the "Control.Monad.State" functions 'Control.Monad.State.get' and
--- 'Control.Monad.State.put'.
-produce :: Monad m => st -> Producer st m a -> m (Pipe m a)
-produce st p@(Producer f) = runStateT f st >>= \ (next, st) -> return $ case next of
-  Nothing -> PipeStop
-  Just  a -> PipeNext a $ produce st p
-
-----------------------------------------------------------------------------------------------------
-
 -- | Functions like 'push', 'foreach', and 'pull' are good for simple @IO@ processes. But when your
 -- process becomes a little more complicated, it is better to define your @IO@ process in terms of
 -- an 'Engine', which manages input, output, an optional state, behind the scenes, allowing you to
@@ -275,6 +243,9 @@ instance Monad m => MonadPlus (Engine st input m) where
   mplus (Engine a) (Engine b) = Engine $
     a >>= \ a -> b >>= \ b -> return (mplus a b)
 
+instance Monad m => MonadState (EngineState st input m) (Engine st input m) where
+  state f = Engine $ state $ \ st0 -> let (a, st) = f st0 in (pure a, st)
+
 instance MonadTrans (Engine st input) where
   lift = Engine . lift . fmap return
 
@@ -294,6 +265,57 @@ instance (Monad m, Semigroup a) => Semigroup (Engine st input m a) where
 instance (Monad m, Monoid a) => Monoid (Engine st input m a) where
   mappend a b = mappend <$> a <*> b
   mempty      = return mempty
+
+-- | The 'runEngine' function can behave as both a 'Data.Foldable.foldl' function, and also an
+-- 'Data.List.unfoldr' function. Notice that the parameters to this function are very similar to the
+-- 'Data.Foldable.foldl' function, with:
+--
+-- 1. The folding function, expressed as a function of type 'Engine'
+--
+-- 2. The arbitrary folding value, in this case denoted as a value of variable type @st@.
+--
+-- 3. The traversable (list-like) value, in this case a 'Pipe'.
+--
+-- ...given in that order, just like 'Data.Foldable.foldl'.
+--
+-- 'Engine' Functions can also be defined to operate in a way similar to the 'Data.List.unfoldr'
+-- function, by defining a recursive function which updates the @st@ value, and deriving an @output@
+-- value from the @st@ after each update. The value of type @st@ can be accessed with the
+-- "Control.Monad.State" functions 'Control.Monad.State.get' and 'Control.Monad.State.put'.
+--
+-- This function also receives an input pipe which may be used or not.
+--
+-- The output of this function is a pipe that produces a result of type @output@ paired with the
+-- 'EngineState'. The engine state may safely be discarded if it is not needed, and so there is also
+-- an 'evalEngine' which does discard the resultant 'EngineState'.
+--
+-- There is also an 'execEngine' function which returns a pipe containing only the state value of
+-- type @st@. This can be useful if the 'Engine' function you have written is to behave as an
+-- 'unfold'-like function for which the type @output@ is unit @()@ but the state value @st@.
+runEngine
+  :: forall st input m output
+   . Monad m
+  => Engine st input m output -> st -> Pipe m input
+  -> m (Pipe m (output, EngineState st input m))
+runEngine f st input = loop init f where
+  init = EngineState{ theEngineInputPipe = input, theEngineStateValue = st }
+  loop st f = runStateT (unwrapEngine f) st >>= \ (a, st) -> return $ case a of
+    PipeStop        -> PipeStop
+    PipeFail msg    -> PipeFail msg
+    PipeNext a next -> (PipeNext (a, st) $ loop st $ Engine $ fmap join $ unwrapEngine next)
+
+-- | Like 'runEngine' but discards the 'EngineState', leaving a 'Pipe' with only the values of type
+-- @output@. Use this function when the intermediate state values of type @st@ are not important,
+-- and only the 'Pipe'ed @output@ is important.
+evalEngine :: Monad m => Engine st input m output -> st -> Pipe m input -> m (Pipe m output)
+evalEngine f st = fmap (fmap fst) . runEngine f st
+
+-- | Like 'runEngine' but discards the values of type @output@, returning a 'Pipe' containing every
+-- intermediate state value of type @st@. This can be useful if the 'Engine' function you have
+-- written is to behave as an 'unfold'-like function for which the type @output@ is unit @()@ but
+-- the state value @st@.
+execEngine :: Monad m => Engine st input m output -> st -> Pipe m input -> m (Pipe m st)
+execEngine f st = fmap (fmap (theEngineStateValue . snd)) . runEngine f st
 
 -- | You should never need to use this function.
 --
