@@ -330,12 +330,21 @@ execEngine f = fmap (fmap (theEngineStateValue . snd)) . runEngine f
 
 -- | This is a combinator to define a function of type 'Engine'. When this function is evaluated, it
 -- take a single value of type @input@ from the input stream that is piped to every 'Engine'
--- functino when it is evaluated by 'evalEngine'.
-input :: forall st input m . Monad m => Engine st input m input
+-- function when it is evaluated by 'evalEngine'.
+input :: Monad m => Engine st input m input
 input = Engine $ use engineInputPipe >>= lift >>= \ case
   PipeStop            -> return PipeStop
   PipeFail msg        -> return $ PipeFail msg
   PipeNext input next -> engineInputPipe .= next >> return (pure input)
+
+-- | This function is similar to 'pushList', but is specifically designed to evaluate within a
+-- function of type 'Engine'. As the name implies, this function is a counterpart to the 'input'
+-- function in that after the 'Engine' has been run with 'evalEngine', the elements evaluated by
+-- 'output' can be /piped/ to the 'input' of another function evaluated by 'evalEngine' using the
+-- monadic bind operator @'>>='@ as the piping operator, and whatever is 'ouput' by this function
+-- can be received on the other end by the 'input' function.
+output :: Monad m => [output] -> Engine st input m output
+output = pushList >=> Engine . return
 
 -- | You should never need to use this function.
 --
