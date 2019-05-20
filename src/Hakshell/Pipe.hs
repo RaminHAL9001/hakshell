@@ -30,7 +30,11 @@ import qualified Data.ByteString.UTF8  as UTF8
 
 type ErrMsg = UTF8.ByteString
 
--- | 'Pipe' is a data type used to approximate the behavior of UNIX pipes.
+-- | /"Ceci n'est pas un pipe."/
+--
+--   -- Rene Magrite
+--
+-- 'Pipe' is a data type used to approximate the behavior of UNIX pipes.
 --
 -- You use the 'pull' function to evaluate an 'Applicative' function of your choice on the content
 -- within the 'Pipe'. The 'Pipe' is a "Mealy Machine" data type, meaning when 'pull' is evaluated,
@@ -49,30 +53,33 @@ type ErrMsg = UTF8.ByteString
 --
 -- Construct a 'Pipe' using functions like 'push' and 'foreach'. Pipe is also a functor, so you can
 -- modify the type of @a@ by evaluating a function on it with 'fmap'. 'Pipe' is not an 'Applicative'
--- or a 'Monad', which makes it unlike a list. However like list, it does instantiate 'Semigroup'
--- and 'Monoid', so if you want to sequence items evaluated by 'pull' within a 'Pipe' you can use
--- the ('<>') operator to append more items onto the content stored within the 'Pipe'. For example:
+-- or a 'Monad', which makes it unlike a list. However like list, it does instantiate 'Alternative'
+-- and 'MonadPlus', so if you want to sequence items evaluated by 'pull' within a 'Pipe' you can use
+-- the ('<|>') operator to append more items onto the content stored within the 'Pipe'. For example:
 --
 -- @
--- return ('push' 1 <> 'push' 2 <> 'push' 3) >>= pull (print . (+ 3))
+-- return ('push' 1 <|> 'push' 2 <|> 'push' 3) >>= pull (print . (+ 3))
 -- @
 --
 -- The above will, for each 'push'ed element, add 3 and then print the result.
 --
--- Monoid/Semigroup appending is lazy, so you can append a 'PipeFail' value to a chain of
--- non-failing ''Pipe's and evaluate 'pull' such that 'pull' stops evaluating before the failure is
--- reached. This can be dnoe ifting a 'Control.Monad.Cont.ContT' and force the 'pull' evaluator to
--- halt:
+-- Monoid/Semigroup appending is simply lifts the 'mappend' or @('<>')@ operator into 'Pipe'
+-- constructor using 'Applicative'. As a consequence, performing 'mappend' om pipes with more than
+-- one element doesn't actually append, but computes the multiplicative of the elements. For actual
+-- list-like concatenation of the contents of pipes, use '<|>' instead. For example:
 --
 -- @
--- 'Control.Monad.Cont.runContT'
---     ('Control.Monad.Cont.callCC' $ \\ halt -> -- <- here we define the halt function
---         return ('push' 1 <> 'push' 2 <> PipeFail "error!") >>=
---             'pull' (\\ i -> if i > 1
---                       then halt () -- halt when we get to 2, 'PipeFail' will not be evaluated.
---                       else print (i + 3))
---     ) return -- <-- tell 'ContT' to simply 'return' the last value returned or passed to halt.
+-- ('push' "A" '<|>' 'push' "B" '<|>' 'push' "C") '<>' ('push' "X" <|> 'push' "Y" <|> 'push' "Z")
 -- @
+--
+-- ...would construct a 'Pipe' containing elements equivalent to:
+--
+-- @
+-- 'pipeList' ["AX", "AY", "AZ", "BX", "BY", "BZ", "CX", "CY", "CZ"]
+-- @
+--
+-- Notice that 'Semigroup'/'Monoid' concatenation is similar to arithmetic in how you would compute
+-- the expression @(a + b + c) * (x + y + z)@ using the distributive property of multiplication.
 data Pipe m a
   = PipeStop
   | PipeFail !ErrMsg
@@ -215,8 +222,8 @@ newtype Engine st input m a
 
 data EngineState st input m
   = EngineState
-    { theEngineInputPipe  :: !(Pipe m input)
-    , theEngineStateValue :: !st
+    { theEngineStateValue :: !st
+    , theEngineInputPipe  :: (m (Pipe m input))
     }
 
 instance Monad m => Applicative (Engine st input m) where
@@ -272,18 +279,23 @@ instance (Monad m, Monoid a) => Monoid (Engine st input m a) where
 --
 -- 1. The folding function, expressed as a function of type 'Engine'
 --
+-- And then the 'EngineState' value which contains:
+--
 -- 2. The arbitrary folding value, in this case denoted as a value of variable type @st@.
 --
 -- 3. The traversable (list-like) value, in this case a 'Pipe'.
 --
--- ...given in that order, just like 'Data.Foldable.foldl'.
+-- ...and parameters 1, 2, and 3 above, given in that order, is just like 'Data.Foldable.foldl'.
 --
 -- 'Engine' Functions can also be defined to operate in a way similar to the 'Data.List.unfoldr'
--- function, by defining a recursive function which updates the @st@ value, and deriving an @output@
--- value from the @st@ after each update. The value of type @st@ can be accessed with the
--- "Control.Monad.State" functions 'Control.Monad.State.get' and 'Control.Monad.State.put'.
+-- function, by defining a recursive function which updates the @st@ value and derives an @output@
+-- value from the @st@ after each update (the @output@ value may, at times, also be the same type as
+-- the @st@ value). The value of type @st@ can be accessed with the "Control.Monad.State" functions
+-- 'Control.Monad.State.get' and 'Control.Monad.State.put', yield an 'output' simply by 'return'ing
+-- it.
 --
--- This function also receives an input pipe which may be used or not.
+-- This function also receives an input pipe which may be used or not, and you can retrieve as many
+-- or as few pipe elements from the input as the algorithm you are writing requires.
 --
 -- The output of this function is a pipe that produces a result of type @output@ paired with the
 -- 'EngineState'. The engine state may safely be discarded if it is not needed, and so there is also
@@ -295,10 +307,9 @@ instance (Monad m, Monoid a) => Monoid (Engine st input m a) where
 runEngine
   :: forall st input m output
    . Monad m
-  => Engine st input m output -> st -> Pipe m input
+  => Engine st input m output -> EngineState st input m
   -> m (Pipe m (output, EngineState st input m))
-runEngine f st input = loop init f where
-  init = EngineState{ theEngineInputPipe = input, theEngineStateValue = st }
+runEngine f init = loop init f where
   loop st f = runStateT (unwrapEngine f) st >>= \ (a, st) -> return $ case a of
     PipeStop        -> PipeStop
     PipeFail msg    -> PipeFail msg
@@ -307,15 +318,24 @@ runEngine f st input = loop init f where
 -- | Like 'runEngine' but discards the 'EngineState', leaving a 'Pipe' with only the values of type
 -- @output@. Use this function when the intermediate state values of type @st@ are not important,
 -- and only the 'Pipe'ed @output@ is important.
-evalEngine :: Monad m => Engine st input m output -> st -> Pipe m input -> m (Pipe m output)
-evalEngine f st = fmap (fmap fst) . runEngine f st
+evalEngine :: Monad m => Engine st input m output -> EngineState st input m -> m (Pipe m output)
+evalEngine f = fmap (fmap fst) . runEngine f
 
 -- | Like 'runEngine' but discards the values of type @output@, returning a 'Pipe' containing every
 -- intermediate state value of type @st@. This can be useful if the 'Engine' function you have
 -- written is to behave as an 'unfold'-like function for which the type @output@ is unit @()@ but
 -- the state value @st@.
-execEngine :: Monad m => Engine st input m output -> st -> Pipe m input -> m (Pipe m st)
-execEngine f st = fmap (fmap (theEngineStateValue . snd)) . runEngine f st
+execEngine :: Monad m => Engine st input m output -> EngineState st input m -> m (Pipe m st)
+execEngine f = fmap (fmap (theEngineStateValue . snd)) . runEngine f
+
+-- | This is a combinator to define a function of type 'Engine'. When this function is evaluated, it
+-- take a single value of type @input@ from the input stream that is piped to every 'Engine'
+-- functino when it is evaluated by 'evalEngine'.
+input :: forall st input m . Monad m => Engine st input m input
+input = Engine $ use engineInputPipe >>= lift >>= \ case
+  PipeStop            -> return PipeStop
+  PipeFail msg        -> return $ PipeFail msg
+  PipeNext input next -> engineInputPipe .= next >> return (pure input)
 
 -- | You should never need to use this function.
 --
@@ -326,7 +346,7 @@ execEngine f st = fmap (fmap (theEngineStateValue . snd)) . runEngine f st
 -- function is defined as: @\\ elem -> 'Engine' ('engineInputPipe' '%=' 'PipeNext' elem . 'return')@
 --
 -- Again, just use the input combinators like 'input', 'collect', 'while', and 'putBackInput'.
-engineInputPipe :: Lens' (EngineState st input m) (Pipe m input)
+engineInputPipe :: Lens' (EngineState st input m) (m (Pipe m input))
 engineInputPipe = lens theEngineInputPipe $ \ a b -> a{ theEngineInputPipe = b }
 
 -- | You should never need to use this function.
