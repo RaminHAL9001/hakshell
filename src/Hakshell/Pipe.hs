@@ -346,6 +346,23 @@ input = Engine $ use engineInputPipe >>= lift >>= \ case
 output :: Monad m => [output] -> Engine st input m output
 output = pushList >=> Engine . return
 
+-- | This function serves as a form of 'Data.List.unfold'ing function. It works by evaluating a
+-- given 'Engine' function repeatedly in a recursive loop while collecting the @output@ from
+-- evaluation. The loop continues until 'empty' or 'mzero' is evaluated (which are identical
+-- functions in standard Haskell). The 'Data.List.unfold'ing comes from the fact that you can use
+-- the 'get', 'put', 'modify', and 'state' functions from the "Control.Monad.State" module to
+-- repeatedly update a stateful value from which your next @output@ value will derive.
+--
+-- Note that the given 'Engine' function which is to be looped must be evaluated at least one time
+-- so that the @output@ value can be inspected and a decision can be made as to whether the loop
+-- should continue, however if the first evaluation of 'while' is 'empty' then no 'output' is ever
+-- produced, so that first evaluation may not have any meaningful side-effects.
+while :: Monad m => Engine st input m output -> Engine st input m output
+while (Engine f) = Engine $ f >>= \ case
+  PipeStop        -> return PipeStop
+  PipeFail msg    -> return $ PipeFail msg
+  next@PipeNext{} -> unwrapEngine $ Engine (pure next) <|> while (Engine f)
+
 -- | You should never need to use this function.
 --
 -- This function used is internally to define the 'Engine' combinators which take elements from the
