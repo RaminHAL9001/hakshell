@@ -1390,20 +1390,20 @@ insertString str = liftEditText $ use (bufferLineBreaker . lineBreaker) >>= loop
         }
       clearCurrentLine
   loop = \ case
-    []          -> return ()
-    [(str, "")] -> writeStr str
-    line:more   -> do
+    []                 -> return ()
+    [(str,"")]         -> writeStr str
+    line@(_,lbrk):more -> do
       join $ editLine $ do
         vec  <- use lineEditBuffer
         cur  <- use charsAfterCursor
         tags <- use textCursorTags
         let len = UMVec.length vec
         if cur <= 0 then return $ pure () else do
-          cut <- liftIO $! UVec.unsafeFreeze $! UMVec.slice (len - cur - 1) cur vec
+          cut <- liftIO $! UVec.freeze $! UMVec.slice (len - cur - 1) cur vec
           --cut <- liftIO $ packSize cur <$> forM [len - cur - 1 .. len - 1] (UMVec.read vec)
           return $ do
             vec <- use bufferVector
-            linesBelowCursor += 1
+            unless (null lbrk) $ linesBelowCursor += 1
             cur <- use linesBelowCursor
             liftIO $ MVec.write vec (MVec.length vec - cur) $ TextLine
               { theTextLineString    = cut
