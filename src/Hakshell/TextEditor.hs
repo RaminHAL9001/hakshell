@@ -1372,7 +1372,7 @@ deleteCharsWrap (Relative (CharIndex n)) = liftEditText $ if n == 0 then return 
 insertString
   :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m)
   => String -> editor tags m ()
-insertString str = liftEditText $ use (bufferLineBreaker . lineBreaker) >>= loop . ($ str) where
+insertString str = liftEditText $ use (bufferLineBreaker . lineBreaker) >>= init . ($ str) where
   writeStr = mapM_ $ unsafeInsertChar Before
   writeLine (str, lbrk) = do
     writeStr str
@@ -1389,7 +1389,7 @@ insertString str = liftEditText $ use (bufferLineBreaker . lineBreaker) >>= loop
         , theTextLineBreakSize = fromIntegral $ length lbrk
         }
       clearCurrentLine
-  loop = \ case
+  init = \ case
     []                 -> return ()
     [(str,"")]         -> writeStr str
     line@(_,lbrk):more -> do
@@ -1412,6 +1412,10 @@ insertString str = liftEditText $ use (bufferLineBreaker . lineBreaker) >>= loop
               }
       writeLine line
       loop more
+  loop = \ case
+    []         -> return ()
+    [(str,"")] -> writeStr str
+    line:more  -> writeLine line >> loop more
 
 -- Not for export: this code shared by 'forLinesInRange' and 'forLines' but requires knowledge of
 -- the 'TextBuffer' internals in order to use, so is not something end users should need to know
