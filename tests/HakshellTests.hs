@@ -79,9 +79,9 @@ textViewTests = do
         report $ "view "++showLoc a++"->"++showLoc b++"\n"
         v <- textView a b buf
         debugPrintView v
-  reportView (mkLoc  3 24) (mkLoc  6 25)
-  reportView (mkLoc 14  1) (mkLoc 16 48)
-  reportView (mkLoc  1  1) (mkLoc  3 48)
+  reportView (mkLoc  3 25) (mkLoc  6 24)
+  reportView (mkLoc 14  1) (mkLoc 16 49)
+  reportView (mkLoc  1  1) (mkLoc  3 49)
   reportView (mkLoc  1 12) (mkLoc  1 28)
   reportView (mkLoc  1 12) (mkLoc  9 28)
   report "Move cursor to start of buffer...\n"

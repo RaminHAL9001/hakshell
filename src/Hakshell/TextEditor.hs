@@ -167,8 +167,6 @@ import qualified Data.Vector.Generic.Mutable as GMVec
 import qualified Data.Vector.Unboxed.Mutable as UMVec
 import           Data.Word
 
-import Debug.Trace
-
 ----------------------------------------------------------------------------------------------------
 
 -- Programmer notes:
@@ -821,9 +819,9 @@ bufferDefaultTags :: Lens' (TextBufferState tags) tags
 bufferDefaultTags = bufferDefaultLine . textLineTags
 
 -- | The function used to break strings into lines. This function is called every time a string is
--- transferred from 'theBufferCursor' to 'theLinesAbove' or 'theLinesBelow'. Note that setting this
--- function doesn't restructure the buffer, the old line breaks will still exist as they were before
--- until the entire buffer is refreshed.
+-- transferred from 'theBufferCursor' to 'theCursorLineIndex' or 'theLinesBelow'. Note that setting
+-- this function doesn't restructure the buffer, the old line breaks will still exist as they were
+-- before until the entire buffer is refreshed.
 --
 -- If you choose to use your own 'LineBreaker' function, be sure that the function obeys this law:
 --
@@ -1021,7 +1019,6 @@ unsafePopLine :: MonadIO m => RelativeToCursor -> EditText tags m (TextLine tags
 unsafePopLine rel = do
   vec <- use bufferVector
   i   <- cursorIndex rel
-  traceM $ "unsafePopLine "++show i
   nil <- use bufferDefaultLine
   liftIO (MVec.read vec i <* MVec.write vec i nil) <*
     ((case rel of{ Before -> cursorLineIndex; After -> linesBelowCursor; }) -= 1)
@@ -1199,8 +1196,8 @@ resetCurrentLine = liftEditText $
 shiftElems
   :: (GMVec.MVector vector a, PrimMonad m)
   => a -> vector (PrimState m) a -> Int -> Int -> Int -> m (Int, Int)
-shiftElems nil vec select' before after = trace ("shiftElems select="++show select++" before="++show before++" after="++show after) $
-  if select == 0 then trace "noop" noop
+shiftElems nil vec select' before after =
+  if select == 0 then noop
   else if select > 0
   then if after  <= 0 then noop else
        if select ==   1  then moveSingle before (len - after) else moveBlock
@@ -1215,24 +1212,18 @@ shiftElems nil vec select' before after = trace ("shiftElems select="++show sele
     len    = GMVec.length vec
     slice  = if unsafeMode then GMVec.unsafeSlice else GMVec.slice
     (toSlice, fromSlice) =
-      if select > 0 then
-        ( trace ("toSlice -> slice "++show before++' ':show select) $
-          slice before select vec
-        , trace ("fromSlice -> slice "++show (len - after)++' ':show select) $
-          slice (len - after) select vec
-        )
+      if select > 0
+      then (slice before select vec, slice (len - after) select vec)
       else if select < 0 then
-        ( trace ("toSlice -> slice "++show (len - after + select)++' ':show (negate select)) $
-          slice (len - after + select) (negate select) vec
-        , trace ("fromSlice -> slice "++show (before + select)++' ':show (negate select)) $
-          slice (before + select) (negate select) vec
+        ( slice (len - after + select) (negate select) vec
+        , slice (before + select) (negate select) vec
         )
       else error $ "shiftElems: select="++show select++", this should never happen"
     clear slice = forM_ [0 .. GMVec.length slice - 1] $ flip (GMVec.write slice) nil
     done = return (before + select, after - select)
-    moveSingle to from = trace ("moveSingle to="++show to++" from="++show from) $
+    moveSingle to from =
       GMVec.read vec from >>= GMVec.write vec to >> GMVec.write vec from nil >> done
-    moveBlock = trace ("GMVec.move toSlice fromSlice") $
+    moveBlock = 
       GMVec.move toSlice fromSlice >> clear fromSlice >> done
 
 -- | This function calls 'moveByLine' and then 'moveByChar' to move the cursor by a number of lines
@@ -1249,7 +1240,6 @@ moveByLine
   :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m)
   => Relative LineIndex -> editor tags m ()
 moveByLine (Relative (LineIndex select)) = liftEditText $ do
-  traceM $ "moveByLine " ++ show select
   vec <- use bufferVector
   (before, after) <- (,) <$> use cursorLineIndex <*> use linesBelowCursor
   (before, after) <- liftIO $ shiftElems TextLineUndefined vec select before after
@@ -1263,7 +1253,6 @@ moveByChar
   :: (MonadEditLine editor, MonadIO (editor tags m), MonadIO m)
   => Relative CharIndex -> editor tags m ()
 moveByChar (Relative (CharIndex select)) = liftEditLine $ do
-  traceM $ "moveByChar " ++ show select
   after  <- use charsAfterCursor
   lbrksz <- use cursorBreakSize
   select <- pure $ if select <= 0 then select else min select $ max 0 (after - fromIntegral lbrksz)
@@ -1458,11 +1447,7 @@ forLinesInRange
   -> EditText tags m fold
 forLinesInRange absFrom@(Absolute (LineIndex from)) (Absolute (LineIndex to)) fold f = do
   endInsertMode Before
-  (before, after) <- (,) <$> use cursorLineIndex <*> use linesBelowCursor -- DEBUG
-  traceM $ "forLinesInRange{before="++show before++",after="++show after++"}: gotoLine "++show from -- DEBUG
   gotoLine absFrom
-  (before, after) <- (,) <$> use cursorLineIndex <*> use linesBelowCursor -- DEBUG
-  traceM $ "forLinesInRange{before="++show before++",after="++show after++"}" -- DEBUG
   lineCount <- (+) <$> use cursorLineIndex <*> use linesBelowCursor
   let dist = to - from
   forLinesLoop fold f (min lineCount . max 1 $ abs dist) $ if dist < 0
@@ -1666,6 +1651,9 @@ textViewAppend appendTags
           )
     }
 
+reorder :: Ord a => a -> a -> (a, a)
+reorder a b = (min a b, max a b)
+
 -- | Create a 'TextView' from the content of a 'TextBuffer' in the given range delimited by the two
 -- given 'TextLocation' values.
 --
@@ -1677,54 +1665,52 @@ textView
   => TextLocation -> TextLocation
   -> TextBuffer tags -> m (TextView tags)
 textView from0 to0 (TextBuffer mvar) = liftIO $ withMVar mvar $ \ st -> do
-  let (from, to) = (min from0 to0, max from0 to0)
-  let fromLine0 = theLocationLineIndex from
-  let toLine0   = theLocationLineIndex to
-  let oldBuf    = theBufferVector      st
-  let above     = theCursorLineIndex   st
-  let below     = theLinesBelowCursor  st
+  let (from, to) = reorder from0 to0
+  let (Absolute (LineIndex fromLine0)) = theLocationLineIndex from
+  let (Absolute (LineIndex toLine0))   = theLocationLineIndex to
+  let (Absolute (CharIndex fromChar0)) = theLocationCharIndex from
+  let (Absolute (CharIndex toChar0))   = theLocationCharIndex to
+  let oldBuf    = theBufferVector     st
+  let above     = theCursorLineIndex  st
+  let below     = theLinesBelowCursor st
   let lineCount = above + below
   let upper     = MVec.length oldBuf - below
-  let limit     = max (Absolute $ LineIndex 1) . min (Absolute $ LineIndex $ lineCount + 1)
-  (Absolute (LineIndex fromLine0), Absolute (LineIndex toLine0)) <- pure
-    (limit $ min fromLine0 toLine0, limit $ max fromLine0 toLine0)
-  let (fromLine, toLine) = (fromLine0 - 1, toLine0 - 1)
-  let newLen = toLine - fromLine + 1
-  let copy   = if unsafeMode then MVec.unsafeCopy  else MVec.copy
-  let slice  = if unsafeMode then MVec.unsafeSlice else MVec.slice
-  if lineCount == 0
-   then return (TextView{ textViewCharCount = 0, textViewVector = Vec.empty })
+  let limit top = max 0 . min top . subtract 1
+  let fromLine  = limit lineCount fromLine0
+  let toLine    = limit lineCount toLine0
+  let newLen    = toLine - fromLine + 1
+  let copy      = if unsafeMode then MVec.unsafeCopy  else MVec.copy
+  let slice     = if unsafeMode then MVec.unsafeSlice else MVec.slice
+  if lineCount < 0
+   then error $ "textView: (lineCount="++show lineCount++") < 0, this should never happen"
    else do
     newBuf <- MVec.new newLen
     if fromLine == toLine
      then MVec.write newBuf 0 =<<
           MVec.read oldBuf (if fromLine < above then fromLine else upper - above + fromLine)
-     else if fromLine <= above && toLine <= above
+     else if fromLine < above && toLine <  above
      then copy newBuf (slice fromLine newLen oldBuf)
-     else if fromLine > above && toLine > above
-     then copy newBuf (slice (upper - above + fromLine - 1) newLen oldBuf)
-     else if fromLine <= above && toLine > above
+     else if fromLine >= above && toLine >= above
+     then copy newBuf (slice (upper - above + fromLine) newLen oldBuf)
+     else if fromLine < above && toLine >= above
      then do
-       let aboveLen = above - fromLine + 1
+       let aboveLen = above - fromLine
        copy (slice 0 aboveLen newBuf) (slice fromLine aboveLen oldBuf)
-       let belowLen = toLine - above
+       let belowLen = toLine - above + 1
        copy (slice aboveLen belowLen newBuf) (slice upper belowLen oldBuf)
-     else error "textViewOnLines: this should never happen"
-    let (Absolute (CharIndex fromChar0), Absolute (CharIndex toChar0)) =
-          (theLocationCharIndex from, theLocationCharIndex to)
+     else error "textView: this should never happen"
     let trim idx slice = MVec.read newBuf idx >>= \ case
-          TextLineUndefined -> traceM $ "newBuf["++show idx++"] is undefined"
+          TextLineUndefined -> error $ "newBuf["++show idx++"] is undefined"
           line              -> do
             let vec = theTextLineString line
             let len = UVec.length vec
-            let lim = max 0 . min (len - 1)
-            let (fromChar, toChar) = (lim fromChar0, lim toChar0)
+            let (fromChar, toChar) = (limit (len - 1) fromChar0, limit (len - 1) toChar0)
             MVec.write newBuf idx $ line
               { theTextLineString =
                   UVec.force $ uncurry UVec.slice (slice len fromChar toChar) vec
               }
     if fromLine == toLine
-      then trim 0 $ \ _len from to -> (from, to - from)
+      then trim 0 $ \ _len from to -> (min from to, abs $ to - from)
       else do
         trim 0 $ \ len from _to -> (from, len - from)
         trim (newLen - 1) $ \ _len _from to -> (0, to)
