@@ -1710,10 +1710,10 @@ textView from0 to0 (TextBuffer mvar) = liftIO $ withMVar mvar $ \ st -> do
                   UVec.force $ uncurry UVec.slice (slice len fromChar toChar) vec
               }
     if fromLine == toLine
-      then trim 0 $ \ _len from to -> (min from to, abs $ to - from)
+      then trim 0 $ \ _len from to -> (min from to, abs (to - from) + 1)
       else do
         trim 0 $ \ len from _to -> (from, len - from)
-        trim (newLen - 1) $ \ _len _from to -> (0, to)
+        trim (newLen - 1) $ \ _len _from to -> (0, to + 1)
     newBuf <- Vec.unsafeFreeze newBuf
     return TextView
       { textViewCharCount = sum $ Vec.toList newBuf >>= \ case
