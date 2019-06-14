@@ -10,8 +10,8 @@ import           Control.Monad.IO.Class
 main :: IO ()
 main = do
   begin
-  basicTests
   textViewTests
+  basicTests
 
 begin :: IO ()
 begin = putStrLn "\n-------------------------\nBegin HakshellTest Log\n-------------------------\n"
@@ -56,12 +56,19 @@ basicTests = do
         report $ "Move cursor "++msg++", line="++show line++" col="++show col++" ...\n"
         gotoCursor $ mkLoc line col
         debugPrintBuffer
+  let reportDelete msg n = testTextEditor error buf $ do
+        report $ "Delete on "++msg++", "++show n++" characters...\n"
+        deleteCharsWrap $ Relative $ CharIndex n
+        debugPrintBuffer
   reportInsert "one two three\n"
   reportInsert "four five six\nseven eight nine\nten eleven twelve\n"
   reportMove        "up" 1  1
   reportMove      "down" 4 16
   reportMove "to middle" 2  7
+  reportDelete "same line" (-4)
+  reportDelete "to \"three\" on previous line" (-8)
   report "OK\n"
+  
 
 textViewTests :: IO ()
 textViewTests = do

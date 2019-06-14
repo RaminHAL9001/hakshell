@@ -616,16 +616,24 @@ emptyTextLine tags = TextLine
   , theTextLineBreakSize = 0
   }
 
--- | Evaluates to 'True' if the 'TextLine' is empty.
+-- | Evaluates to 'True' if the 'TextLine' is empty. Undefined lines also evaluate to 'True'. (Use
+-- 'textLineIsUndefined' to test if the line is undefined.) If the line is empty and not undefined,
+-- the given predicate is evaluated on the 'textLineTags' value, and this predicate's result
+-- determines whether the line is null.
 nullTextLine :: (tags -> Bool) -> TextLine tags -> Bool
-nullTextLine nullTags line = UVec.null (theTextLineString line) && nullTags (theTextLineTags line)
+nullTextLine nullTags = \ case
+  TextLineUndefined -> True
+  line              ->
+    if UVec.null (theTextLineString line) then nullTags (theTextLineTags line) else False
 
 -- | Cut a line at some index, keeping the characters 'Before' or 'After' the index.
 sliceLineToEnd :: RelativeToCursor -> Absolute CharIndex -> TextLine tags -> TextLine tags
-sliceLineToEnd rel (Absolute (CharIndex n)) = textLineString %~ \ vec ->
-  let len = UVec.length vec in case rel of
-    Before -> UVec.slice  0 (len - n) vec
-    After  -> UVec.slice (len - n) n  vec
+sliceLineToEnd rel (Absolute (CharIndex n)) = \ case
+  TextLineUndefined -> TextLineUndefined
+  line              -> line & textLineString %~ \ vec ->
+    let len = UVec.length vec in case rel of
+      Before -> UVec.slice  0 (len - n) vec
+      After  -> UVec.slice (len - n) n  vec
 
 -- | Evaluates toe True if the 'TextLine' is undefined. An undefined 'TextLine' is different from an
 -- empty string, it is similar to the 'Prelude.Nothing' constructor.
@@ -645,8 +653,16 @@ data TextCursor tags
     }
   deriving Functor
 
-instance IntSized (TextLine tags) where { intSize = UVec.length . theTextLineString; }
-instance Unpackable (TextLine tags) where { unpack = UVec.toList . theTextLineString; }
+instance IntSized (TextLine tags) where
+  intSize = \ case
+    TextLineUndefined               -> 0
+    TextLine{theTextLineString=str} -> UVec.length str
+
+instance Unpackable (TextLine tags) where
+  unpack = \ case
+    TextLineUndefined               -> ""
+    TextLine{theTextLineString=str} -> UVec.toList str
+
 instance Show tags => Show (TextLine tags) where
   show = \ case
     TextLineUndefined -> "(null)"
@@ -1153,22 +1169,24 @@ endInsertMode rel = liftEditText $ do
 replaceCurrentLine
   :: (MonadEditLine editor, MonadIO (editor tags m), MonadIO m)
   => Absolute CharIndex -> TextLine tags -> editor tags m ()
-replaceCurrentLine (Absolute (CharIndex cur)) line = liftEditLine $ do
-  let srcvec = line ^. textLineString
-  let srclen = intSize srcvec
-  cur <- pure $ max 0 $ min (cur - 1) srclen
-  targvec <- use lineEditBuffer
-  let targlen = UMVec.length targvec
-  targvec <- if targlen >= srclen then return targvec else liftIO $
-    UMVec.new $ head $ dropWhile (< srclen) $ iterate (* 2) targlen
-  let targlen = UMVec.length targvec
-  charsBeforeCursor .= cur
-  charsAfterCursor  .= srclen - cur
-  textCursorTags    .= line ^. textLineTags
-  liftIO $ do
-    let copy = mapM_ $ UMVec.write targvec *** (srcvec UVec.!) >>> app
-    copy $ (id &&& id) <$> [0 .. cur - 1]
-    copy $ zip [targlen - cur - 1 .. targlen - 1] [srclen - cur - 1 .. srclen - 1]
+replaceCurrentLine (Absolute (CharIndex cur)) = \ case
+  TextLineUndefined -> return ()
+  line              -> liftEditLine $ do
+    let srcvec = line ^. textLineString
+    let srclen = intSize srcvec
+    cur <- pure $ max 0 $ min (cur - 1) srclen
+    targvec <- use lineEditBuffer
+    let targlen = UMVec.length targvec
+    targvec <- if targlen >= srclen then return targvec else liftIO $
+      UMVec.new $ head $ dropWhile (< srclen) $ iterate (* 2) targlen
+    let targlen = UMVec.length targvec
+    charsBeforeCursor .= cur
+    charsAfterCursor  .= srclen - cur
+    textCursorTags    .= line ^. textLineTags
+    liftIO $ do
+      let copy = mapM_ $ UMVec.write targvec *** (srcvec UVec.!) >>> app
+      copy $ (id &&& id) <$> [0 .. cur - 1]
+      copy $ zip [targlen - cur - 1 .. targlen - 1] [srclen - cur - 1 .. srclen - 1]
 
 -- | Delete the content of the 'bufferCurrentLine'. This function does not change the memory
 -- allocation for the 'TextCursor', it simply sets the character count to zero. Tags on this line
@@ -1338,22 +1356,38 @@ deleteChars (Relative (CharIndex n)) = liftEditLine $
 deleteCharsWrap
   :: forall editor tags m . (MonadEditText editor, MonadIO (editor tags m), MonadIO m)
   => Relative CharIndex -> editor tags m ()
-deleteCharsWrap (Relative (CharIndex n)) = liftEditText $ if n == 0 then return () else do
-  (push, rel) <- pure $ if n > 0 then (Before, After) else (After, Before)
-  let cutLine = sliceLineToEnd rel . Absolute . CharIndex
-  let insAdjust charsLens = let cursor = bufferCurrentLine . charsLens in
-        ( state $ \ st -> let count = st ^. cl cursor in
-            if n < count
-            then (0, st & cl cursor .~ count - n)
-            else (n - count, st & cl cursor .~ 0)
-        ) <* endInsertMode push
-  insMode <- use bufferInsertMode
-  n <- if not insMode then return n else case rel of
-    Before -> insAdjust charsBeforeCursor
-    After  -> insAdjust charsAfterCursor
-  void $ forLines rel n $ \ halt line -> get >>= \ n -> if n <= 0 then halt n else do
-    let len = UVec.length $ line ^. textLineString
-    state $ const $ if len < n then ([], n - len) else ([cutLine n line], 0)
+deleteCharsWrap (Relative (CharIndex remaining)) = liftEditText $
+  if remaining == 0 then return () else do
+    (push, rel, remaining) <- pure $
+      if remaining > 0
+      then (Before, After, remaining)
+      else (After, Before, negate remaining)
+    let cutLine = sliceLineToEnd rel . Absolute . CharIndex
+    let insAdjust charsLens = let cursor = bufferCurrentLine . charsLens in
+          ( state $ \ st -> let count = st ^. cl cursor in
+              if remaining < count
+              then (0, st & cl cursor .~ count - remaining)
+              else (remaining - count, st & cl cursor .~ 0)
+          ) <* endInsertMode push
+    -- If we are in insert mode, delete characters in the current cursor, then cancel insert mode.
+    -- The number of characters deleted is returned.
+    insMode   <- use bufferInsertMode
+    remaining <- if not insMode then return remaining else case rel of
+      Before -> insAdjust charsBeforeCursor
+      After  -> insAdjust charsAfterCursor
+    -- Now alter each line of text going to the start (or end) of the buffer counting how many
+    -- characters are being deleted, use the continuation 'halt' function to when the count of the
+    -- characters deleted equals the requested number 'remaining'.
+    void $ forLines rel remaining $ \ halt -> \ case
+      TextLineUndefined -> do
+        remaining <- get
+        error $ "undefined line, remaining charactes = " ++ show remaining
+      line -> get >>= \ remaining -> if remaining <= 0 then halt remaining else do
+        let len = UVec.length $ line ^. textLineString
+        state $ const $
+          if len < remaining
+          then ([], remaining - len)
+          else ([cutLine remaining line], 0)
 
 -- | This function evaluates the 'lineBreaker' function on the given string, and beginning from the
 -- current cursor position, begins inserting all the lines of text produced by the 'lineBreaker'
@@ -1636,7 +1670,13 @@ textViewAppend appendTags
               let firstB = vecB Vec.! 0
               let lenAB  = lenA + lenB
               let lineAB = TextLine
-                    { theTextLineString = theTextLineString lastA <> theTextLineString firstB
+                    { theTextLineString = case lastA of
+                        TextLineUndefined -> case firstB of
+                          TextLineUndefined -> mempty
+                          firstB            -> theTextLineString firstB
+                        lastA             -> case firstB of
+                          TextLineUndefined -> theTextLineString lastA
+                          firstB            -> theTextLineString lastA <> theTextLineString firstB
                     , theTextLineTags = appendTags (theTextLineTags lastA) (theTextLineTags firstB)
                     , theTextLineBreakSize = theTextLineBreakSize firstB
                     }
