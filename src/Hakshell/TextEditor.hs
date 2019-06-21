@@ -159,6 +159,7 @@ import           Control.Monad.Primitive
 import           Control.Monad.State
 import           Control.Monad.State.Class
 
+import           Data.Maybe                  (isNothing)
 import           Data.Semigroup
 import qualified Data.Vector                 as Vec
 import qualified Data.Vector.Mutable         as MVec
@@ -581,8 +582,9 @@ data TextBufferState tags
 
 data TextEditError
   = TextEditError !StrictBytes
-  | BottomOfBuffer
+  | EndOfBuffer RelativeToCursor
   | LineIndexOutOfRange !(Absolute LineIndex)
+  | LineCountOutOfRange !(Relative LineIndex)
   deriving (Eq, Ord)
 
 -- | A pair of functions used to break strings into lines. This function is called every time a
@@ -934,13 +936,17 @@ bufLine0 = return 0
 bufCurIndex :: Monad m => EditText tags m Int
 bufCurIndex = gets theCursorLineIndex
 
+-- The vector of the text buffer.
+bufVector :: Monad m => EditText tags m (MVec.IOVector (TextLine tags))
+bufVector = gets theBufferVector
+
 -- The number of valid lines after the cursor.
 bufAboveCur :: Monad m => EditText tags m Int
 bufAboveCur = gets theLinesBelowCursor
 
 -- The size of the buffer allocation
 bufAllocSize :: Monad m => EditText tags m Int
-bufAllocSize = gets $ MVec.length . theBufferVector
+bufAllocSize = MVec.length <$> bufVector
 
 -- The number of valid lines in the buffer @(bufCurIndex + bufferLinesBelowCursor)@.
 bufLineCount :: Monad m => EditText tags m Int
@@ -955,52 +961,143 @@ bufTopIndex :: Monad m => EditText tags m Int
 bufTopIndex = subtract 1 <$> bufAllocSize
 
 -- The index of the top-most valid line, which may not exist.
-bufTopLineM :: Monad m => EditText tags m (Maybe Int)
+bufTopLineM :: Monad m => EditText tagss m (Maybe Int)
 bufTopLineM = do
   i <- gets theLinesBelowCursor
   if i <= 0 then return Nothing else Just <$> bufTopIndex
 
--- Like 'bufTopLineM', but if 'bufTopLineM' returns 'Nothing' a 'BottomOfBuffer' exception is
+-- Like 'bufTopLineM', but if 'bufTopLineM' returns 'Nothing' a 'EndOfBuffer' exception is
 -- raised.
-bufTopLine :: Monad m => EditText tags m Int
-bufTopLine = bufTopLineM >>= maybe (throwError BottomOfBuffer) return
+bufTopLine :: Monad m => EditText tagss m Int
+bufTopLine = bufTopLineM >>= maybe (throwError $ EndOfBuffer After) return
 
 -- Gets the index of the first valid line after the cursor, returns 'Nothing' if at the bottom of
 -- the buffer.
-bufLineAfterCurM :: Monad m => EditText tags m (Maybe Int)
+bufLineAfterCurM :: Monad m => EditText tagss m (Maybe Int)
 bufLineAfterCurM = do
   i <- gets theLinesBelowCursor
   if i <= 0 then return Nothing else Just . subtract i <$> bufAllocSize
 
--- Like 'bufLineAfterCurM', but if 'bufLineAfterCurM' returns 'Nothing' a 'BottomOfBuffer' exception
+-- Like 'bufLineAfterCurM', but if 'bufLineAfterCurM' returns 'Nothing' a 'EndOfBuffer' exception
 -- is raised.
-bufLineAfterCur :: Monad m => EditText tag m Int
-bufLineAfterCur = bufLineAfterCurM >>= maybe (throwError BottomOfBuffer) return
+bufLineAfterCur :: Monad m => EditText tags m Int
+bufLineAfterCur = bufLineAfterCurM >>= maybe (throwError $ EndOfBuffer After) return
 
 -- Get the index within the vector that is associated with the given 'LineIndex'.
-bufAbsoluteM :: Monad m => Absolute LineIndex -> EditText tag m (Maybe Int)
+bufAbsoluteM :: Monad m => Absolute LineIndex -> EditText tags m (Maybe Int)
 bufAbsoluteM (Absolute (LineIndex i)) = do
   i   <- pure $ i - 1 -- LineIndex values begin counting at 1, so line index 1 maps to vector index 0
   siz <- bufAllocSize
   cur <- bufCurIndex
   if not $ 0 <= i && i < siz
-    then return Nothing
-    else if i <= cur
-    then return $ Just i
-    else Just . (+ i) <$> bufUnusedSpace
+   then return Nothing
+   else if i <= cur
+   then return $ Just i
+   else Just . (+ i) <$> bufUnusedSpace
 
 -- Like 'bufAbsoluteM', but if 'bufAbsoluteM' returns 'Nothing' a 'LineIndexOutOfRange' exception is
 -- raised.
-bufAbsolute :: Monad m => Absolute LineIndex -> EditText tag m Int
+bufAbsolute :: Monad m => Absolute LineIndex -> EditText tags m Int
 bufAbsolute i = bufAbsoluteM i >>= maybe (throwError $ LineIndexOutOfRange i) return
 
 -- Convert a @('Relative' 'LineIndex')@ to an @('Absolute' 'LineIndex')@.
-bufRelToAbs :: Monad m => Relative LineIndex -> EditText tag m (Absolute LineIndex)
+bufRelToAbs :: Monad m => Relative LineIndex -> EditText tags m (Absolute LineIndex)
 bufRelToAbs (Relative (LineIndex i)) = Absolute . LineIndex . succ . (+ i) <$> bufCurIndex
 
--- | Force an @('Absolute' 'LineIndex')@ to be in bounds.
-bufForceInBounds :: Monad m => Absolute LineIndex -> EditText tag m (Absolute LineIndex)
+-- Force an @('Absolute' 'LineIndex')@ to be in bounds.
+bufForceInBounds :: Monad m => Absolute LineIndex -> EditText tags m (Absolute LineIndex)
 bufForceInBounds = (<*>) (((max 1) .) . min . Absolute . LineIndex <$> bufAllocSize) . pure
+
+-- Return the region of elements that are undefined.
+bufVoid :: Monad m => EditText tags m (Maybe (Int, Int))
+bufVoid = do
+  siz <- bufTopIndex
+  cur <- bufCurIndex
+  aft <- bufAboveCur
+  return $ if cur + aft + 1 >= siz then Nothing else Just
+    (cur + 1, siz - aft - 1)
+
+-- True if there are no undefined text line elements in the buffer.
+bufIsFull :: Monad m => EditText tags m Bool
+bufIsFull = isNothing <$> bufVoid
+
+-- Make a slice of elements before or after the cursor. If the line index goes out of bounds,
+-- 'Nothing' is returned.
+bufSliceM
+  :: Monad m
+  => Relative LineIndex
+  -> EditText tags m (Maybe (MVec.IOVector (TextLine tags)))
+bufSliceM (Relative (LineIndex count)) = do
+  vec <- gets theBufferVector
+  if count < 0
+   then do
+    i <- (+ count) <$> bufCurIndex
+    return $ if i < 0 then Nothing else Just $ MVec.slice i (abs count) vec
+   else if count > 0
+   then do
+    i   <- fmap (+ count) <$> bufLineAfterCurM
+    top <- bufTopLineM
+    return $ case (,) <$> i <*> top of
+      Nothing       -> Nothing
+      Just (i, top) -> if i > top then Nothing else Just $ MVec.slice i count vec
+   else return $ Just $ MVec.slice 0 0 vec
+
+-- Like 'bufSliceM', but if 'bufSliceM' returns 'Nothing' a 'LineCountOutOfRange' exception is
+-- raised.
+bufSlice
+  :: Monad m
+  => Relative LineIndex
+  -> EditText tags m (MVec.IOVector (TextLine tags))
+bufSlice count = bufSliceM count >>= maybe (throwError $ LineCountOutOfRange count) return
+
+-- Make a slice within the contiguous region of invalid elements after the cursor. This can be used
+-- as the target of a vector copy.
+bufVoidSliceM
+  :: Monad m
+  => Relative LineIndex
+  -> EditText tags m (Maybe (MVec.IOVector (TextLine tags)))
+bufVoidSliceM (Relative (LineIndex count)) = do
+  vec <- gets theBufferVector
+  vsp <- bufVoid
+  return $ vsp <&> \ (lo, hi) ->
+   if count < 0
+   then MVec.slice (hi + count) (abs count) vec
+   else if count > 0
+   then MVec.slice lo count vec
+   else MVec.slice 0 0 vec
+
+-- Like 'bufVoidSliceM', but if 'bufVoidSliceM' returns 'Nothing' a 'LineCountOutOfRange' exception
+-- is raised.
+bufVoidSlice :: Monad m => Relative LineIndex -> EditText tags m (MVec.IOVector (TextLine tags))
+bufVoidSlice count = bufVoidSliceM count >>= maybe (throwError $ LineCountOutOfRange count) return
+
+-- Copy a single line before/on or after the cursor.
+bufCopy1M :: MonadIO m => RelativeToCursor -> EditText tags m (Maybe (TextLine tags))
+bufCopy1M = \ case
+  Before -> MVec.read <$> bufVector <*> bufCurIndex >>= fmap Just . liftIO
+  After  -> bufTopLineM >>= \ case
+    Nothing  -> return Nothing
+    Just top -> MVec.read <$> bufVector <*> pure top >>= fmap Just . liftIO
+
+-- Like 'bufCopy1M', but if 'bufCopy1M' returns 'Nothing' an 'EndOfBuffer' exception is raised.
+bufCopy1 :: MonadIO m => RelativeToCursor -> EditText tags m (TextLine tags)
+bufCopy1 rel = bufCopy1M rel >>= maybe (throwError $ EndOfBuffer rel) return
+
+-- Delete a single line before/on or after the cursor.
+bufDel1M :: MonadIO m => RelativeToCursor -> EditText tags m (Maybe ())
+bufDel1M rel = let undef = pure TextLineUndefined in case rel of
+  Before -> do
+    i <- bufCurIndex
+    if i <= 0 then return Nothing else Just <$>
+      (MVec.write <$> bufVector <*> bufCurIndex <*> undef >>= liftIO)
+  After  -> bufTopLineM >>= \ case
+    Nothing  -> return Nothing
+    Just top -> if top <= 0 then return Nothing else Just <$>
+        (MVec.write <$> bufVector <*> pure top <*> undef >>= liftIO)
+
+-- Like 'bufDel1M' but if 'bufDel1M' returns 'Nothing' an 'EndOFBuffer' exception is raised.
+bufDel1 :: MonadIO m => RelativeToCursor -> EditText tags m ()
+bufDel1 rel = bufDel1M rel >>= maybe (throwError $ EndOfBuffer rel) return
 
 ----------------------------------------------------------------------------------------------------
 
