@@ -581,6 +581,8 @@ data TextBufferState tags
 
 data TextEditError
   = TextEditError !StrictBytes
+  | BottomOfBuffer
+  | LineIndexOutOfRange !(Absolute LineIndex)
   deriving (Eq, Ord)
 
 -- | A pair of functions used to break strings into lines. This function is called every time a
@@ -917,6 +919,91 @@ textLineTags = lens theTextLineTags $ \ a b -> a{ theTextLineTags = b }
 
 ----------------------------------------------------------------------------------------------------
 
+-- Line indexing arithmetic
+--
+-- I think of these functions as being similar to named environment variables in that you can use
+-- these names to have meaningful symbols for certain vector indicies. This makes code involving
+-- ranges of lines, and code involving translating user-facing @('Absolute' 'LineIndex')@ values to
+-- simplliied arithmetic expressions that I consuder to be more human readable.
+
+-- Convenient zero value
+bufLine0 :: Monad m => EditText tags m Int
+bufLine0 = return 0
+
+-- The current value of 'theCursorLineIndex'.
+bufCurIndex :: Monad m => EditText tags m Int
+bufCurIndex = gets theCursorLineIndex
+
+-- The number of valid lines after the cursor.
+bufAboveCur :: Monad m => EditText tags m Int
+bufAboveCur = gets theLinesBelowCursor
+
+-- The size of the buffer allocation
+bufAllocSize :: Monad m => EditText tags m Int
+bufAllocSize = gets $ MVec.length . theBufferVector
+
+-- The number of valid lines in the buffer @(bufCurIndex + bufferLinesBelowCursor)@.
+bufLineCount :: Monad m => EditText tags m Int
+bufLineCount = (+) <$> bufCurIndex <*> bufAboveCur
+
+-- The number of lines in the buffer that are not valid, @(bufAllocSize - bufLineCount)@
+bufUnusedSpace :: Monad m => EditText tags m Int
+bufUnusedSpace = subtract <$> bufLineCount <*> bufAllocSize
+
+-- The top-most index, regardless of whether the index contains a valid line.
+bufTopIndex :: Monad m => EditText tags m Int
+bufTopIndex = subtract 1 <$> bufAllocSize
+
+-- The index of the top-most valid line, which may not exist.
+bufTopLineM :: Monad m => EditText tags m (Maybe Int)
+bufTopLineM = do
+  i <- gets theLinesBelowCursor
+  if i <= 0 then return Nothing else Just <$> bufTopIndex
+
+-- Like 'bufTopLineM', but if 'bufTopLineM' returns 'Nothing' a 'BottomOfBuffer' exception is
+-- raised.
+bufTopLine :: Monad m => EditText tags m Int
+bufTopLine = bufTopLineM >>= maybe (throwError BottomOfBuffer) return
+
+-- Gets the index of the first valid line after the cursor, returns 'Nothing' if at the bottom of
+-- the buffer.
+bufLineAfterCurM :: Monad m => EditText tags m (Maybe Int)
+bufLineAfterCurM = do
+  i <- gets theLinesBelowCursor
+  if i <= 0 then return Nothing else Just . subtract i <$> bufAllocSize
+
+-- Like 'bufLineAfterCurM', but if 'bufLineAfterCurM' returns 'Nothing' a 'BottomOfBuffer' exception
+-- is raised.
+bufLineAfterCur :: Monad m => EditText tag m Int
+bufLineAfterCur = bufLineAfterCurM >>= maybe (throwError BottomOfBuffer) return
+
+-- Get the index within the vector that is associated with the given 'LineIndex'.
+bufAbsoluteM :: Monad m => Absolute LineIndex -> EditText tag m (Maybe Int)
+bufAbsoluteM (Absolute (LineIndex i)) = do
+  i   <- pure $ i - 1 -- LineIndex values begin counting at 1, so line index 1 maps to vector index 0
+  siz <- bufAllocSize
+  cur <- bufCurIndex
+  if not $ 0 <= i && i < siz
+    then return Nothing
+    else if i <= cur
+    then return $ Just i
+    else Just . (+ i) <$> bufUnusedSpace
+
+-- Like 'bufAbsoluteM', but if 'bufAbsoluteM' returns 'Nothing' a 'LineIndexOutOfRange' exception is
+-- raised.
+bufAbsolute :: Monad m => Absolute LineIndex -> EditText tag m Int
+bufAbsolute i = bufAbsoluteM i >>= maybe (throwError $ LineIndexOutOfRange i) return
+
+-- Convert a @('Relative' 'LineIndex')@ to an @('Absolute' 'LineIndex')@.
+bufRelToAbs :: Monad m => Relative LineIndex -> EditText tag m (Absolute LineIndex)
+bufRelToAbs (Relative (LineIndex i)) = Absolute . LineIndex . succ . (+ i) <$> bufCurIndex
+
+-- | Force an @('Absolute' 'LineIndex')@ to be in bounds.
+bufForceInBounds :: Monad m => Absolute LineIndex -> EditText tag m (Absolute LineIndex)
+bufForceInBounds = (<*>) (((max 1) .) . min . Absolute . LineIndex <$> bufAllocSize) . pure
+
+----------------------------------------------------------------------------------------------------
+
 -- | Throughout this module you will find functions that are defined like so:
 --
 -- @
@@ -926,13 +1013,13 @@ textLineTags = lens theTextLineTags $ \ a b -> a{ theTextLineTags = b }
 -- So you may wonder, when is it possible to use 'insertString' since it's type is the unspecified
 -- @editor@ type variable?
 --
--- There are two different function types which satisfy the @editor@ type variable: the 'TextEdit'
+-- There are two different function types which satisfy the @editor@ type variable: the 'EditText'
 -- function type which is evaluated by the 'runEditText' function, and the 'TextFoldMap' function
 -- type which is evaluated by the 'runFoldMapLines' function.
 --
 -- So any function type you see in this module that evaluates to a polymorphic type variable
 -- @editor@, where @editor@ is a member of 'MonadEditText' (for example 'insertString'), can be used
--- when building either a 'TextEdit' or 'TextFoldMap' function that is then passed as a parameter to
+-- when building either a 'EditText' or 'TextFoldMap' function that is then passed as a parameter to
 -- the 'runEditText' or 'runFoldMapLines' (respectively).
 --
 -- This design pattern is similar to 'Control.Monad.IO.Class.liftIO', and then defining an API in
