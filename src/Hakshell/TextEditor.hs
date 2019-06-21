@@ -960,8 +960,18 @@ bufUnusedSpace = subtract <$> bufLineCount <*> bufAllocSize
 bufTopIndex :: Monad m => EditText tags m Int
 bufTopIndex = subtract 1 <$> bufAllocSize
 
+throwIfNothing0 :: Monad m => TextEditError -> EditText tags m (Maybe a) -> EditText tags m a
+throwIfNothing0 msg = (>>= maybe (throwError msg) return)
+
+throwIfNothing
+  :: Monad m
+  => (a -> TextEditError)
+  -> (a -> EditText tags m (Maybe b))
+  -> (a -> EditText tags m b)
+throwIfNothing constr f a = f a >>= maybe (throwError $ constr a) return
+
 -- The index of the top-most valid line, which may not exist.
-bufTopLineM :: Monad m => EditText tagss m (Maybe Int)
+bufTopLineM :: Monad m => EditText tags m (Maybe Int)
 bufTopLineM = do
   i <- gets theLinesBelowCursor
   if i <= 0 then return Nothing else Just <$> bufTopIndex
@@ -969,7 +979,7 @@ bufTopLineM = do
 -- Like 'bufTopLineM', but if 'bufTopLineM' returns 'Nothing' a 'EndOfBuffer' exception is
 -- raised.
 bufTopLine :: Monad m => EditText tagss m Int
-bufTopLine = bufTopLineM >>= maybe (throwError $ EndOfBuffer After) return
+bufTopLine = throwIfNothing0 (EndOfBuffer After) bufTopLineM
 
 -- Gets the index of the first valid line after the cursor, returns 'Nothing' if at the bottom of
 -- the buffer.
@@ -981,7 +991,7 @@ bufLineAfterCurM = do
 -- Like 'bufLineAfterCurM', but if 'bufLineAfterCurM' returns 'Nothing' a 'EndOfBuffer' exception
 -- is raised.
 bufLineAfterCur :: Monad m => EditText tags m Int
-bufLineAfterCur = bufLineAfterCurM >>= maybe (throwError $ EndOfBuffer After) return
+bufLineAfterCur = throwIfNothing0 (EndOfBuffer After) bufLineAfterCurM
 
 -- Get the index within the vector that is associated with the given 'LineIndex'.
 bufAbsoluteM :: Monad m => Absolute LineIndex -> EditText tags m (Maybe Int)
@@ -998,7 +1008,7 @@ bufAbsoluteM (Absolute (LineIndex i)) = do
 -- Like 'bufAbsoluteM', but if 'bufAbsoluteM' returns 'Nothing' a 'LineIndexOutOfRange' exception is
 -- raised.
 bufAbsolute :: Monad m => Absolute LineIndex -> EditText tags m Int
-bufAbsolute i = bufAbsoluteM i >>= maybe (throwError $ LineIndexOutOfRange i) return
+bufAbsolute = throwIfNothing LineIndexOutOfRange bufAbsoluteM
 
 -- Convert a @('Relative' 'LineIndex')@ to an @('Absolute' 'LineIndex')@.
 bufRelToAbs :: Monad m => Relative LineIndex -> EditText tags m (Absolute LineIndex)
@@ -1048,7 +1058,7 @@ bufSlice
   :: Monad m
   => Relative LineIndex
   -> EditText tags m (MVec.IOVector (TextLine tags))
-bufSlice count = bufSliceM count >>= maybe (throwError $ LineCountOutOfRange count) return
+bufSlice = throwIfNothing LineCountOutOfRange bufSliceM
 
 -- Make a slice within the contiguous region of invalid elements after the cursor. This can be used
 -- as the target of a vector copy.
@@ -1069,7 +1079,7 @@ bufVoidSliceM (Relative (LineIndex count)) = do
 -- Like 'bufVoidSliceM', but if 'bufVoidSliceM' returns 'Nothing' a 'LineCountOutOfRange' exception
 -- is raised.
 bufVoidSlice :: Monad m => Relative LineIndex -> EditText tags m (MVec.IOVector (TextLine tags))
-bufVoidSlice count = bufVoidSliceM count >>= maybe (throwError $ LineCountOutOfRange count) return
+bufVoidSlice = throwIfNothing LineCountOutOfRange bufVoidSliceM
 
 -- Copy a single line before/on or after the cursor.
 bufCopy1M :: MonadIO m => RelativeToCursor -> EditText tags m (Maybe (TextLine tags))
@@ -1081,7 +1091,7 @@ bufCopy1M = \ case
 
 -- Like 'bufCopy1M', but if 'bufCopy1M' returns 'Nothing' an 'EndOfBuffer' exception is raised.
 bufCopy1 :: MonadIO m => RelativeToCursor -> EditText tags m (TextLine tags)
-bufCopy1 rel = bufCopy1M rel >>= maybe (throwError $ EndOfBuffer rel) return
+bufCopy1 = throwIfNothing EndOfBuffer bufCopy1M
 
 -- Delete a single line before/on or after the cursor.
 bufDel1M :: MonadIO m => RelativeToCursor -> EditText tags m (Maybe ())
@@ -1097,7 +1107,7 @@ bufDel1M rel = let undef = pure TextLineUndefined in case rel of
 
 -- Like 'bufDel1M' but if 'bufDel1M' returns 'Nothing' an 'EndOFBuffer' exception is raised.
 bufDel1 :: MonadIO m => RelativeToCursor -> EditText tags m ()
-bufDel1 rel = bufDel1M rel >>= maybe (throwError $ EndOfBuffer rel) return
+bufDel1  = throwIfNothing EndOfBuffer bufDel1M
 
 ----------------------------------------------------------------------------------------------------
 
