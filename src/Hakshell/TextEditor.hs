@@ -930,12 +930,14 @@ textLineTags = lens theTextLineTags $ \ a b -> a{ theTextLineTags = b }
 
 class MonadIO m => Editor vec m | m -> vec where
   nullElem  :: vec ~ v elem => m elem
+  newVector :: Int -> m vec
   modVector :: (vec -> vec) -> m vec
   modCursor :: (Int -> Int) -> m Int
   modAfter  :: (Int -> Int) -> m Int
 
 instance MonadIO m => Editor (MVec.IOVector (TextLine tags)) (EditText tags m) where
   nullElem = pure TextLineUndefined
+  newVector siz = nullElem >>= liftIO . MVec.replicate siz
   modVector f = state $ \ st -> let vec = f $ theBufferVector st in
     (vec, st{ theBufferVector = vec })
   modCursor f = state $ \ st -> let i = f $ theCursorLineIndex st in
@@ -945,6 +947,7 @@ instance MonadIO m => Editor (MVec.IOVector (TextLine tags)) (EditText tags m) w
 
 instance MonadIO m => Editor (UMVec.IOVector Char) (EditLine tags m) where
   nullElem = pure '\0'
+  newVector siz = nullElem >>= liftIO . UMVec.replicate siz
   modVector f = state $ \ st -> let vec = f $ theLineEditBuffer st in
     (vec, st{ theLineEditBuffer = vec })
   modCursor f = state $ \ st -> let i = f $ theCharsBeforeCursor st in
@@ -965,8 +968,8 @@ getCurIndex :: Editor vec m => m Int
 getCurIndex = modCursor id
 
 -- The number of valid lines after the cursor.
-getAboveCur :: Editor vec m => m Int
-getAboveCur = modAfter id
+getBelowCur :: Editor vec m => m Int
+getBelowCur = modAfter id
 
 -- The size of the buffer allocation
 getAllocSize :: (Editor (vec st elem) m, GMVec.MVector vec elem) => m Int
@@ -974,7 +977,7 @@ getAllocSize = GMVec.length <$> getVector
 
 -- The number of valid lines in the buffer @(bufCurIndex + bufferLinesBelowCursor)@.
 getLineCount :: Editor vec m => m Int
-getLineCount = (+) <$> getCurIndex <*> getAboveCur
+getLineCount = (+) <$> getCurIndex <*> getBelowCur
 
 -- The number of lines in the buffer that are not valid, @(bufAllocSize - bufLineCount)@
 getUnusedSpace :: (Editor (vec st elem) m, GMVec.MVector vec elem) => m Int
@@ -985,7 +988,7 @@ getTopIndex :: (Editor (vec st elem) m, GMVec.MVector vec elem) => m Int
 getTopIndex = subtract 1 <$> getAllocSize
 
 throwIfNothing0 :: (Monad m, MonadError TextEditError m) => TextEditError -> m (Maybe a) -> m a
-throwIfNothing0 msg = (>>= maybe (throwError msg) return)
+throwIfNothing0 msg = (>>= (maybe (throwError msg) return))
 
 throwIfNothing
   :: (Monad m, MonadError TextEditError m)
@@ -997,7 +1000,7 @@ throwIfNothing constr f a = f a >>= maybe (throwError $ constr a) return
 -- The index of the top-most valid line, which may not exist.
 getTopLineM :: (Editor (vec st elem) m, GMVec.MVector vec elem) => m (Maybe Int)
 getTopLineM = do
-  i <- getAboveCur
+  i <- getBelowCur
   if i <= 0 then return Nothing else Just <$> getTopIndex
 
 -- Like 'getTopLineM', but if 'getTopLineM' returns 'Nothing' a 'EndOfBuffer' exception is
@@ -1011,7 +1014,7 @@ getTopLine = throwIfNothing0 (EndOfBuffer After) getTopLineM
 -- the buffer.
 getLineAfterCurM :: (Editor (vec st elem) m, GMVec.MVector vec elem) => m (Maybe Int)
 getLineAfterCurM = do
-  i <- getAboveCur
+  i <- getBelowCur
   if i <= 0 then return Nothing else Just . subtract i <$> getAllocSize
 
 -- Like 'getLineAfterCurM', but if 'getLineAfterCurM' returns 'Nothing' a 'EndOfBuffer' exception
@@ -1061,7 +1064,7 @@ getVoid
 getVoid = do
   siz <- getTopIndex
   cur <- getCurIndex
-  aft <- getAboveCur
+  aft <- getBelowCur
   return $ if cur + aft + 1 >= siz then Nothing else Just
     (cur + 1, siz - aft - 1)
 
@@ -1102,9 +1105,8 @@ getSlice = throwIfNothing LineCountOutOfRange getSliceM
 -- as the target of a vector copy.
 getVoidSliceM
   :: (Editor (vec st elem) m, GMVec.MVector vec elem)
-  => Relative LineIndex
-  -> m (Maybe (vec st elem))
-getVoidSliceM (Relative (LineIndex count)) = do
+  => Int -> m (Maybe (vec st elem))
+getVoidSliceM count = do
   vec <- getVector
   vsp <- getVoid
   return $ vsp <&> \ (lo, hi) ->
@@ -1118,8 +1120,8 @@ getVoidSliceM (Relative (LineIndex count)) = do
 -- is raised.
 getVoidSlice
   :: (Editor (vec st elem) m, GMVec.MVector vec elem, MonadError TextEditError m)
-  => Relative LineIndex -> m (vec st elem)
-getVoidSlice = throwIfNothing LineCountOutOfRange getVoidSliceM
+  => (Int -> TextEditError) -> Int -> m (vec st elem)
+getVoidSlice mkerr = throwIfNothing mkerr getVoidSliceM
 
 -- Copy a single line before/on or after the cursor.
 getCopy1M
