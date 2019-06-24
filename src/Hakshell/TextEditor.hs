@@ -934,6 +934,7 @@ class MonadIO m => Editor vec m | m -> vec where
   modVector :: (vec -> vec) -> m vec
   modCursor :: (Int -> Int) -> m Int
   modAfter  :: (Int -> Int) -> m Int
+  countBeforeCur :: m Int
 
 instance MonadIO m => Editor (MVec.IOVector (TextLine tags)) (EditText tags m) where
   nullElem = pure TextLineUndefined
@@ -944,6 +945,7 @@ instance MonadIO m => Editor (MVec.IOVector (TextLine tags)) (EditText tags m) w
     (i, st{ theCursorLineIndex = i})
   modAfter  f = state $ \ st -> let i = f $ theLinesBelowCursor st in
     (i, st{ theLinesBelowCursor = i })
+  countBeforeCur = (+ 1) <$> modCursor id
 
 instance MonadIO m => Editor (UMVec.IOVector Char) (EditLine tags m) where
   nullElem = pure '\0'
@@ -954,6 +956,7 @@ instance MonadIO m => Editor (UMVec.IOVector Char) (EditLine tags m) where
     (i, st{ theCharsBeforeCursor = i })
   modAfter  f = state $ \ st -> let i = f $ theCharsAfterCursor st in
     (i, st{ theCharsAfterCursor = i })
+  countBeforeCur = modCursor id
 
 -- Convenient zero value
 m0 :: Monad m => m Int
@@ -966,11 +969,6 @@ getVector = modVector id
 -- The current value of 'theCursorLineIndex'.
 getCurIndex :: Editor vec m => m Int
 getCurIndex = modCursor id
-
--- Returns the number of valid elements on or before the cursor. This number should always be
--- greater than or equal to 1.
-countBeforeCur :: Editor vec m => m Int
-countBeforeCur = (+ 1) <$> modAfter id
 
 -- The number of valid lines after the cursor.
 countAfterCur :: Editor vec m => m Int
