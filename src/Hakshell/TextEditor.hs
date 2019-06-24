@@ -1157,6 +1157,14 @@ getDel1
   => RelativeToCursor -> m ()
 getDel1  = throwIfNothing EndOfBuffer getDel1M
 
+-- Write an element to a vector index, overwriting whatever was there before. __WARNING__: there is
+-- no bounds checking.
+putElem
+  :: (Editor (vec RealWorld elem) m, GMVec.MVector vec elem)
+  => Int -> elem -> m ()
+putElem i elem = write <$> getVector <*> pure i <*> pure elem >>= liftIO where
+  write = if unsafeMode then GMVec.unsafeWrite else GMVec.write
+
 ----------------------------------------------------------------------------------------------------
 
 -- | Throughout this module you will find functions that are defined like so:
