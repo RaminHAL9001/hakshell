@@ -184,9 +184,10 @@ import Debug.Trace
 -- For efficient insertion, lines below the cursor are shifted toward the end of the vector, leaving
 -- a gap of many conecutive 'TextLineUndefined' lines which can be over-written in O(1) time.
 --
--- Positioning the cursor is done with 1-based indexing, so the first line is line 1, not line zero.
--- This means care must be taken to translate 'Absolute' addresses to vector indicies by subtracting
--- 1 from every line number parameter passed by a public API.
+-- When a user positions the cursor, it is done with 1-based indexing values of type @('Absolute'
+-- 'LineIndex')@ or @('Absolute' 'CharIndex')@, so the first line is line 1, not line zero. This
+-- means care must be taken to translate 'Absolute' addresses to vector indicies by subtracting 1
+-- from every line number parameter passed by a public API.
 --
 -- There are two integer values tracked in the text buffer: 'cursorLineIndex' and
 -- 'linesBelowCursor'. The sum of these two numbers indicates how many lines there are in the
@@ -569,7 +570,7 @@ data TextBufferState tags
       -- string is transferred from 'theBufferCursor' to to 'theLinesAbove' or 'theLinesBelow'.
     , theBufferVector      :: !(MVec.IOVector (TextLine tags))
       -- ^ A mutable vector containing each line of editable text.
-    , theCursorLineIndex   :: !Int
+    , theLinesAboveCursor  :: !Int
       -- ^ The number of lines above the cursor
     , theLinesBelowCursor  :: !Int
       -- ^ The number of line below the cursor
@@ -735,7 +736,7 @@ newTextBuffer = fmap TextBuffer . (newTextBufferState defaultInitBufferSize >=> 
 -- position, and the content and state of the cursor.
 copyTextBuffer :: TextBuffer tags -> IO (TextBuffer tags)
 copyTextBuffer (TextBuffer mvar) = withMVar mvar $ \ old -> do
-  newBuf <- copyVec (theBufferVector old) (theCursorLineIndex old) (theLinesBelowCursor old)
+  newBuf <- copyVec (theBufferVector old) (theLinesAboveCursor old) (theLinesBelowCursor old)
   newCur <- copyTextCursor $ theBufferCursor old
   fmap TextBuffer $ newMVar $ old{ theBufferCursor = newCur, theBufferVector = newBuf }
 
@@ -753,7 +754,7 @@ newTextBufferState size tags = do
     { theBufferDefaultLine = emptyLine
     , theBufferLineBreaker = lineBreakerNLCR
     , theBufferVector      = buf
-    , theCursorLineIndex   = 0
+    , theLinesAboveCursor  = 0
     , theLinesBelowCursor  = 0
     , theBufferCursor      = cur
     , theBufferInsertMode  = False
@@ -862,7 +863,7 @@ bufferDefaultTags :: Lens' (TextBufferState tags) tags
 bufferDefaultTags = bufferDefaultLine . textLineTags
 
 -- | The function used to break strings into lines. This function is called every time a string is
--- transferred from 'theBufferCursor' to 'theCursorLineIndex' or 'theLinesBelow'. Note that setting
+-- transferred from 'theBufferCursor' to 'theLinesAboveCursor' or 'theLinesBelow'. Note that setting
 -- this function doesn't restructure the buffer, the old line breaks will still exist as they were
 -- before until the entire buffer is refreshed.
 --
@@ -889,8 +890,8 @@ defaultLineBreak :: Lens' LineBreaker CharVector
 defaultLineBreak = lens theDefaultLineBreak $ \ a b -> a{ theDefaultLineBreak = b }
 
 -- Not for export: requires correct accounting of line numbers to avoid segment faults.
-cursorLineIndex :: Lens' (TextBufferState tags) Int
-cursorLineIndex = lens theCursorLineIndex $ \ a b -> a{ theCursorLineIndex = b }
+linesAboveCursor :: Lens' (TextBufferState tags) Int
+linesAboveCursor = lens theLinesAboveCursor $ \ a b -> a{ theLinesAboveCursor = b }
 
 -- Not for export: requires correct accounting of line numbers to avoid segment faults.
 linesBelowCursor :: Lens' (TextBufferState tags) Int
@@ -932,31 +933,28 @@ class MonadIO m => Editor vec m | m -> vec where
   nullElem  :: vec ~ v elem => m elem
   newVector :: Int -> m vec
   modVector :: (vec -> vec) -> m vec
-  modCursor :: (Int -> Int) -> m Int
+  modBefore :: (Int -> Int) -> m Int
   modAfter  :: (Int -> Int) -> m Int
-  countBeforeCur :: m Int
 
 instance MonadIO m => Editor (MVec.IOVector (TextLine tags)) (EditText tags m) where
   nullElem = pure TextLineUndefined
   newVector siz = nullElem >>= liftIO . MVec.replicate siz
   modVector f = state $ \ st -> let vec = f $ theBufferVector st in
     (vec, st{ theBufferVector = vec })
-  modCursor f = state $ \ st -> let i = f $ theCursorLineIndex st in
-    (i, st{ theCursorLineIndex = i})
+  modBefore f = state $ \ st -> let i = f $ theLinesAboveCursor st in
+    (i, st{ theLinesAboveCursor = i})
   modAfter  f = state $ \ st -> let i = f $ theLinesBelowCursor st in
     (i, st{ theLinesBelowCursor = i })
-  countBeforeCur = (+ 1) <$> modCursor id
 
 instance MonadIO m => Editor (UMVec.IOVector Char) (EditLine tags m) where
   nullElem = pure '\0'
   newVector siz = nullElem >>= liftIO . UMVec.replicate siz
   modVector f = state $ \ st -> let vec = f $ theLineEditBuffer st in
     (vec, st{ theLineEditBuffer = vec })
-  modCursor f = state $ \ st -> let i = f $ theCharsBeforeCursor st in
+  modBefore f = state $ \ st -> let i = f $ theCharsBeforeCursor st in
     (i, st{ theCharsBeforeCursor = i })
   modAfter  f = state $ \ st -> let i = f $ theCharsAfterCursor st in
     (i, st{ theCharsAfterCursor = i })
-  countBeforeCur = modCursor id
 
 -- Convenient zero value
 m0 :: Monad m => m Int
@@ -966,9 +964,13 @@ m0 = return 0
 getVector :: Editor vec m => m vec
 getVector = modVector id
 
--- The current value of 'theCursorLineIndex'.
+-- The current value of 'theLinesAboveCursor'.
 getCurIndex :: Editor vec m => m Int
-getCurIndex = modCursor id
+getCurIndex = subtract 1 <$> modBefore id
+
+-- Returns the number of valid elements on or before the cursor.
+countBeforeCur :: Editor vec m => m Int
+countBeforeCur = modBefore id
 
 -- The number of valid lines after the cursor.
 countAfterCur :: Editor vec m => m Int
@@ -1034,7 +1036,7 @@ getAbsoluteM
 getAbsoluteM (Absolute (LineIndex i)) = do
   i   <- pure $ i - 1 -- LineIndex values begin counting at 1, so line index 1 maps to vector index 0
   siz <- getAllocSize
-  cur <- getCurIndex
+  cur <- countBeforeCur
   if not $ 0 <= i && i < siz
    then return Nothing
    else if i <= cur
@@ -1052,7 +1054,7 @@ getAbsolute = throwIfNothing LineIndexOutOfRange getAbsoluteM
 getRelToAbs
   :: (Editor (vec st elem) m, GMVec.MVector vec elem)
   => Relative LineIndex -> m (Absolute LineIndex)
-getRelToAbs (Relative (LineIndex i)) = Absolute . LineIndex . succ . (+ i) <$> getCurIndex
+getRelToAbs (Relative (LineIndex i)) = Absolute . LineIndex . succ . (+ i) <$> countBeforeCur
 
 -- Force an @('Absolute' 'LineIndex')@ to be in bounds.
 getForceInBounds
@@ -1066,7 +1068,7 @@ getVoid
   => m (Maybe (Int, Int))
 getVoid = do
   siz <- getTopIndex
-  cur <- getCurIndex
+  cur <- countBeforeCur
   aft <- countAfterCur
   return $ if cur + aft + 1 >= siz then Nothing else Just
     (cur + 1, siz - aft - 1)
@@ -1087,7 +1089,7 @@ getSliceM count = do
   vec <- getVector
   if count < 0
    then do
-    i <- (+ count) <$> getCurIndex
+    i <- (+ count) <$> countBeforeCur
     return $ if i < 0 then Nothing else Just $ GMVec.slice i (abs count) vec
    else if count > 0
    then do
@@ -1160,7 +1162,7 @@ getCopy1M
   :: (Editor (vec RealWorld elem) m, GMVec.MVector vec elem)
   => RelativeToCursor -> m (Maybe elem)
 getCopy1M = \ case
-  Before -> GMVec.read <$> getVector <*> getCurIndex >>= fmap Just . liftIO
+  Before -> GMVec.read <$> getVector <*> countBeforeCur >>= fmap Just . liftIO
   After  -> getTopLineM >>= \ case
     Nothing  -> return Nothing
     Just top -> GMVec.read <$> getVector <*> pure top >>= fmap Just . liftIO
@@ -1177,9 +1179,9 @@ getDel1M
   => RelativeToCursor -> m (Maybe ())
 getDel1M = \ case
   Before -> do
-    i <- getCurIndex
+    i <- countBeforeCur
     if i <= 0 then return Nothing else Just <$>
-      (GMVec.write <$> getVector <*> getCurIndex <*> nullElem >>= liftIO)
+      (GMVec.write <$> getVector <*> countBeforeCur <*> nullElem >>= liftIO)
   After  -> getTopLineM >>= \ case
     Nothing  -> return Nothing
     Just top -> if top <= 0 then return Nothing else Just <$>
@@ -1199,7 +1201,7 @@ growVector
   => (Int -> TextEditError) -> m ()
 growVector mkErr = do
   siz <- getTopIndex
-  cur <- getCurIndex
+  cur <- countBeforeCur
   aft <- countAfterCur
   if cur + aft < siz then return () else do
     oldbef <- getLoSlice mkErr
@@ -1285,7 +1287,7 @@ data RelativeToCursor = Before | After
 -- Not for export: This function takes a 'RelativeToCursor' value and constructs a lens that can be
 -- used to access 'TextLine's within the 'TextCursor'.
 relativeToLine :: RelativeToCursor -> Lens' (TextBufferState tags) Int
-relativeToLine = \ case { Before -> cursorLineIndex; After -> linesBelowCursor; }
+relativeToLine = \ case { Before -> linesAboveCursor; After -> linesBelowCursor; }
   -- This function may dissapear if I decide to buffer lines in a mutable vector.
 
 -- Not for export: This function takes a 'RelativeToCursor' value and constructs a lens that can be
@@ -1297,7 +1299,7 @@ relativeToChar =
 -- Get an index into the 'bufferVector' from the current position of the cursor.
 cursorIndex :: Monad m => RelativeToCursor -> EditText tags m Int
 cursorIndex = \ case
-  Before -> use cursorLineIndex
+  Before -> use linesAboveCursor
   After  -> (-) <$> (MVec.length <$> use bufferVector) <*> use linesBelowCursor
 
 -- Not for export: unsafe, requires correct accounting of cursor positions, otherwise segfaults may
@@ -1351,7 +1353,7 @@ growLineIfTooSmall grow = do
 growBufferIfTooSmall :: MonadIO m => Int -> EditText tags m ()
 growBufferIfTooSmall grow = do
   buf   <- use bufferVector
-  above <- use cursorLineIndex
+  above <- use linesAboveCursor
   below <- use linesBelowCursor
   liftIO (growVec buf above below grow) >>= assign bufferVector
 
@@ -1382,7 +1384,7 @@ unsafePopLine rel = do
   traceM $ "unsafePopLine: rel="++show rel++", cursorIndex="++show i
   line <-  --DEBUG
     liftIO (MVec.read vec i <* MVec.write vec i TextLineUndefined) <*
-      ((case rel of{ Before -> cursorLineIndex; After -> linesBelowCursor; }) -= 1)
+      ((case rel of{ Before -> linesAboveCursor; After -> linesBelowCursor; }) -= 1)
   traceM $ "unsafePopLine: "++show line --DEBUG
   return line --DEBUG
 
@@ -1396,7 +1398,7 @@ popLine
      )
   => RelativeToCursor -> editor tags m (Maybe (TextLine tags))
 popLine = liftEditText . \ case
-  Before -> use cursorLineIndex >>= \ before ->
+  Before -> use linesAboveCursor >>= \ before ->
     if before <= 0 then return Nothing else Just <$> unsafePopLine Before
   After  -> use linesBelowCursor >>= \ after ->
     if after <= 0 then return Nothing else Just <$> unsafePopLine After
@@ -1410,7 +1412,7 @@ currentLineNumber
      )
   => editor tags m (Absolute LineIndex)
 currentLineNumber = liftEditText $
-  Absolute . LineIndex . (+ 1) <$> use cursorLineIndex
+  Absolute . LineIndex . (+ 1) <$> use linesAboveCursor
 
 -- | Get the current column number of the cursor.
 currentColumnNumber
@@ -1446,7 +1448,7 @@ readLineIndex
   => Absolute LineIndex -> editor tags m (Maybe (TextLine tags))
 readLineIndex (Absolute (LineIndex i')) = liftEditText $ let i = i' - 1 in
   if i < 0 then return Nothing else do
-    above <- use cursorLineIndex
+    above <- use linesAboveCursor
     vec   <- use bufferVector
     let len = MVec.length vec
     if i < above then liftIO $ Just <$> MVec.read vec i else do
@@ -1463,13 +1465,13 @@ writeLineIndex
   => Absolute LineIndex -> TextLine tags -> editor tags m Bool
 writeLineIndex (Absolute (LineIndex i')) line = liftEditText $ let i = i' - 1 in
   if i < 0 then return False else do
-    above <- use cursorLineIndex
+    above <- use linesAboveCursor
     vec   <- use bufferVector
     let len = MVec.length vec
     if i <= above
      then do
       liftIO $ MVec.write vec i line
-      when (i == above) $ cursorLineIndex += 1
+      when (i == above) $ linesAboveCursor += 1
       return True
      else do
       below <- use linesBelowCursor
@@ -1482,7 +1484,7 @@ writeLineIndex (Absolute (LineIndex i')) line = liftEditText $ let i = i' - 1 in
        else liftIO (MVec.write vec (len - below + i - 1) line) >> return True
 
 -- | If not already in 'bufferInsertMode', this function copies the 'TextLine' at the 'LineIndex'
--- given by 'cursorLineIndex' (i.e. it copies the line under the cursor) into the local
+-- given by 'linesAboveCursor' (i.e. it copies the line under the cursor) into the local
 -- 'bufferCurrentLine' line editor. Functions that evaluate to an 'EditLine' function type can then
 -- perform a character-by-character edit on the 'bufferCurrentLine' line editor. No 'TextLine's in
 -- the 'TextBuffer' are modified or overwritten until 'endInsertMode' is evaluated.
@@ -1501,7 +1503,7 @@ beginInsertMode = liftEditText $ do
   if insMode then return False else do
     cur   <- Absolute . CharIndex . subtract 1 <$> use (bufferCurrentLine . charsBeforeCursor)
     vec   <- use bufferVector
-    above <- use cursorLineIndex
+    above <- use linesAboveCursor
     traceM $ "beginInsertMode: cur="++show cur++", above="++show above
     -- Set 'bufferInsertMode' before calling 'replaceCurrentLine' to avoid a possible accidental
     -- infinite recursion.
@@ -1510,12 +1512,12 @@ beginInsertMode = liftEditText $ do
     return True
 
 -- | If in 'bufferInsertMode', this function places the 'bufferCurrentLine' back into the text
--- buffer, overwriting the 'TextLine' at the 'LineIndex' given by 'cursorLineIndex'. This function
+-- buffer, overwriting the 'TextLine' at the 'LineIndex' given by 'linesAboveCursor'. This function
 -- then clears the 'bufferCurrentLine' line editor.
 --
--- It is possible to move the 'cursorLineIndex' to some other 'LineIndex' while in insert mode,
--- 'endInsertMode' does not care what the 'cursorLineIndex' was when 'beginInsertMode' was called,
--- it will always write the edited line to the 'LineIndex' given by 'cursorLineIndex'. So it is
+-- It is possible to move the 'linesAboveCursor' to some other 'LineIndex' while in insert mode,
+-- 'endInsertMode' does not care what the 'linesAboveCursor' was when 'beginInsertMode' was called,
+-- it will always write the edited line to the 'LineIndex' given by 'linesAboveCursor'. So it is
 -- possible to overwrite a 'TextLine' different from the line that was copied when 'beginInsertMode'
 -- was evaluated.
 --
@@ -1532,7 +1534,7 @@ endInsertMode = liftEditText $ do
   insMode <- use bufferInsertMode
   if not insMode then return False else do
     vec   <- use bufferVector
-    above <- use cursorLineIndex
+    above <- use linesAboveCursor
     (copyCurrentLine <* clearCurrentLine) >>= liftIO . MVec.write vec (above - 1)
     bufferInsertMode .= False
     return True
@@ -1658,9 +1660,9 @@ moveByLine
   => Relative LineIndex -> editor tags m ()
 moveByLine (Relative (LineIndex select)) = liftEditText $ do
   vec <- use bufferVector
-  (before, after) <- (,) <$> use cursorLineIndex <*> use linesBelowCursor
+  (before, after) <- (,) <$> use linesAboveCursor <*> use linesBelowCursor
   (before, after) <- liftIO $ shiftElems TextLineUndefined vec select before after
-  cursorLineIndex .= before
+  linesAboveCursor .= before
   linesBelowCursor .= after
 
 -- | Move the cursor to a different character position within the 'bufferCurrentLine' by an @n ::
@@ -1724,7 +1726,7 @@ gotoLine
      )
   => Absolute LineIndex -> editor tags m ()
 gotoLine (Absolute (LineIndex n)) = liftEditText $ do
-  above <- use cursorLineIndex
+  above <- use linesAboveCursor
   moveByLine $ Relative $ LineIndex $ n - above
 
 -- | Go to an absolute character (column) number, the first character is 1 (character 0 and below
@@ -1929,7 +1931,7 @@ forLinesInRange
 forLinesInRange absFrom@(Absolute (LineIndex from)) (Absolute (LineIndex to)) fold f = do
   endInsertMode
   gotoLine absFrom
-  lineCount <- (+) <$> use cursorLineIndex <*> use linesBelowCursor
+  lineCount <- (+) <$> use linesAboveCursor <*> use linesBelowCursor
   let dist = to - from
   forLinesLoop fold f (min lineCount . max 1 $ abs dist) $ if dist < 0
     then (unsafePopLine Before, pushLine After)
@@ -1961,7 +1963,7 @@ forLines
       TextLine tags -> FoldMapLines fold fold tags m [TextLine tags])
   -> EditText tags m fold
 forLines rel fold f = do
-  above <- use cursorLineIndex
+  above <- use linesAboveCursor
   below <- use linesBelowCursor
   uncurry (forLinesLoop fold f) $ case rel of
     Before -> (above, (unsafePopLine Before, pushLine After))
@@ -2032,7 +2034,7 @@ getCursor
      )
   => editor tags m TextLocation
 getCursor = liftEditText $ TextLocation
-  <$> (Absolute . LineIndex . (+ 1) <$> use cursorLineIndex)
+  <$> (Absolute . LineIndex . (+ 1) <$> use linesAboveCursor)
   <*> editLine (Absolute . CharIndex . (+ 1) <$> use charsBeforeCursor)
 
 -- | Move the cursor to given 'TextLocation'.
@@ -2067,7 +2069,7 @@ class RelativeToAbsoluteCursor index where
 instance RelativeToAbsoluteCursor LineIndex where
   relativeToAbsolute (Relative (LineIndex i)) = liftEditText $
     Absolute . LineIndex . (+ 1) . max 0 . app . (min &&& (+ i)) <$>
-    use cursorLineIndex
+    use linesAboveCursor
 
 instance RelativeToAbsoluteCursor CharIndex where
   relativeToAbsolute (Relative (CharIndex i)) = liftEditText $
@@ -2172,7 +2174,7 @@ textView from0 to0 (TextBuffer mvar) = liftIO $ withMVar mvar $ \ st -> do
   let (Absolute (CharIndex fromChar0)) = theLocationCharIndex from
   let (Absolute (CharIndex toChar0))   = theLocationCharIndex to
   let oldBuf    = theBufferVector     st
-  let above     = theCursorLineIndex  st
+  let above     = theLinesAboveCursor st
   let below     = theLinesBelowCursor st
   let lineCount = above + below
   let upper     = MVec.length oldBuf - below
@@ -2252,7 +2254,7 @@ newTextBufferFromView rel tags (TextView{textViewVector=vec}) = liftIO $ do
   let cursor = if oldLen == 0 then 0 else
         if theTextLineBreakSize (vec Vec.! (oldLen - 1)) > 0 then oldLen else oldLen - 1
   let (idx, st) = case rel of
-        Before -> ([0 ..], st & cursorLineIndex .~ cursor)
+        Before -> ([0 ..], st & linesAboveCursor .~ cursor)
         After  -> ([newLen - oldLen ..], st & linesBelowCursor .~ cursor)
   forM_ (zip idx $ Vec.toList vec) $ uncurry $ MVec.write newBuf
   TextBuffer <$> newMVar st
@@ -2312,11 +2314,11 @@ debugPrintBuffer = liftEditText $ do
             (printLines $! nullCount + 1) $! i + 1
           else liftIO showLine >> (printLines 0 $! i + 1)
   printLines 0 0
-  above   <- use cursorLineIndex
+  above   <- use linesAboveCursor
   below   <- use linesBelowCursor
   insmode <- use bufferInsertMode
   liftIO $ do
-    putStrLn $ "    cursorLineIndex: " ++ show above
+    putStrLn $ "   linesAboveCursor: " ++ show above
     putStrLn $ "   linesBelowCursor: " ++ show below
     putStrLn $ "    bufferLineCount: " ++ show (above + below)
     putStrLn $ " __bufferInsertMode: " ++ show insmode
