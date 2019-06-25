@@ -1126,25 +1126,27 @@ delElem
   => RelativeToCursor -> m ()
 delElem rel = join $ putElem rel <$> nullElem
 
--- If, and only if the vector is full, allocate a new vector with double the space of the current
--- vector, copy the elements from the current vector to the new vector, and then replace the current
+-- If, and only if the vector is full, allocate a new vector with enough space to fit the requested
+-- number of elements by doubling the size of the current vector until the size is large enough,
+-- then copy the elements from the current vector to the new vector, and then replace the current
 -- vector with the new one.
 growVector
   :: (Editor (vec RealWorld elem) m, GMVec.MVector vec elem)
-  => m ()
-growVector = do
+  => Int -> m ()
+growVector increase = if increase <= 0 then return () else do
   siz <- getAllocSize
   cur <- getElemCount Before
   aft <- getElemCount After
-  if cur + aft < siz then return () else do
-    oldbef <- getLoSlice
-    oldaft <- getHiSlice
-    newVector (2 * siz) >>= modVector . const
-    newbef <- getLoSlice
-    newaft <- getHiSlice
-    let copy to = liftIO . if unsafeMode then GMVec.unsafeCopy to else GMVec.copy to
-    copy newbef oldbef
-    copy newaft oldaft
+  let count  = cur + aft
+  let newsiz = count + increase
+  oldbef <- getLoSlice
+  oldaft <- getHiSlice
+  newVector (head $ dropWhile (<= newsiz) $ iterate (* 2) siz) >>= modVector . const
+  newbef <- getLoSlice
+  newaft <- getHiSlice
+  let copy to = liftIO . if unsafeMode then GMVec.unsafeCopy to else GMVec.copy to
+  copy newbef oldbef
+  copy newaft oldaft
 
 -- Push a single element to the index 'Before' (currently on) the cursor, or the index 'After' the
 -- cursor, and then shift the cursor to point to the pushed element.
@@ -1152,7 +1154,7 @@ pushElem
   :: (Editor (vec RealWorld elem) m, GMVec.MVector vec elem)
   => RelativeToCursor -> elem -> m ()
 pushElem rel elem = do
-  growVector
+  growVector 1
   putElem rel elem
   void $ modCount rel (+ 1)
 
