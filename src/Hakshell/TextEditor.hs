@@ -1163,16 +1163,33 @@ popElem
   => RelativeToCursor -> m elem
 popElem rel = getElem rel >>= \ elem -> delElem rel >> return elem
 
--- Move the cursor, which will shifting elements around the vector.
+-- Move the cursor, which will shift elements around the vector, using a algorithm of O(n) steps,
+-- where @n@ is the 'Relative' shift value. Pass a boolean value indicating whether or not you would
+-- like to perform bounds checking, if so an exception will be raised if the line index goes out of
+-- bounds.
 shiftCursor
   :: (Editor (vec RealWorld elem) m, GMVec.MVector vec elem)
-  => Relative Int -> m ()
-shiftCursor (Relative count) =
-  if count == 0 then return ()
-  else if count ==  1 then popElem After  >>= pushElem Before
-  else if count == -1 then popElem Before >>= pushElem After
-  else do
-    error "TODO"
+  => Bool -> Relative Int -> m ()
+shiftCursor doCheck rc@(Relative count) = if count == 0 then return () else getVoid >>= \ case
+  Nothing -> do
+    siz <- getAllocSize
+    cur <- getElemCount Before
+    let i = cur + count
+    if not $ 0 <= i && i < siz then throwCountErr count else void $ do
+      modCount Before (+ count)
+      modCount After  (+ count)
+  Just (Absolute lo, Absolute hi) ->
+    if      count ==  1 then popElem After  >>= pushElem Before
+    else if count == -1 then popElem Before >>= pushElem After
+    else do
+      vec  <- getVector
+      from <- getSlice True $ Relative count -- necessary bounds checking is done in 'getSlice'
+      let to = vec &
+            if      count > 1 then GMVec.slice lo count
+            else if count < 1 then GMVec.slice (hi + count) (negate count)
+            else error "shiftCursor: internal error, this should never happen"
+      let copy = if unsafeMode then GMVec.unsafeCopy else GMVec.copy
+      liftIO $ copy to from
 
 ----------------------------------------------------------------------------------------------------
 
