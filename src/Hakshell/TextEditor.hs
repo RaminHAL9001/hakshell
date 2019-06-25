@@ -163,6 +163,7 @@ import           Data.Semigroup
 import qualified Data.Vector                 as Vec
 import qualified Data.Vector.Mutable         as MVec
 import qualified Data.Vector.Unboxed         as UVec
+import qualified Data.Vector.Generic         as GVec
 import qualified Data.Vector.Generic.Mutable as GMVec
 import qualified Data.Vector.Unboxed.Mutable as UMVec
 import           Data.Word
@@ -1097,21 +1098,40 @@ getLoSlice = countBeforeCur >>= getSlice False . Relative . negate
 getHiSlice :: (Editor (vec st elem) m, GMVec.MVector vec elem) => m (vec st elem)
 getHiSlice = countAfterCur >>= getSlice False . Relative
 
--- Copy the element that is 'Before' (currently on), or the element that is 'After', the current
--- cursor. When selecting the element 'After', a bounds check is performed to ensure that the cursor
--- is not at the end of the buffer.
-getCopy1 :: (Editor (vec RealWorld elem) m, GMVec.MVector vec elem) => RelativeToCursor -> m elem
-getCopy1 rel = GMVec.read <$> getVector <*> getRelIndex rel >>= liftIO
+-- Write an element to a vector index, overwriting whatever was there before. __WARNING__: there is
+-- no bounds checking.
+putElemIndex
+  :: (Editor (vec RealWorld elem) m, GMVec.MVector vec elem)
+  => Int -> elem -> m ()
+putElemIndex i elem = write <$> getVector <*> pure i <*> pure elem >>= liftIO where
+  write = if unsafeMode then GMVec.unsafeWrite else GMVec.write
 
--- Delete a single element that is 'Before' (currently on), or the element that is 'After', the
--- cursor. When selecting the element 'After', a bounds check is performed to ensure that the cursor
--- is not at the end of the buffer.
-getDel1
+-- Read an element from a vector index. __WARNING__: there is no bounds checking.
+getElemIndex
+  :: (Editor (vec RealWorld elem) m, GMVec.MVector vec elem)
+  => Int -> m elem
+getElemIndex i = read <$> getVector <*> pure i >>= liftIO where
+  read = if unsafeMode then GMVec.unsafeRead else GMVec.read
+
+-- Like 'putElemIndex' but the index to which the element is written is given by a
+-- 'RelativeToCursor' value, so the index returned by 'getRelIndex'. The cursor position is not
+-- modified.
+putElem
+  :: (Editor (vec RealWorld elem) m, GMVec.MVector vec elem)
+  => RelativeToCursor -> elem -> m ()
+putElem rel elem = join $ putElemIndex <$> getRelIndex rel <*> pure elem
+
+-- Like 'getElemIndex' but the index from which the element is read is given by a 'RelativeToCursor'
+-- value, so the index returned by 'getRelIndex'. The cursor position is not modified.
+getElem :: (Editor (vec RealWorld elem) m, GMVec.MVector vec elem) => RelativeToCursor -> m elem
+getElem = getRelIndex >=> getElemIndex
+
+-- Like 'putElem' but the @elem@ value to be put is taken from the 'nullElem' for this 'Editor'
+-- context. The cursor position is not modified.
+delElem
   :: (Editor (vec RealWorld elem) m, GMVec.MVector vec elem)
   => RelativeToCursor -> m ()
-getDel1 rel = do
-  GMVec.write <$> getVector <*> getRelIndex rel <*> nullElem >>= liftIO
-  void $ modBefore $ subtract 1
+delElem rel = join $ putElem rel <$> nullElem
 
 -- If, and only if the vector is full, allocate a new vector with double the space of the current
 -- vector, copy the elements from the current vector to the new vector, and then replace the current
@@ -1133,21 +1153,33 @@ growVector = do
     copy newbef oldbef
     copy newaft oldaft
 
--- Write an element to a vector index, overwriting whatever was there before. __WARNING__: there is
--- no bounds checking.
-putElem
-  :: (Editor (vec RealWorld elem) m, GMVec.MVector vec elem)
-  => Int -> elem -> m ()
-putElem i elem = write <$> getVector <*> pure i <*> pure elem >>= liftIO where
-  write = if unsafeMode then GMVec.unsafeWrite else GMVec.write
-
+-- Push a single element to the index 'Before' (currently on) the cursor, or the index 'After' the
+-- cursor, and then shift the cursor to point to the pushed element.
 pushElem
   :: (Editor (vec RealWorld elem) m, GMVec.MVector vec elem)
-  => elem -> m ()
-pushElem elem = do
+  => RelativeToCursor -> elem -> m ()
+pushElem rel elem = do
   growVector
-  join $ putElem <$> countBeforeCur <*> pure elem
-  void $ modBefore (+ 1)
+  putElem rel elem
+  void $ (case rel of { Before -> modBefore; After -> modAfter; }) (+ 1)
+
+-- Pop a single element from the index 'Before' (currently on) the cursor, or from the index 'After'
+-- the cursor, and then shift the cursor to point to the pushed element.
+popElem
+  :: (Editor (vec RealWorld elem) m, GMVec.MVector vec elem)
+  => RelativeToCursor -> m elem
+popElem rel = getElem rel >>= \ elem -> delElem rel >> return elem
+
+-- Move the cursor, which will shifting elements around the vector.
+shiftCursor
+  :: (Editor (vec RealWorld elem) m, GMVec.MVector vec elem)
+  => Relative Int -> m ()
+shiftCursor (Relative count) =
+  if count == 0 then return ()
+  else if count ==  1 then popElem After  >>= pushElem Before
+  else if count == -1 then popElem Before >>= pushElem After
+  else do
+    error "TODO"
 
 ----------------------------------------------------------------------------------------------------
 
