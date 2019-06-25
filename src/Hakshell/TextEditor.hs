@@ -1379,14 +1379,25 @@ popLine = liftEditText . \ case
 
 ----------------------------------------------------------------------------------------------------
 
+indexToLine :: Int -> Absolute LineIndex
+indexToLine = Absolute . LineIndex . (+ 1)
+
+indexToChar :: Int -> Absolute CharIndex
+indexToChar = Absolute . CharIndex . (+ 1)
+
+lineToIndex :: Absolute LineIndex -> Int
+lineToIndex (Absolute (LineIndex i)) = i - 1
+
+charToIndex :: Absolute CharIndex -> Int
+charToIndex (Absolute (CharIndex i)) = i - 1
+
 -- | Get the current line number of the cursor.
 currentLineNumber
   :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
      )
   => editor tags m (Absolute LineIndex)
-currentLineNumber = liftEditText $
-  Absolute . LineIndex . (+ 1) <$> use linesAboveCursor
+currentLineNumber = liftEditText $ indexToLine <$> getElemCount Before
 
 -- | Get the current column number of the cursor.
 currentColumnNumber
@@ -1394,8 +1405,7 @@ currentColumnNumber
      , Show tags --DEBUG
      )
   => editor tags m (Absolute CharIndex)
-currentColumnNumber = liftEditText $
-  Absolute . CharIndex . (+ 1) . theCharsBeforeCursor <$> use bufferCurrentLine
+currentColumnNumber = liftEditText $ editLine $ indexToChar <$> getElemCount Before
 
 -- | Get the current cursor position.
 currentTextLocation
@@ -1411,51 +1421,25 @@ copyCurrentLine
      , Show tags --DEBUG
      )
   => editor tags m (TextLine tags)
-copyCurrentLine = liftEditText $ use bufferCurrentLine >>= liftIO . unsafeMakeLine
+copyCurrentLine = liftEditText $ getElem Before
 
--- | Read a 'TextLine' from an @('Absolute' 'LineIndex')@ address. If the index is out of bounds,
--- 'Prelude.Nothing' is returned.
+-- | Read a 'TextLine' from an @('Absolute' 'LineIndex')@ address.
 readLineIndex
   :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
      )
-  => Absolute LineIndex -> editor tags m (Maybe (TextLine tags))
-readLineIndex (Absolute (LineIndex i')) = liftEditText $ let i = i' - 1 in
-  if i < 0 then return Nothing else do
-    above <- use linesAboveCursor
-    vec   <- use bufferVector
-    let len = MVec.length vec
-    if i < above then liftIO $ Just <$> MVec.read vec i else do
-      below <- use linesBelowCursor
-      i <- pure $ i - above
-      if i >= below then return Nothing else liftIO $ Just <$> MVec.read vec (len - below + i - 1)
+  => Absolute LineIndex -> editor tags m (TextLine tags)
+readLineIndex i = liftEditText $ getAbsoluteChk (Absolute $ lineToIndex i) >>= getElemIndex
 
 -- | Write a 'TextLine' (as produced by 'copyCurrentLine' or readLineIndex') to an @('Absolute'
--- 'LineIndex')@ address. If the index is out of bounds, 'Prelude.False' is returned.
+-- 'LineIndex')@ address.
 writeLineIndex
   :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
      )
-  => Absolute LineIndex -> TextLine tags -> editor tags m Bool
-writeLineIndex (Absolute (LineIndex i')) line = liftEditText $ let i = i' - 1 in
-  if i < 0 then return False else do
-    above <- use linesAboveCursor
-    vec   <- use bufferVector
-    let len = MVec.length vec
-    if i <= above
-     then do
-      liftIO $ MVec.write vec i line
-      when (i == above) $ linesAboveCursor += 1
-      return True
-     else do
-      below <- use linesBelowCursor
-      i     <- pure $ i - above
-      if i >= below
-       then if i /= below then return False else do
-        liftIO $ MVec.write vec (len - below - 1) line
-        linesBelowCursor += 1
-        return True
-       else liftIO (MVec.write vec (len - below + i - 1) line) >> return True
+  => Absolute LineIndex -> TextLine tags -> editor tags m ()
+writeLineIndex i line = liftEditText $
+  getAbsoluteChk (Absolute $ lineToIndex i) >>= flip putElemIndex line
 
 -- | If not already in 'bufferInsertMode', this function copies the 'TextLine' at the 'LineIndex'
 -- given by 'linesAboveCursor' (i.e. it copies the line under the cursor) into the local
@@ -1475,14 +1459,13 @@ beginInsertMode
 beginInsertMode = liftEditText $ do
   insMode <- use bufferInsertMode
   if insMode then return False else do
-    cur   <- Absolute . CharIndex . subtract 1 <$> use (bufferCurrentLine . charsBeforeCursor)
-    vec   <- use bufferVector
-    above <- use linesAboveCursor
-    traceM $ "beginInsertMode: cur="++show cur++", above="++show above
+    cur <- editLine $ getElemCount Before
+    aft <- getElemCount Before  --DEBUG
+    traceM $ "beginInsertMode: charCursor="++show cur++", above="++show aft
     -- Set 'bufferInsertMode' before calling 'replaceCurrentLine' to avoid a possible accidental
     -- infinite recursion.
     bufferInsertMode .= True
-    liftIO (MVec.read vec above) >>= resumeEditLine False . editReplaceCurrentLine cur
+    getElem Before >>= resumeEditLine False . editReplaceCurrentLine (indexToChar cur)
     return True
 
 -- | If in 'bufferInsertMode', this function places the 'bufferCurrentLine' back into the text
