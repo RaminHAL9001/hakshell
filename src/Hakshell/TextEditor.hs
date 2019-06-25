@@ -159,7 +159,6 @@ import           Control.Monad.Primitive
 import           Control.Monad.State
 import           Control.Monad.State.Class
 
-import           Data.Maybe                  (isNothing)
 import           Data.Semigroup
 import qualified Data.Vector                 as Vec
 import qualified Data.Vector.Mutable         as MVec
@@ -582,10 +581,13 @@ data TextBufferState tags
     }
 
 data TextEditError
-  = TextEditError !StrictBytes
-  | EndOfBuffer RelativeToCursor
+  = TextEditError       !StrictBytes
+  | EndOfLineBuffer     !RelativeToCursor
+  | EndOfCharBuffer     !RelativeToCursor
   | LineIndexOutOfRange !(Absolute LineIndex)
   | LineCountOutOfRange !(Relative LineIndex)
+  | CharIndexOutOfRange !(Absolute CharIndex)
+  | CharCountOutOfRange !(Relative CharIndex)
   deriving (Eq, Ord)
 
 -- | A pair of functions used to break strings into lines. This function is called every time a
@@ -935,6 +937,9 @@ class MonadIO m => Editor vec m | m -> vec where
   modVector :: (vec -> vec) -> m vec
   modBefore :: (Int -> Int) -> m Int
   modAfter  :: (Int -> Int) -> m Int
+  throwLimitErr :: RelativeToCursor -> m void
+  throwIndexErr :: Int -> m void
+  throwCountErr :: Int -> m void
 
 instance MonadIO m => Editor (MVec.IOVector (TextLine tags)) (EditText tags m) where
   nullElem = pure TextLineUndefined
@@ -945,6 +950,9 @@ instance MonadIO m => Editor (MVec.IOVector (TextLine tags)) (EditText tags m) w
     (i, st{ theLinesAboveCursor = i})
   modAfter  f = state $ \ st -> let i = f $ theLinesBelowCursor st in
     (i, st{ theLinesBelowCursor = i })
+  throwLimitErr = throwError . EndOfLineBuffer
+  throwIndexErr = throwError . LineIndexOutOfRange . Absolute . LineIndex
+  throwCountErr = throwError . LineCountOutOfRange . Relative . LineIndex
 
 instance MonadIO m => Editor (UMVec.IOVector Char) (EditLine tags m) where
   nullElem = pure '\0'
@@ -955,6 +963,9 @@ instance MonadIO m => Editor (UMVec.IOVector Char) (EditLine tags m) where
     (i, st{ theCharsBeforeCursor = i })
   modAfter  f = state $ \ st -> let i = f $ theCharsAfterCursor st in
     (i, st{ theCharsAfterCursor = i })
+  throwLimitErr = throwError . EndOfCharBuffer
+  throwIndexErr = throwError . CharIndexOutOfRange . Absolute . CharIndex
+  throwCountErr = throwError . CharCountOutOfRange . Relative . CharIndex
 
 -- Convenient zero value
 m0 :: Monad m => m Int
@@ -963,10 +974,6 @@ m0 = return 0
 -- The vector of the text buffer.
 getVector :: Editor vec m => m vec
 getVector = modVector id
-
--- The current value of 'theLinesAboveCursor'.
-getCurIndex :: Editor vec m => m Int
-getCurIndex = subtract 1 <$> modBefore id
 
 -- Returns the number of valid elements on or before the cursor.
 countBeforeCur :: Editor vec m => m Int
@@ -992,223 +999,136 @@ getUnusedSpace = subtract <$> countLines <*> getAllocSize
 getTopIndex :: (Editor (vec st elem) m, GMVec.MVector vec elem) => m Int
 getTopIndex = subtract 1 <$> getAllocSize
 
-throwIfNothing0 :: (Monad m, MonadError TextEditError m) => TextEditError -> m (Maybe a) -> m a
-throwIfNothing0 msg = (>>= (maybe (throwError msg) return))
+-- The index of the top-most valid line, which may not exist. Bounds checking is performed.
+getTopIndexChk :: (Editor (vec st elem) m, GMVec.MVector vec elem) => m Int
+getTopIndexChk = countAfterCur >>= \ i ->
+  if i <= 0 then throwLimitErr After else getTopIndex
 
-throwIfNothing
-  :: (Monad m, MonadError TextEditError m)
-  => (a -> TextEditError)
-  -> (a -> m (Maybe b))
-  -> (a -> m b)
-throwIfNothing constr f a = f a >>= maybe (throwError $ constr a) return
+-- Translate a 'Before' or 'After' value to an 'Int' index value into a vector. When selecting the
+-- element 'After', a bounds check is performed to ensure that the cursor is not at the end of the
+-- buffer.
+getRelIndex :: (Editor (vec RealWorld elem) m, GMVec.MVector vec elem) => RelativeToCursor -> m Int
+getRelIndex = \ case { Before -> countBeforeCur; After -> getTopIndexChk; }
 
--- The index of the top-most valid line, which may not exist.
-getTopLineM :: (Editor (vec st elem) m, GMVec.MVector vec elem) => m (Maybe Int)
-getTopLineM = do
-  i <- countAfterCur
-  if i <= 0 then return Nothing else Just <$> getTopIndex
+-- Gets the index of the first valid line after the cursor. Bounds checking is __NOT__ performed.
+getIndexAfterCur :: (Editor (vec st elem) m, GMVec.MVector vec elem) => m Int
+getIndexAfterCur = subtract <$> countAfterCur <*> getAllocSize
 
--- Like 'getTopLineM', but if 'getTopLineM' returns 'Nothing' a 'EndOfBuffer' exception is
--- raised.
-getTopLine
-  :: (Editor (vec st elem) m, GMVec.MVector vec elem, MonadError TextEditError m)
-  => m Int
-getTopLine = throwIfNothing0 (EndOfBuffer After) getTopLineM
+-- Gets the index of the first valid line after the cursor. Bounds checking is performed.
+getIndexAfterCurChk :: (Editor (vec st elem) m, GMVec.MVector vec elem) => m Int
+getIndexAfterCurChk = countAfterCur >>= \ i ->
+  if i <= 0 then throwLimitErr After else getIndexAfterCur
 
--- Gets the index of the first valid line after the cursor, returns 'Nothing' if at the bottom of
--- the buffer.
-getLineAfterCurM :: (Editor (vec st elem) m, GMVec.MVector vec elem) => m (Maybe Int)
-getLineAfterCurM = do
-  i <- countAfterCur
-  if i <= 0 then return Nothing else Just . subtract i <$> getAllocSize
+-- Get the index within the vector that is associated with the given 'LineIndex'. Bounds checking is
+-- performed.
+getAbsoluteChk :: (Editor (vec st elem) m, GMVec.MVector vec elem) => Absolute Int -> m Int
+getAbsoluteChk (Absolute i) = getAllocSize >>= \ siz ->
+  (if not $ 0 <= i && i < siz then throwIndexErr else getAbsolute . Absolute) i
 
--- Like 'getLineAfterCurM', but if 'getLineAfterCurM' returns 'Nothing' a 'EndOfBuffer' exception
--- is raised.
-getLineAfterCur
-  :: (Editor (vec st elem) m, GMVec.MVector vec elem, MonadError TextEditError m)
-  => m Int
-getLineAfterCur = throwIfNothing0 (EndOfBuffer After) getLineAfterCurM
-
--- Get the index within the vector that is associated with the given 'LineIndex'.
-getAbsoluteM
-  :: (Editor (vec st elem) m, GMVec.MVector vec elem)
-  => Absolute LineIndex -> m (Maybe Int)
-getAbsoluteM (Absolute (LineIndex i)) = do
-  i   <- pure $ i - 1 -- LineIndex values begin counting at 1, so line index 1 maps to vector index 0
-  siz <- getAllocSize
-  cur <- countBeforeCur
-  if not $ 0 <= i && i < siz
-   then return Nothing
-   else if i <= cur
-   then return $ Just i
-   else Just . (+ i) <$> getUnusedSpace
-
--- Like 'getAbsoluteM', but if 'getAbsoluteM' returns 'Nothing' a 'LineIndexOutOfRange' exception is
--- raised.
-getAbsolute
-  :: (Editor (vec st elem) m, GMVec.MVector vec elem, MonadError TextEditError m)
-  => Absolute LineIndex -> m Int
-getAbsolute = throwIfNothing LineIndexOutOfRange getAbsoluteM
+-- Get the index within the vector that is associated with the given 'LineIndex'. Bounds checking is
+-- __NOT__ performed.
+getAbsolute :: (Editor (vec st elem) m, GMVec.MVector vec elem) => Absolute Int -> m Int
+getAbsolute (Absolute i) = countBeforeCur >>= \ cur ->
+  if i <= cur then return i else (+ i) <$> getUnusedSpace
 
 -- Convert a @('Relative' 'LineIndex')@ to an @('Absolute' 'LineIndex')@.
 getRelToAbs
   :: (Editor (vec st elem) m, GMVec.MVector vec elem)
-  => Relative LineIndex -> m (Absolute LineIndex)
-getRelToAbs (Relative (LineIndex i)) = Absolute . LineIndex . succ . (+ i) <$> countBeforeCur
+  => (Relative Int) -> m (Absolute Int)
+getRelToAbs (Relative i) = Absolute . (+ i) <$> countBeforeCur
 
--- Force an @('Absolute' 'LineIndex')@ to be in bounds.
-getForceInBounds
-  :: (Editor (vec st elem) m, GMVec.MVector vec elem)
-  => Absolute LineIndex -> m (Absolute LineIndex)
-getForceInBounds = (<*>) (((max 1) .) . min . Absolute . LineIndex <$> getAllocSize) . pure
-
--- Return the region of elements that are undefined.
+-- Return the starting and ending index of the region of undefined elements.
 getVoid
   :: (Editor (vec st elem) m, GMVec.MVector vec elem)
-  => m (Maybe (Int, Int))
+  => m (Maybe (Absolute Int, Absolute Int))
 getVoid = do
-  siz <- getTopIndex
-  cur <- countBeforeCur
-  aft <- countAfterCur
-  return $ if cur + aft + 1 >= siz then Nothing else Just
-    (cur + 1, siz - aft - 1)
+  rgn <- (,) <$> (Absolute . (+ 1) <$> countBeforeCur)
+             <*> (Absolute . subtract 1 <$> countAfterCur)
+  return $ guard (uncurry (<=) rgn) >> Just rgn
 
 -- True if there are no undefined text line elements in the buffer.
 getIsFull
   :: (Editor (vec st elem) m, GMVec.MVector vec elem)
   => m Bool
-getIsFull = isNothing <$> getVoid
+getIsFull = (== 0) <$> getUnusedSpace
 
 -- Make a slice of elements relative to the current cursor. A negative argument will take elements
 -- before and up-to the cursor, a positive argument will take that many elements starting from
--- 'getLineAfterCur'. If the line index goes out of bounds, 'Nothing' is returned.
-getSliceM
+-- 'getLineAfterCur'. Pass a boolean value indicating whether or not you would like to perform
+-- bounds checking, if so an exception will be raised if the line index goes out of bounds.
+getSlice
   :: (Editor (vec st elem) m, GMVec.MVector vec elem)
-  => Int -> m (Maybe (vec st elem))
-getSliceM count = do
+  => Bool -> Relative Int -> m (vec st elem)
+getSlice doCheck (Relative count) = do
   vec <- getVector
   if count < 0
    then do
     i <- (+ count) <$> countBeforeCur
-    return $ if i < 0 then Nothing else Just $ GMVec.slice i (abs count) vec
+    if doCheck && i < 0 then throwCountErr count else return $ GMVec.slice i (abs count) vec
    else if count > 0
    then do
-    i   <- fmap (+ count) <$> getLineAfterCurM
-    top <- getTopLineM
-    return $ case (,) <$> i <*> top of
-      Nothing       -> Nothing
-      Just (i, top) -> if i > top then Nothing else Just $ GMVec.slice i count vec
-   else return $ Just $ GMVec.slice 0 0 vec
-
--- Like 'bufSliceM', but if 'bufSliceM' returns 'Nothing' a 'LineCountOutOfRange' exception is
--- raised.
-getSlice
-  :: (Editor (vec st elem) m, GMVec.MVector vec elem, MonadError TextEditError m)
-  => (Int -> TextEditError) -> Int -> m (vec st elem)
-getSlice mkErr = throwIfNothing mkErr getSliceM
+    i   <- (+ count) <$> getIndexAfterCur
+    top <- getTopIndex
+    if doCheck && i > top then throwCountErr count else return $ GMVec.slice i count vec
+   else return $ GMVec.slice 0 0 vec
 
 -- Make a slice within the contiguous region of invalid elements after the cursor. This can be used
--- as the target of a vector copy.
-getVoidSliceM
+-- as the target of a vector copy. If the buffer is full, 'Nothing' is returned.
+getVoidSlice
   :: (Editor (vec st elem) m, GMVec.MVector vec elem)
-  => Int -> m (Maybe (vec st elem))
-getVoidSliceM count = do
+  => Relative Int -> m (Maybe (vec st elem))
+getVoidSlice (Relative count) = do
   vec <- getVector
   vsp <- getVoid
-  return $ vsp <&> \ (lo, hi) ->
+  return $ vsp <&> \ (Absolute lo, Absolute hi) ->
    if count < 0
    then GMVec.slice (hi + count) (abs count) vec
    else if count > 0
    then GMVec.slice lo count vec
    else GMVec.slice 0 0 vec
 
--- Like 'bufVoidSliceM', but if 'bufVoidSliceM' returns 'Nothing' a 'LineCountOutOfRange' exception
--- is raised.
-getVoidSlice
-  :: (Editor (vec st elem) m, GMVec.MVector vec elem, MonadError TextEditError m)
-  => (Int -> TextEditError) -> Int -> m (vec st elem)
-getVoidSlice mkerr = throwIfNothing mkerr getVoidSliceM
-
--- Obtain a slice (using 'getSliceM') for the portion of the vector containing elements before or on
+-- Obtain a slice (using 'getSlice') for the portion of the vector containing elements before or on
 -- the current cursor.
-getLoSliceM
-  :: (GMVec.MVector vec elem, Editor (vec st elem) m)
-  => m (Maybe (vec st elem))
-getLoSliceM = countBeforeCur >>= getSliceM . negate
-
--- Like 'getLoSliceM', but if 'getLoSliceM' returns 'Nothing' a 'LineCountOutOfRange' exception is
--- raised.
-getLoSlice
-  :: (GMVec.MVector vec elem, Editor (vec st elem) m, MonadError TextEditError m)
-  => (Int -> TextEditError) -> m (vec st elem)
-getLoSlice mkErr = countBeforeCur >>= getSlice mkErr . negate
+getLoSlice :: (Editor (vec st elem) m, GMVec.MVector vec elem) => m (vec st elem)
+getLoSlice = countBeforeCur >>= getSlice False . Relative . negate
 
 -- Obtain a slice (using 'getSliceM') for the portion of the vector containing elements after the
 -- current cursor.
-getHiSliceM
-  :: (GMVec.MVector vec elem, Editor (vec st elem) m)
-  => m (Maybe (vec st elem))
-getHiSliceM = countAfterCur >>= getSliceM
+getHiSlice :: (Editor (vec st elem) m, GMVec.MVector vec elem) => m (vec st elem)
+getHiSlice = countAfterCur >>= getSlice False . Relative
 
--- Obtain a slice (using 'getSliceM') for the portion of the vector containing elements after the
--- current cursor.
-getHiSlice
-  :: (GMVec.MVector vec elem, Editor (vec st elem) m, MonadError TextEditError m)
-  => (Int -> TextEditError) -> m (vec st elem)
-getHiSlice mkErr = countAfterCur >>= getSlice mkErr
+-- Copy the element that is 'Before' (currently on), or the element that is 'After', the current
+-- cursor. When selecting the element 'After', a bounds check is performed to ensure that the cursor
+-- is not at the end of the buffer.
+getCopy1 :: (Editor (vec RealWorld elem) m, GMVec.MVector vec elem) => RelativeToCursor -> m elem
+getCopy1 rel = GMVec.read <$> getVector <*> getRelIndex rel >>= liftIO
 
--- Copy a single line before/on or after the cursor.
-getCopy1M
-  :: (Editor (vec RealWorld elem) m, GMVec.MVector vec elem)
-  => RelativeToCursor -> m (Maybe elem)
-getCopy1M = \ case
-  Before -> GMVec.read <$> getVector <*> countBeforeCur >>= fmap Just . liftIO
-  After  -> getTopLineM >>= \ case
-    Nothing  -> return Nothing
-    Just top -> GMVec.read <$> getVector <*> pure top >>= fmap Just . liftIO
-
--- Like 'bufCopy1M', but if 'bufCopy1M' returns 'Nothing' an 'EndOfBuffer' exception is raised.
-getCopy1
-  :: (Editor (vec RealWorld elem) m, GMVec.MVector vec elem, MonadError TextEditError m)
-  => RelativeToCursor -> m elem
-getCopy1 = throwIfNothing EndOfBuffer getCopy1M
-
--- Delete a single line before/on or after the cursor.
-getDel1M
-  :: (Editor (vec RealWorld elem) m, GMVec.MVector vec elem)
-  => RelativeToCursor -> m (Maybe ())
-getDel1M = \ case
-  Before -> do
-    i <- countBeforeCur
-    if i <= 0 then return Nothing else Just <$>
-      (GMVec.write <$> getVector <*> countBeforeCur <*> nullElem >>= liftIO)
-  After  -> getTopLineM >>= \ case
-    Nothing  -> return Nothing
-    Just top -> if top <= 0 then return Nothing else Just <$>
-        (GMVec.write <$> getVector <*> pure top <*> nullElem >>= liftIO)
-
--- Like 'bufDel1M' but if 'bufDel1M' returns 'Nothing' an 'EndOFBuffer' exception is raised.
+-- Delete a single element that is 'Before' (currently on), or the element that is 'After', the
+-- cursor. When selecting the element 'After', a bounds check is performed to ensure that the cursor
+-- is not at the end of the buffer.
 getDel1
-  :: (Editor (vec RealWorld elem) m, GMVec.MVector vec elem, MonadError TextEditError m)
+  :: (Editor (vec RealWorld elem) m, GMVec.MVector vec elem)
   => RelativeToCursor -> m ()
-getDel1  = throwIfNothing EndOfBuffer getDel1M
+getDel1 rel = do
+  GMVec.write <$> getVector <*> getRelIndex rel <*> nullElem >>= liftIO
+  void $ modBefore $ subtract 1
 
 -- If, and only if the vector is full, allocate a new vector with double the space of the current
 -- vector, copy the elements from the current vector to the new vector, and then replace the current
 -- vector with the new one.
 growVector
-  :: (Editor (vec RealWorld elem) m, GMVec.MVector vec elem, MonadError TextEditError m)
-  => (Int -> TextEditError) -> m ()
-growVector mkErr = do
-  siz <- getTopIndex
+  :: (Editor (vec RealWorld elem) m, GMVec.MVector vec elem)
+  => m ()
+growVector = do
+  siz <- getAllocSize
   cur <- countBeforeCur
   aft <- countAfterCur
   if cur + aft < siz then return () else do
-    oldbef <- getLoSlice mkErr
-    oldaft <- getHiSlice mkErr
-    newVector (2 * (siz + 1)) >>= modVector . const
-    newbef <- getLoSlice mkErr
-    newaft <- getHiSlice mkErr
+    oldbef <- getLoSlice
+    oldaft <- getHiSlice
+    newVector (2 * siz) >>= modVector . const
+    newbef <- getLoSlice
+    newaft <- getHiSlice
     let copy to = liftIO . if unsafeMode then GMVec.unsafeCopy to else GMVec.copy to
     copy newbef oldbef
     copy newaft oldaft
@@ -1220,6 +1140,14 @@ putElem
   => Int -> elem -> m ()
 putElem i elem = write <$> getVector <*> pure i <*> pure elem >>= liftIO where
   write = if unsafeMode then GMVec.unsafeWrite else GMVec.write
+
+pushElem
+  :: (Editor (vec RealWorld elem) m, GMVec.MVector vec elem)
+  => elem -> m ()
+pushElem elem = do
+  growVector
+  join $ putElem <$> countBeforeCur <*> pure elem
+  void $ modBefore (+ 1)
 
 ----------------------------------------------------------------------------------------------------
 
