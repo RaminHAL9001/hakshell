@@ -936,8 +936,7 @@ class MonadIO m => Editor vec m | m -> vec where
   nullElem  :: vec ~ v elem => m elem
   newVector :: Int -> m vec
   modVector :: (vec -> vec) -> m vec
-  modBefore :: (Int -> Int) -> m Int
-  modAfter  :: (Int -> Int) -> m Int
+  modCount  :: RelativeToCursor -> (Int -> Int) -> m Int
   throwLimitErr :: RelativeToCursor -> m void
   throwIndexErr :: Int -> m void
   throwCountErr :: Int -> m void
@@ -947,10 +946,9 @@ instance MonadIO m => Editor (MVec.IOVector (TextLine tags)) (EditText tags m) w
   newVector siz = nullElem >>= liftIO . MVec.replicate siz
   modVector f = state $ \ st -> let vec = f $ theBufferVector st in
     (vec, st{ theBufferVector = vec })
-  modBefore f = state $ \ st -> let i = f $ theLinesAboveCursor st in
-    (i, st{ theLinesAboveCursor = i})
-  modAfter  f = state $ \ st -> let i = f $ theLinesBelowCursor st in
-    (i, st{ theLinesBelowCursor = i })
+  modCount rel f = state $ \ st -> case rel of
+    Before -> let i = f $ theLinesAboveCursor st in (i, st{ theLinesAboveCursor = i })
+    After  -> let i = f $ theLinesBelowCursor st in (i, st{ theLinesBelowCursor = i })
   throwLimitErr = throwError . EndOfLineBuffer
   throwIndexErr = throwError . LineIndexOutOfRange . Absolute . LineIndex
   throwCountErr = throwError . LineCountOutOfRange . Relative . LineIndex
@@ -960,10 +958,9 @@ instance MonadIO m => Editor (UMVec.IOVector Char) (EditLine tags m) where
   newVector siz = nullElem >>= liftIO . UMVec.replicate siz
   modVector f = state $ \ st -> let vec = f $ theLineEditBuffer st in
     (vec, st{ theLineEditBuffer = vec })
-  modBefore f = state $ \ st -> let i = f $ theCharsBeforeCursor st in
-    (i, st{ theCharsBeforeCursor = i })
-  modAfter  f = state $ \ st -> let i = f $ theCharsAfterCursor st in
-    (i, st{ theCharsAfterCursor = i })
+  modCount rel f = state $ \ st -> case rel of
+    Before -> let i = f $ theCharsBeforeCursor st in (i, st{ theCharsBeforeCursor = i })
+    After  -> let i = f $ theCharsAfterCursor  st in (i, st{ theCharsAfterCursor  = i })
   throwLimitErr = throwError . EndOfCharBuffer
   throwIndexErr = throwError . CharIndexOutOfRange . Absolute . CharIndex
   throwCountErr = throwError . CharCountOutOfRange . Relative . CharIndex
@@ -977,12 +974,8 @@ getVector :: Editor vec m => m vec
 getVector = modVector id
 
 -- Returns the number of valid elements on or before the cursor.
-countBeforeCur :: Editor vec m => m Int
-countBeforeCur = modBefore id
-
--- The number of valid lines after the cursor.
-countAfterCur :: Editor vec m => m Int
-countAfterCur = modAfter id
+getElemCount :: Editor vec m => RelativeToCursor -> m Int
+getElemCount = flip modCount id
 
 -- The size of the buffer allocation
 getAllocSize :: (Editor (vec st elem) m, GMVec.MVector vec elem) => m Int
@@ -990,7 +983,7 @@ getAllocSize = GMVec.length <$> getVector
 
 -- The number of valid lines in the buffer @(bufCurIndex + bufferLinesBelowCursor)@.
 countLines :: Editor vec m => m Int
-countLines = (+) <$> countBeforeCur <*> countAfterCur
+countLines = (+) <$> getElemCount Before <*> getElemCount After
 
 -- The number of lines in the buffer that are not valid, @(bufAllocSize - bufLineCount)@
 getUnusedSpace :: (Editor (vec st elem) m, GMVec.MVector vec elem) => m Int
@@ -1002,22 +995,22 @@ getTopIndex = subtract 1 <$> getAllocSize
 
 -- The index of the top-most valid line, which may not exist. Bounds checking is performed.
 getTopIndexChk :: (Editor (vec st elem) m, GMVec.MVector vec elem) => m Int
-getTopIndexChk = countAfterCur >>= \ i ->
+getTopIndexChk = getElemCount After >>= \ i ->
   if i <= 0 then throwLimitErr After else getTopIndex
 
 -- Translate a 'Before' or 'After' value to an 'Int' index value into a vector. When selecting the
 -- element 'After', a bounds check is performed to ensure that the cursor is not at the end of the
 -- buffer.
 getRelIndex :: (Editor (vec RealWorld elem) m, GMVec.MVector vec elem) => RelativeToCursor -> m Int
-getRelIndex = \ case { Before -> countBeforeCur; After -> getTopIndexChk; }
+getRelIndex = \ case { Before -> getElemCount Before; After -> getTopIndexChk; }
 
 -- Gets the index of the first valid line after the cursor. Bounds checking is __NOT__ performed.
 getIndexAfterCur :: (Editor (vec st elem) m, GMVec.MVector vec elem) => m Int
-getIndexAfterCur = subtract <$> countAfterCur <*> getAllocSize
+getIndexAfterCur = subtract <$> getElemCount After <*> getAllocSize
 
 -- Gets the index of the first valid line after the cursor. Bounds checking is performed.
 getIndexAfterCurChk :: (Editor (vec st elem) m, GMVec.MVector vec elem) => m Int
-getIndexAfterCurChk = countAfterCur >>= \ i ->
+getIndexAfterCurChk = getElemCount After >>= \ i ->
   if i <= 0 then throwLimitErr After else getIndexAfterCur
 
 -- Get the index within the vector that is associated with the given 'LineIndex'. Bounds checking is
@@ -1029,22 +1022,22 @@ getAbsoluteChk (Absolute i) = getAllocSize >>= \ siz ->
 -- Get the index within the vector that is associated with the given 'LineIndex'. Bounds checking is
 -- __NOT__ performed.
 getAbsolute :: (Editor (vec st elem) m, GMVec.MVector vec elem) => Absolute Int -> m Int
-getAbsolute (Absolute i) = countBeforeCur >>= \ cur ->
+getAbsolute (Absolute i) = getElemCount Before >>= \ cur ->
   if i <= cur then return i else (+ i) <$> getUnusedSpace
 
 -- Convert a @('Relative' 'LineIndex')@ to an @('Absolute' 'LineIndex')@.
 getRelToAbs
   :: (Editor (vec st elem) m, GMVec.MVector vec elem)
   => (Relative Int) -> m (Absolute Int)
-getRelToAbs (Relative i) = Absolute . (+ i) <$> countBeforeCur
+getRelToAbs (Relative i) = Absolute . (+ i) <$> getElemCount Before
 
 -- Return the starting and ending index of the region of undefined elements.
 getVoid
   :: (Editor (vec st elem) m, GMVec.MVector vec elem)
   => m (Maybe (Absolute Int, Absolute Int))
 getVoid = do
-  rgn <- (,) <$> (Absolute . (+ 1) <$> countBeforeCur)
-             <*> (Absolute . subtract 1 <$> countAfterCur)
+  rgn <- (,) <$> (Absolute . (+ 1) <$> getElemCount Before)
+             <*> (Absolute . subtract 1 <$> getElemCount After)
   return $ guard (uncurry (<=) rgn) >> Just rgn
 
 -- True if there are no undefined text line elements in the buffer.
@@ -1064,7 +1057,7 @@ getSlice doCheck (Relative count) = do
   vec <- getVector
   if count < 0
    then do
-    i <- (+ count) <$> countBeforeCur
+    i <- (+ count) <$> getElemCount Before
     if doCheck && i < 0 then throwCountErr count else return $ GMVec.slice i (abs count) vec
    else if count > 0
    then do
@@ -1091,12 +1084,12 @@ getVoidSlice (Relative count) = do
 -- Obtain a slice (using 'getSlice') for the portion of the vector containing elements before or on
 -- the current cursor.
 getLoSlice :: (Editor (vec st elem) m, GMVec.MVector vec elem) => m (vec st elem)
-getLoSlice = countBeforeCur >>= getSlice False . Relative . negate
+getLoSlice = getElemCount Before >>= getSlice False . Relative . negate
 
 -- Obtain a slice (using 'getSliceM') for the portion of the vector containing elements after the
 -- current cursor.
 getHiSlice :: (Editor (vec st elem) m, GMVec.MVector vec elem) => m (vec st elem)
-getHiSlice = countAfterCur >>= getSlice False . Relative
+getHiSlice = getElemCount After >>= getSlice False . Relative
 
 -- Write an element to a vector index, overwriting whatever was there before. __WARNING__: there is
 -- no bounds checking.
@@ -1141,8 +1134,8 @@ growVector
   => m ()
 growVector = do
   siz <- getAllocSize
-  cur <- countBeforeCur
-  aft <- countAfterCur
+  cur <- getElemCount Before
+  aft <- getElemCount After
   if cur + aft < siz then return () else do
     oldbef <- getLoSlice
     oldaft <- getHiSlice
@@ -1161,7 +1154,7 @@ pushElem
 pushElem rel elem = do
   growVector
   putElem rel elem
-  void $ (case rel of { Before -> modBefore; After -> modAfter; }) (+ 1)
+  void $ modCount rel (+ 1)
 
 -- Pop a single element from the index 'Before' (currently on) the cursor, or from the index 'After'
 -- the cursor, and then shift the cursor to point to the pushed element.
