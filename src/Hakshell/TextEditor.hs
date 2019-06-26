@@ -937,7 +937,7 @@ textLineTags = lens theTextLineTags $ \ a b -> a{ theTextLineTags = b }
 -- ranges of lines, and code involving translating user-facing @('Absolute' 'LineIndex')@ values to
 -- simplliied arithmetic expressions that I consuder to be more human readable.
 
-class MonadIO m => VecEditMonad vec m | m -> vec where
+class MonadIO m => MonadEditVec vec m | m -> vec where
   nullElem  :: vec ~ v elem => m elem
   newVector :: Int -> m vec
   modVector :: (vec -> vec) -> m vec
@@ -946,7 +946,7 @@ class MonadIO m => VecEditMonad vec m | m -> vec where
   throwIndexErr :: Int -> m void
   throwCountErr :: Int -> m void
 
-instance MonadIO m => VecEditMonad (MVec.IOVector (TextLine tags)) (EditText tags m) where
+instance MonadIO m => MonadEditVec (MVec.IOVector (TextLine tags)) (EditText tags m) where
   nullElem = pure TextLineUndefined
   newVector siz = nullElem >>= liftIO . MVec.replicate siz
   modVector f = state $ \ st -> let vec = f $ theBufferVector st in
@@ -958,7 +958,7 @@ instance MonadIO m => VecEditMonad (MVec.IOVector (TextLine tags)) (EditText tag
   throwIndexErr = throwError . LineIndexOutOfRange . Absolute . LineIndex
   throwCountErr = throwError . LineCountOutOfRange . Relative . LineIndex
 
-instance MonadIO m => VecEditMonad (UMVec.IOVector Char) (EditLine tags m) where
+instance MonadIO m => MonadEditVec (UMVec.IOVector Char) (EditLine tags m) where
   nullElem = pure '\0'
   newVector siz = nullElem >>= liftIO . UMVec.replicate siz
   modVector f = state $ \ st -> let vec = f $ theLineEditBuffer st in
@@ -975,71 +975,71 @@ m0 :: Monad m => m Int
 m0 = return 0
 
 -- The vector of the text buffer.
-getVector :: VecEditMonad vec m => m vec
+getVector :: MonadEditVec vec m => m vec
 getVector = modVector id
 
 -- Returns the number of valid elements on or before the cursor.
-getElemCount :: VecEditMonad vec m => RelativeToCursor -> m Int
+getElemCount :: MonadEditVec vec m => RelativeToCursor -> m Int
 getElemCount = flip modCount id
 
 -- The size of the buffer allocation
-getAllocSize :: (VecEditMonad (vec st elem) m, GMVec.MVector vec elem) => m Int
+getAllocSize :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem) => m Int
 getAllocSize = GMVec.length <$> getVector
 
 -- The number of valid lines in the buffer @(bufCurIndex + bufferLinesBelowCursor)@.
-countLines :: VecEditMonad vec m => m Int
+countLines :: MonadEditVec vec m => m Int
 countLines = (+) <$> getElemCount Before <*> getElemCount After
 
 -- The number of lines in the buffer that are not valid, @(bufAllocSize - bufLineCount)@
-getUnusedSpace :: (VecEditMonad (vec st elem) m, GMVec.MVector vec elem) => m Int
+getUnusedSpace :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem) => m Int
 getUnusedSpace = subtract <$> countLines <*> getAllocSize
 
 -- The top-most index, regardless of whether the index contains a valid line.
-getTopIndex :: (VecEditMonad (vec st elem) m, GMVec.MVector vec elem) => m Int
+getTopIndex :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem) => m Int
 getTopIndex = subtract 1 <$> getAllocSize
 
 -- The index of the top-most valid line, which may not exist. Bounds checking is performed.
-getTopIndexChk :: (VecEditMonad (vec st elem) m, GMVec.MVector vec elem) => m Int
+getTopIndexChk :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem) => m Int
 getTopIndexChk = getElemCount After >>= \ i ->
   if i <= 0 then throwLimitErr After else getTopIndex
 
 -- Translate a 'Before' or 'After' value to an 'Int' index value into a vector. When selecting the
 -- element 'After', a bounds check is performed to ensure that the cursor is not at the end of the
 -- buffer.
-getRelIndex :: (VecEditMonad (vec RealWorld elem) m, GMVec.MVector vec elem) => RelativeToCursor -> m Int
+getRelIndex :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem) => RelativeToCursor -> m Int
 getRelIndex = \ case { Before -> getElemCount Before; After -> getTopIndexChk; }
 
 -- Gets the index of the first valid line after the cursor. Bounds checking is __NOT__ performed.
-getIndexAfterCur :: (VecEditMonad (vec st elem) m, GMVec.MVector vec elem) => m Int
+getIndexAfterCur :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem) => m Int
 getIndexAfterCur = subtract <$> getElemCount After <*> getAllocSize
 
 -- Gets the index of the first valid line after the cursor. Bounds checking is performed.
-getIndexAfterCurChk :: (VecEditMonad (vec st elem) m, GMVec.MVector vec elem) => m Int
+getIndexAfterCurChk :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem) => m Int
 getIndexAfterCurChk = getElemCount After >>= \ i ->
   if i <= 0 then throwLimitErr After else getIndexAfterCur
 
 -- Get the index within the vector that is associated with the given 'LineIndex'. Bounds checking is
 -- performed.
-getAbsoluteChk :: (VecEditMonad (vec st elem) m, GMVec.MVector vec elem) => Absolute Int -> m Int
+getAbsoluteChk :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem) => Absolute Int -> m Int
 getAbsoluteChk (Absolute i) = getAllocSize >>= \ siz ->
   (if not $ 0 <= i && i < siz then throwIndexErr else getAbsolute . Absolute) i
 
 -- Get the index within the vector that is associated with the given 'LineIndex'. Bounds checking is
 -- __NOT__ performed.
-getAbsolute :: (VecEditMonad (vec st elem) m, GMVec.MVector vec elem) => Absolute Int -> m Int
+getAbsolute :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem) => Absolute Int -> m Int
 getAbsolute (Absolute i) = getElemCount Before >>= \ cur ->
   if i <= cur then return i else (+ i) <$> getUnusedSpace
 
 -- Convert a @('Relative' 'LineIndex')@ to an @('Absolute' 'LineIndex')@.
 getRelToAbs
-  :: (VecEditMonad (vec st elem) m, GMVec.MVector vec elem)
+  :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem)
   => (Relative Int) -> m (Absolute Int)
 getRelToAbs (Relative i) = Absolute . (+ i) <$> getElemCount Before
 
 -- Return the starting and ending index of the void region of the buffer, which is the contiguous
 -- region of undefined elements within the buffer.
 getVoid
-  :: (VecEditMonad (vec st elem) m, GMVec.MVector vec elem)
+  :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem)
   => m (Maybe (Absolute Int, Absolute Int))
 getVoid = do
   rgn <- (,) <$> (Absolute . (+ 1) <$> getElemCount Before)
@@ -1048,7 +1048,7 @@ getVoid = do
 
 -- True if there are no undefined text line elements in the buffer.
 getIsFull
-  :: (VecEditMonad (vec st elem) m, GMVec.MVector vec elem)
+  :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem)
   => m Bool
 getIsFull = (== 0) <$> getUnusedSpace
 
@@ -1057,7 +1057,7 @@ getIsFull = (== 0) <$> getUnusedSpace
 -- 'getLineAfterCur'. Pass a boolean value indicating whether or not you would like to perform
 -- bounds checking, if so an exception will be raised if the line index goes out of bounds.
 getSlice
-  :: (VecEditMonad (vec st elem) m, GMVec.MVector vec elem)
+  :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem)
   => Bool -> Relative Int -> m (vec st elem)
 getSlice doCheck (Relative count) = do
   vec <- getVector
@@ -1076,7 +1076,7 @@ getSlice doCheck (Relative count) = do
 -- the cursor). This can be used as the target of a vector copy. If the buffer is full, 'Nothing' is
 -- returned.
 getVoidSlice
-  :: (VecEditMonad (vec st elem) m, GMVec.MVector vec elem)
+  :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem)
   => Relative Int -> m (Maybe (vec st elem))
 getVoidSlice (Relative count) = do
   vec <- getVector
@@ -1090,25 +1090,25 @@ getVoidSlice (Relative count) = do
 
 -- Obtain a slice (using 'getSlice') for the portion of the vector containing elements before or on
 -- the current cursor.
-getLoSlice :: (VecEditMonad (vec st elem) m, GMVec.MVector vec elem) => m (vec st elem)
+getLoSlice :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem) => m (vec st elem)
 getLoSlice = getElemCount Before >>= getSlice False . Relative . negate
 
 -- Obtain a slice (using 'getSliceM') for the portion of the vector containing elements after the
 -- current cursor.
-getHiSlice :: (VecEditMonad (vec st elem) m, GMVec.MVector vec elem) => m (vec st elem)
+getHiSlice :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem) => m (vec st elem)
 getHiSlice = getElemCount After >>= getSlice False . Relative
 
 -- Write an element to a vector index, overwriting whatever was there before. __WARNING__: there is
 -- no bounds checking.
 putElemIndex
-  :: (VecEditMonad (vec RealWorld elem) m, GMVec.MVector vec elem)
+  :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem)
   => Int -> elem -> m ()
 putElemIndex i elem = write <$> getVector <*> pure i <*> pure elem >>= liftIO where
   write = if unsafeMode then GMVec.unsafeWrite else GMVec.write
 
 -- Read an element from a vector index. __WARNING__: there is no bounds checking.
 getElemIndex
-  :: (VecEditMonad (vec RealWorld elem) m, GMVec.MVector vec elem)
+  :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem)
   => Int -> m elem
 getElemIndex i = read <$> getVector <*> pure i >>= liftIO where
   read = if unsafeMode then GMVec.unsafeRead else GMVec.read
@@ -1117,21 +1117,21 @@ getElemIndex i = read <$> getVector <*> pure i >>= liftIO where
 -- 'RelativeToCursor' value, so the index returned by 'getRelIndex'. The cursor position is not
 -- modified.
 putElem
-  :: (VecEditMonad (vec RealWorld elem) m, GMVec.MVector vec elem)
+  :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem)
   => RelativeToCursor -> elem -> m ()
 putElem rel elem = join $ putElemIndex <$> getRelIndex rel <*> pure elem
 
 -- Like 'getElemIndex' but the index from which the element is read is given by a 'RelativeToCursor'
 -- value, so the index returned by 'getRelIndex'. The cursor position is not modified.
 getElem
-  :: (VecEditMonad (vec RealWorld elem) m, GMVec.MVector vec elem)
+  :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem)
   => RelativeToCursor -> m elem
 getElem = getRelIndex >=> getElemIndex
 
--- Like 'putElem' but the @elem@ value to be put is taken from the 'nullElem' for this 'VecEditMonad'
+-- Like 'putElem' but the @elem@ value to be put is taken from the 'nullElem' for this 'MonadEditVec'
 -- context. The cursor position is not modified.
 delElem
-  :: (VecEditMonad (vec RealWorld elem) m, GMVec.MVector vec elem)
+  :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem)
   => RelativeToCursor -> m ()
 delElem rel = join $ putElem rel <$> nullElem
 
@@ -1149,7 +1149,7 @@ minPow2ScaledSize oldsiz newsiz = head $ dropWhile (<= newsiz) $ iterate (* 2) $
 -- is ONLY allocated and returned; the content of the current buffer is NOT copied, the current
 -- buffer is not replaced.
 prepLargerVector
-  :: (VecEditMonad (vec RealWorld elem) m, GMVec.MVector vec elem)
+  :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem)
   => Int -> m (Maybe (vec RealWorld elem))
 prepLargerVector newsiz = do
   oldsiz <- getAllocSize
@@ -1161,7 +1161,7 @@ prepLargerVector newsiz = do
 -- then copy the elements from the current vector to the new vector, and then replace the current
 -- vector with the new one.
 growVector
-  :: (VecEditMonad (vec RealWorld elem) m, GMVec.MVector vec elem)
+  :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem)
   => Int -> m ()
 growVector increase = if increase <= 0 then return () else do
   count  <- countLines
@@ -1180,7 +1180,7 @@ growVector increase = if increase <= 0 then return () else do
 -- Push a single element to the index 'Before' (currently on) the cursor, or the index 'After' the
 -- cursor, and then shift the cursor to point to the pushed element.
 pushElem
-  :: (VecEditMonad (vec RealWorld elem) m, GMVec.MVector vec elem)
+  :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem)
   => RelativeToCursor -> elem -> m ()
 pushElem rel elem = do
   growVector 1
@@ -1190,7 +1190,7 @@ pushElem rel elem = do
 -- Pop a single element from the index 'Before' (currently on) the cursor, or from the index 'After'
 -- the cursor, and then shift the cursor to point to the pushed element.
 popElem
-  :: (VecEditMonad (vec RealWorld elem) m, GMVec.MVector vec elem)
+  :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem)
   => RelativeToCursor -> m elem
 popElem rel = getElem rel >>= \ elem -> delElem rel >> return elem
 
@@ -1199,7 +1199,7 @@ popElem rel = getElem rel >>= \ elem -> delElem rel >> return elem
 -- like to perform bounds checking, if so an exception will be raised if the line index goes out of
 -- bounds.
 shiftCursor
-  :: (VecEditMonad (vec RealWorld elem) m, GMVec.MVector vec elem)
+  :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem)
   => Bool -> Relative Int -> m ()
 shiftCursor doCheck rc@(Relative count) = if count == 0 then return () else getVoid >>= \ case
   Nothing -> do
@@ -1783,9 +1783,9 @@ deleteChars (Relative (CharIndex n)) = liftEditLine $ fmap (Relative . CharIndex
 -- adjacent lines such that the travel of deletion wraps to the end of the prior line or the
 -- beginning of the next line, depending on the direction of travel.
 deleteCharsWrap
-  :: forall editor tags m . (MonadEditText editor, MonadIO (editor tags m), MonadIO m
-                            , Show tags --DEBUG
-                            )
+  :: ( MonadEditText editor, MonadIO (editor tags m), MonadIO m
+     , Show tags --DEBUG
+     )
   => Relative CharIndex -> editor tags m (Relative CharIndex)
 deleteCharsWrap rem@(Relative (CharIndex remaining)) = liftEditText $ do
   insMode <- use bufferInsertMode
