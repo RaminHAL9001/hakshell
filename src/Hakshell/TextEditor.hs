@@ -117,7 +117,7 @@ module Hakshell.TextEditor
     -- ** Text Editing Typeclasses
     MonadEditText(..), MonadEditLine(..),
     -- ** Instances of Text Editing Type Classes
-    EditText, newTextCursor, copyTextCursor,
+    EditText, newTextCursorIO, copyTextCursorIO, newLineEditor, copyLineEditor,
     FoldMapLines, MapLines, EditLine, editLine,
     FoldMapLinesHalt,
     FoldMapChars, foldMapChars, runFoldMapChars, execFoldMapChars, evalFoldMapChars,
@@ -574,7 +574,7 @@ data TextBufferState tags
       -- ^ The number of lines above the cursor
     , theLinesBelowCursor  :: !Int
       -- ^ The number of line below the cursor
-    , theBufferLineEditor      :: !(TextCursor tags)
+    , theBufferLineEditor  :: !(TextCursor tags)
       -- ^ A data structure for editing individual characters in a line of text.
     , theBufferInsertMode  :: !Bool
       -- ^ Whether or not the buffer is in insert mode, which means a 'TextLine' has been copied
@@ -740,12 +740,12 @@ newTextBuffer = fmap TextBuffer . (newTextBufferState defaultInitBufferSize >=> 
 copyTextBuffer :: TextBuffer tags -> IO (TextBuffer tags)
 copyTextBuffer (TextBuffer mvar) = withMVar mvar $ \ old -> do
   newBuf <- copyVec (theBufferVector old) (theLinesAboveCursor old) (theLinesBelowCursor old)
-  newCur <- copyTextCursor $ theBufferLineEditor old
+  newCur <- copyTextCursorIO $ theBufferLineEditor old
   fmap TextBuffer $ newMVar $ old{ theBufferLineEditor = newCur, theBufferVector = newBuf }
 
 newTextBufferState :: Int -> tags -> IO (TextBufferState tags)
 newTextBufferState size tags = do
-  cur <- newTextCursor tags
+  cur <- newTextCursorIO tags
   buf <- MVec.replicate size TextLineUndefined
   let emptyLine = TextLine
         { theTextLineTags      = tags
@@ -768,8 +768,10 @@ newTextBufferState size tags = do
 -- allowing the 'TextEdit' APIs automatically manage line editing. A 'TextBufferState' always
 -- contains one empty line, but a line must have a @tags@ tag, so it is necessary to pass an
 -- initializing tag value of type @tags@.
-newTextCursor :: tags -> IO (TextCursor tags)
-newTextCursor tag = do
+--
+-- See also the 'newTextCursor' function which calls this function within a 'MonadEditLine' context.
+newTextCursorIO :: tags -> IO (TextCursor tags)
+newTextCursorIO tag = do
   buf <- UMVec.new 1024
   return TextCursor
     { theLineEditBuffer    = buf
@@ -781,8 +783,11 @@ newTextCursor tag = do
 
 -- | Use this to create a deep-copy of a 'TextCursor'. The cursor position within the 'TextCursor'
 -- is also copied.
-copyTextCursor :: TextCursor tags -> IO (TextCursor tags)
-copyTextCursor cur = do
+--
+-- See also the 'copyTextCursor' function which calls this function within an 'MonadEditText'
+-- context.
+copyTextCursorIO :: TextCursor tags -> IO (TextCursor tags)
+copyTextCursorIO cur = do
   buf <- copyVec (theLineEditBuffer cur) (theCharsBeforeCursor cur) (theCharsAfterCursor cur)
   return cur{ theLineEditBuffer = buf }
 
@@ -1495,13 +1500,15 @@ beginInsertMode
 beginInsertMode = liftEditText $ do
   insMode <- use bufferInsertMode
   if insMode then return False else do
-    cur <- editLine $ getElemCount Before
-    aft <- getElemCount Before  --DEBUG
-    traceM $ "beginInsertMode: charCursor="++show cur++", above="++show aft
-    -- Set 'bufferInsertMode' before calling 'replaceCurrentLine' to avoid a possible accidental
-    -- infinite recursion.
     bufferInsertMode .= True
-    getElem Before >>= resumeEditLine False . editReplaceCurrentLine (indexToChar cur)
+    before <- getElemCount Before
+    after  <- getElemCount After
+    when (before <= 0) $ pushElem Before =<<
+      if after <= 0 then use bufferDefaultLine else popElem After
+    before <- getElemCount Before
+    elem   <- getElemIndex (before - 1)
+    resumeEditLine False $ join $
+      editReplaceCurrentLine <$> (indexToChar <$> getElemCount Before) <*> pure elem
     return True
 
 -- | If in 'bufferInsertMode', this function places the 'bufferLineEditor' back into the text
@@ -1593,8 +1600,27 @@ resetCurrentLine
      , Show tags --DEBUG
      )
   => editor tags m ()
-resetCurrentLine = liftEditText $
-  use (bufferLineEditor . textCursorTags) >>= liftIO . newTextCursor >>= assign bufferLineEditor
+resetCurrentLine = liftEditText $ newLineEditor >>= assign bufferLineEditor
+
+-- | Create a new 'LineEditor' value within the current 'EditText' context, using the default tags
+-- given by 'bufferDefaultTags'. This function calls 'newTextCursorIO' using the value of
+-- 'textCursorTags'.
+newLineEditor
+  :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
+     , Show tags --DEBUG
+     )
+  => editor tags m (TextCursor tags)
+newLineEditor = liftEditText $
+  use (bufferLineEditor . textCursorTags) >>= liftIO . newTextCursorIO
+
+-- | Create a copy of the current 'lineEditBuffer' and return it. This function calls
+-- 'copyTextCursorIO' using the value of the current 'lineEditBuffer'.
+copyLineEditor
+  :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
+     , Show tags --DEBUG
+     )
+  => editor tags m (TextCursor tags)
+copyLineEditor = liftEditText $ use bufferLineEditor >>= liftIO . copyTextCursorIO
 
 -- Not for export: exposes structure of internal mutable vector. Moves a region of elements near the
 -- cursor from top to bottom, or from bottom to top. Negative value for select indicates to select
@@ -1662,6 +1688,38 @@ moveByChar
   => Relative CharIndex -> editor tags m ()
 moveByChar = liftEditLine . shiftCursor True . Relative . charToCount
 
+-- | Go to an absolute line number, the first line is 1 (line 0 and below all send the cursor to
+-- line 1), the last line is 'Prelude.maxBound'.
+gotoLine
+  :: (MonadEditText editor, MonadEditLine editor, MonadIO (editor tags m), MonadIO m
+     , Show tags --DEBUG
+     )
+  => Absolute LineIndex -> editor tags m ()
+gotoLine (Absolute (LineIndex n)) = liftEditText $ do
+  bef <- getElemCount Before
+  moveByLine $ Relative $ LineIndex $ n - bef
+
+-- | Go to an absolute character (column) number, the first character is 1 (character 0 and below
+-- all send the cursor to column 1), the last line is 'Prelude.maxBound'.
+gotoChar
+  :: (MonadEditLine editor, MonadIO (editor tags m), MonadIO m
+     , Show tags --DEBUG
+     )
+  => Absolute CharIndex -> editor tags m ()
+gotoChar (Absolute (CharIndex n)) = liftEditLine $ do
+  before    <- use charsBeforeCursor
+  moveByChar $ Relative $ CharIndex $ n - before
+
+-- | This function calls 'gotoLine' and then 'gotoChar' to move the cursor to an absolute a line
+-- number and characters (column) number.
+gotoPosition
+  :: (MonadEditText editor, MonadEditLine editor, MonadIO (editor tags m), MonadIO m
+     , Show tags --DEBUG
+     )
+  => TextLocation -> editor tags m ()
+gotoPosition (TextLocation{theLocationLineIndex=line,theLocationCharIndex=col}) =
+  liftEditText $ gotoLine line >> gotoChar col
+
 -- Not for export: does not filter line-breaking characters.
 unsafeInsertChar :: MonadIO m => RelativeToCursor -> Char -> EditText tags m ()
 unsafeInsertChar rel c = do
@@ -1687,51 +1745,20 @@ unsafeInsertString rel str = do
 
 -- | Insert a single character. If the 'lineBreakPredicate' function evaluates to 'Prelude.True',
 -- meaning the given character is a line breaking character, this function does nothing. To insert
--- line breaks, using 'insertString'.
+-- line breaks, using 'insertString'. Returns the number of characters added to the buffer.
 insertChar
   :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
      )
-  => RelativeToCursor -> Char -> editor tags m ()
-insertChar rel c = liftEditText $ do
+  => RelativeToCursor -> Char -> editor tags m (Relative CharIndex)
+insertChar rel c = liftEditText $ Relative . CharIndex <$> do
   isBreak <- use $ bufferLineBreaker . lineBreakPredicate
-  if isBreak c then return () else unsafeInsertChar rel c
-
--- | Go to an absolute line number, the first line is 1 (line 0 and below all send the cursor to
--- line 1), the last line is 'Prelude.maxBound'.
-gotoLine
-  :: (MonadEditText editor, MonadEditLine editor, MonadIO (editor tags m), MonadIO m
-     , Show tags --DEBUG
-     )
-  => Absolute LineIndex -> editor tags m ()
-gotoLine (Absolute (LineIndex n)) = liftEditText $ do
-  above <- use linesAboveCursor
-  moveByLine $ Relative $ LineIndex $ n - above
-
--- | Go to an absolute character (column) number, the first character is 1 (character 0 and below
--- all send the cursor to column 1), the last line is 'Prelude.maxBound'.
-gotoChar
-  :: (MonadEditLine editor, MonadIO (editor tags m), MonadIO m
-     , Show tags --DEBUG
-     )
-  => Absolute CharIndex -> editor tags m ()
-gotoChar (Absolute (CharIndex n)) = liftEditLine $ do
-  before    <- use charsBeforeCursor
-  moveByChar $ Relative $ CharIndex $ n - before
-
--- | This function calls 'gotoLine' and then 'gotoChar' to move the cursor to an absolute a line
--- number and characters (column) number.
-gotoPosition
-  :: (MonadEditText editor, MonadEditLine editor, MonadIO (editor tags m), MonadIO m
-     , Show tags --DEBUG
-     )
-  => TextLocation -> editor tags m ()
-gotoPosition (TextLocation{theLocationLineIndex=line,theLocationCharIndex=col}) =
-  liftEditText $ gotoLine line >> gotoChar col
+  if isBreak c then return 0 else liftEditLine (pushElem Before c) >> return 1
 
 -- | This function only deletes characters on the current line, if the cursor is at the start of the
 -- line and you evaluate @'deleteChars' 'Before'@, this function does nothing. This function does
--- not delete line breaking characters. Returns the number of characters actually deleted.
+-- not delete line breaking characters. Returns the number of characters actually deleted as a
+-- negative number (or zero), indicating a change in the number of characters in the buffer.
 deleteChars
   :: (MonadEditLine editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
@@ -1739,15 +1766,15 @@ deleteChars
   => Relative CharIndex -> editor tags m (Relative CharIndex)
 deleteChars (Relative (CharIndex n)) = liftEditLine $ fmap (Relative . CharIndex) $
   if n < 0 then do
-    before <- use charsBeforeCursor
-    let count = min before $ negate n 
-    charsBeforeCursor .= before - count
+    before <- getElemCount Before
+    let count = negate $ min before $ abs n 
+    modCount Before $ const $ before + count
     return count
   else if n > 0 then do
     lbrksz <- fromIntegral <$> use cursorBreakSize
-    after  <- use charsAfterCursor
-    let count = min n $ max 0 $ after - lbrksz
-    charsAfterCursor .= after - count
+    after  <- getElemCount After
+    let count = negate $ min n $ max 0 $ after - lbrksz
+    modCount Before $ const $ after + count
     return count
   else return 0
 
