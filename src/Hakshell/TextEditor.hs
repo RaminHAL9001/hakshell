@@ -126,7 +126,7 @@ module Hakshell.TextEditor
     -- ** Text Buffer
     TextBufferState, LineBreaker(..),
     bufferLineBreaker, lineBreaker, lineBreakPredicate, defaultLineBreak,
-    bufferCurrentLine, textLineString, bufferDefaultTags,
+    bufferLineEditor, textLineString, bufferDefaultTags,
     lineBreakerNLCR,
     -- ** Line Editing
     TextLine, emptyTextLine, nullTextLine, sliceLineToEnd, textLineIsUndefined,
@@ -392,7 +392,7 @@ runMapLines = flip evalFoldMapLines ()
 ----------------------------------------------------------------------------------------------------
 
 -- | Functions of this type operate on a single 'TextLine', it is useful for updating the
--- 'bufferCurrentLine'.
+-- 'bufferLineEditor'.
 newtype EditLine tags m a
   = EditLine
     { unwrapEditLine :: ExceptT TextEditError (StateT (TextCursor tags) (EditText tags m)) a }
@@ -422,7 +422,7 @@ editLine f = beginInsertMode >>= flip resumeEditLine f
 
 -- not for export
 --
--- This function assumes the 'bufferCurrentLine' is set to the current line already, and thus does
+-- This function assumes the 'bufferLineEditor' is set to the current line already, and thus does
 -- not evaluate 'beginInsertMode'. It is necessary for all functions in this module to use
 -- 'resumeEditLine' rather than 'liftEditLine' internally to prevent an infinite recursions caused
 -- by the fact that the exported, public-facing 'editLine' calls 'beginInsertMode'.
@@ -432,9 +432,9 @@ resumeEditLine
      ) => Bool -> EditLine tags m a -> EditText tags m a
 resumeEditLine modeChanged (EditLine f) = do
   let end = when modeChanged $ void endInsertMode
-  use bufferCurrentLine >>= runStateT (runExceptT f) >>= \ case
+  use bufferLineEditor >>= runStateT (runExceptT f) >>= \ case
     (Left err, _   ) -> end >> throwError err
-    (Right  a, line) -> bufferCurrentLine .= line >> end >> return a
+    (Right  a, line) -> bufferLineEditor .= line >> end >> return a
 
 ----------------------------------------------------------------------------------------------------
 
@@ -553,7 +553,7 @@ newtype TextBuffer tags = TextBuffer (MVar (TextBufferState tags))
 -- 'TextBuffer' data type. The constructor for this data type is not exposed because it is
 -- automatically constructed by the 'newTextBuffer' function, and it contains what object oriented
 -- programmers would call "private" variables. However some of the lenses for this data type, namely
--- 'bufferDefaultTags', 'bufferLineBreaker', and 'bufferCurrentLine', do allow you to modify the
+-- 'bufferDefaultTags', 'bufferLineBreaker', and 'bufferLineEditor', do allow you to modify the
 -- variable fields of this data type.
 --
 -- The 'EditText' monad instantiates the 'MonadState' typeclass such that the stateful data is this
@@ -567,18 +567,18 @@ data TextBufferState tags
       -- break character is inserted.
     , theBufferLineBreaker :: LineBreaker
       -- ^ The function used to break strings into lines. This function is called every time a
-      -- string is transferred from 'theBufferCursor' to to 'theLinesAbove' or 'theLinesBelow'.
+      -- string is transferred from 'theBufferLineEditor' to to 'theLinesAbove' or 'theLinesBelow'.
     , theBufferVector      :: !(MVec.IOVector (TextLine tags))
       -- ^ A mutable vector containing each line of editable text.
     , theLinesAboveCursor  :: !Int
       -- ^ The number of lines above the cursor
     , theLinesBelowCursor  :: !Int
       -- ^ The number of line below the cursor
-    , theBufferCursor      :: !(TextCursor tags)
+    , theBufferLineEditor      :: !(TextCursor tags)
       -- ^ A data structure for editing individual characters in a line of text.
     , theBufferInsertMode  :: !Bool
       -- ^ Whether or not the buffer is in insert mode, which means a 'TextLine' has been copied
-      -- into 'theBufferCursor'.
+      -- into 'theBufferLineEditor'.
     }
 
 data TextEditError
@@ -592,7 +592,7 @@ data TextEditError
   deriving (Eq, Ord)
 
 -- | A pair of functions used to break strings into lines. This function is called every time a
--- string is transferred from 'theBufferCursor' to to 'theLinesAbove' or 'theLinesBelow' to ensure
+-- string is transferred from 'theBufferLineEditor' to to 'theLinesAbove' or 'theLinesBelow' to ensure
 -- all strings entered into a buffer have no more than one line terminating character sequence at
 -- the end of them.
 --
@@ -604,7 +604,7 @@ data TextEditError
 data LineBreaker
   = LineBreaker
     { theLineBreakPredicate :: Char -> Bool
-      -- ^ This function is called by 'insertChar' to determine if the 'bufferCurrentLine' should be
+      -- ^ This function is called by 'insertChar' to determine if the 'bufferLineEditor' should be
       -- terminated.
     , theLineBreaker :: String -> [(String, String)]
       -- ^ This function scans through a string finding character sequences that delimit the end of
@@ -740,8 +740,8 @@ newTextBuffer = fmap TextBuffer . (newTextBufferState defaultInitBufferSize >=> 
 copyTextBuffer :: TextBuffer tags -> IO (TextBuffer tags)
 copyTextBuffer (TextBuffer mvar) = withMVar mvar $ \ old -> do
   newBuf <- copyVec (theBufferVector old) (theLinesAboveCursor old) (theLinesBelowCursor old)
-  newCur <- copyTextCursor $ theBufferCursor old
-  fmap TextBuffer $ newMVar $ old{ theBufferCursor = newCur, theBufferVector = newBuf }
+  newCur <- copyTextCursor $ theBufferLineEditor old
+  fmap TextBuffer $ newMVar $ old{ theBufferLineEditor = newCur, theBufferVector = newBuf }
 
 newTextBufferState :: Int -> tags -> IO (TextBufferState tags)
 newTextBufferState size tags = do
@@ -759,7 +759,7 @@ newTextBufferState size tags = do
     , theBufferVector      = buf
     , theLinesAboveCursor  = 0
     , theLinesBelowCursor  = 0
-    , theBufferCursor      = cur
+    , theBufferLineEditor  = cur
     , theBufferInsertMode  = False
     }
 
@@ -866,7 +866,7 @@ bufferDefaultTags :: Lens' (TextBufferState tags) tags
 bufferDefaultTags = bufferDefaultLine . textLineTags
 
 -- | The function used to break strings into lines. This function is called every time a string is
--- transferred from 'theBufferCursor' to 'theLinesAboveCursor' or 'theLinesBelow'. Note that setting
+-- transferred from 'theBufferLineEditor' to 'theLinesAboveCursor' or 'theLinesBelow'. Note that setting
 -- this function doesn't restructure the buffer, the old line breaks will still exist as they were
 -- before until the entire buffer is refreshed.
 --
@@ -878,7 +878,7 @@ bufferDefaultTags = bufferDefaultLine . textLineTags
 bufferLineBreaker :: Lens' (TextBufferState tags) LineBreaker
 bufferLineBreaker = lens theBufferLineBreaker $ \ a b -> a{ theBufferLineBreaker = b }
 
--- | This function is called by 'insertChar' to determine if the 'bufferCurrentLine' should be
+-- | This function is called by 'insertChar' to determine if the 'bufferLineEditor' should be
 -- terminated.
 lineBreakPredicate :: Lens' LineBreaker (Char -> Bool)
 lineBreakPredicate = lens theLineBreakPredicate $ \ a b -> a{ theLineBreakPredicate = b }
@@ -910,8 +910,8 @@ bufferInsertMode :: Lens' (TextBufferState tags) Bool
 bufferInsertMode = lens theBufferInsertMode $ \ a b -> a{ theBufferInsertMode = b }
 
 -- | The current line of text being edited under the cursor.
-bufferCurrentLine :: Lens' (TextBufferState tags) (TextCursor tags)
-bufferCurrentLine = lens theBufferCursor $ \ a b -> a{ theBufferCursor = b }
+bufferLineEditor :: Lens' (TextBufferState tags) (TextCursor tags)
+bufferLineEditor = lens theBufferLineEditor $ \ a b -> a{ theBufferLineEditor = b }
 
 -- | The null-terminated, UTF-8 encoded string of bytes stored in this line of text.
 textLineString :: Lens' (TextLine tags) CharVector
@@ -1265,10 +1265,10 @@ relativeToLine = \ case { Before -> linesAboveCursor; After -> linesBelowCursor;
   -- This function may dissapear if I decide to buffer lines in a mutable vector.
 
 -- Not for export: This function takes a 'RelativeToCursor' value and constructs a lens that can be
--- used to access a character index within the 'bufferCurrentLine'.
+-- used to access a character index within the 'bufferLineEditor'.
 relativeToChar :: RelativeToCursor -> Lens' (TextBufferState tags) Int
 relativeToChar =
-  (bufferCurrentLine .) . \ case { Before -> charsBeforeCursor; After -> charsAfterCursor; }
+  (bufferLineEditor .) . \ case { Before -> charsBeforeCursor; After -> charsAfterCursor; }
 
 -- Get an index into the 'bufferVector' from the current position of the cursor.
 cursorIndex :: Monad m => RelativeToCursor -> EditText tags m Int
@@ -1319,10 +1319,10 @@ copyVec oldVec before after = do
 -- given number of elements.
 growLineIfTooSmall :: MonadIO m => Int -> EditText tags m ()
 growLineIfTooSmall grow = do
-  cur <- use bufferCurrentLine
+  cur <- use bufferLineEditor
   buf <- liftIO $
     growVec (cur ^. lineEditBuffer) (cur ^. charsBeforeCursor) (cur ^. charsAfterCursor) grow
-  bufferCurrentLine . lineEditBuffer .= buf
+  bufferLineEditor . lineEditBuffer .= buf
 
 growBufferIfTooSmall :: MonadIO m => Int -> EditText tags m ()
 growBufferIfTooSmall grow = do
@@ -1332,7 +1332,7 @@ growBufferIfTooSmall grow = do
   liftIO (growVec buf above below grow) >>= assign bufferVector
 
 -- | Push a 'TextLine' before or after the cursor. This function does not effect the content of the
--- 'bufferCurrentLine'.
+-- 'bufferLineEditor'.
 pushLine
   :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
      , Show tags -- DEBUG
@@ -1363,9 +1363,9 @@ unsafePopLine rel = do
   return line --DEBUG
 
 -- | Pop a 'TextLine' from before or after the cursor. This function does not effect the content of
--- the 'bufferCurrentLine'. If you 'popLine' from 'Before' the cursor when the 'bufferCurrentLine'
+-- the 'bufferLineEditor'. If you 'popLine' from 'Before' the cursor when the 'bufferLineEditor'
 -- is at the beginning of the buffer, or if you 'popLine' from 'After' the cursor when the
--- 'bufferCurrentLine' is at the end of the buffer, 'Prelude.Nothing' will be returned.
+-- 'bufferLineEditor' is at the end of the buffer, 'Prelude.Nothing' will be returned.
 popLine
   :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
@@ -1415,7 +1415,7 @@ currentTextLocation
   => editor tags m TextLocation
 currentTextLocation = TextLocation <$> currentLineNumber <*> currentColumnNumber
 
--- | Create a copy of the 'bufferCurrentLine'.
+-- | Create a copy of the 'bufferLineEditor'.
 copyCurrentLine
   :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
@@ -1443,8 +1443,8 @@ writeLineIndex i line = liftEditText $
 
 -- | If not already in 'bufferInsertMode', this function copies the 'TextLine' at the 'LineIndex'
 -- given by 'linesAboveCursor' (i.e. it copies the line under the cursor) into the local
--- 'bufferCurrentLine' line editor. Functions that evaluate to an 'EditLine' function type can then
--- perform a character-by-character edit on the 'bufferCurrentLine' line editor. No 'TextLine's in
+-- 'bufferLineEditor' line editor. Functions that evaluate to an 'EditLine' function type can then
+-- perform a character-by-character edit on the 'bufferLineEditor' line editor. No 'TextLine's in
 -- the 'TextBuffer' are modified or overwritten until 'endInsertMode' is evaluated.
 --
 -- This function returns 'True' if the insertion mode state was changed successfully. If the
@@ -1468,9 +1468,9 @@ beginInsertMode = liftEditText $ do
     getElem Before >>= resumeEditLine False . editReplaceCurrentLine (indexToChar cur)
     return True
 
--- | If in 'bufferInsertMode', this function places the 'bufferCurrentLine' back into the text
+-- | If in 'bufferInsertMode', this function places the 'bufferLineEditor' back into the text
 -- buffer, overwriting the 'TextLine' at the 'LineIndex' given by 'linesAboveCursor'. This function
--- then clears the 'bufferCurrentLine' line editor.
+-- then clears the 'bufferLineEditor' line editor.
 --
 -- It is possible to move the 'linesAboveCursor' to some other 'LineIndex' while in insert mode,
 -- 'endInsertMode' does not care what the 'linesAboveCursor' was when 'beginInsertMode' was called,
@@ -1490,13 +1490,11 @@ endInsertMode
 endInsertMode = liftEditText $ do
   insMode <- use bufferInsertMode
   if not insMode then return False else do
-    vec   <- use bufferVector
-    above <- use linesAboveCursor
-    (copyCurrentLine <* clearCurrentLine) >>= liftIO . MVec.write vec (above - 1)
+    (copyCurrentLine <* clearCurrentLine) >>= putElem Before
     bufferInsertMode .= False
     return True
 
--- | Replace the content in the 'bufferCurrentLine' with the content in the given 'TextLine'. Pass
+-- | Replace the content in the 'bufferLineEditor' with the content in the given 'TextLine'. Pass
 -- an integer value indicating where the cursor position should be set. This function does not
 -- re-allocate the current line editor buffer unless it is too small to hold all of the characters
 -- in the given 'TextLine', meaning this function only grows the buffer memory allocation, it never
@@ -1536,7 +1534,7 @@ editReplaceCurrentLine (Absolute (CharIndex cur)) line = do
     copy $ (id &&& id) <$> [0 .. cur - 1]
     copy $ zip [targlen - cur - 1 .. targlen - 1] [srclen - cur - 1 .. srclen - 1]
 
--- | Delete the content of the 'bufferCurrentLine' except for the line breaking characters (if any)
+-- | Delete the content of the 'bufferLineEditor' except for the line breaking characters (if any)
 -- at the end of the line. This function does not change the memory allocation for the 'TextCursor',
 -- it simply sets the character count to zero. Tags on this line are not effected.
 clearCurrentLine
@@ -1548,9 +1546,9 @@ clearCurrentLine = liftEditLine $ do
   charsBeforeCursor .= 0
   use cursorBreakSize >>= assign charsAfterCursor . fromIntegral
 
--- | Like 'clearCurrentLine', this function deletes the content of the 'bufferCurrentLine', and tags
+-- | Like 'clearCurrentLine', this function deletes the content of the 'bufferLineEditor', and tags
 -- on this line are not effected. The difference is that this function replaces the
--- 'bufferCurrentLine' with a new empty line, resetting the line editor buffer to the default
+-- 'bufferLineEditor' with a new empty line, resetting the line editor buffer to the default
 -- allocation size and allowing the garbage collector to delete the previous allocation. This means
 -- the line editor buffer memory allocation may be shrunk to it's minimal/default size.
 resetCurrentLine
@@ -1559,7 +1557,7 @@ resetCurrentLine
      )
   => editor tags m ()
 resetCurrentLine = liftEditText $
-  use (bufferCurrentLine . textCursorTags) >>= liftIO . newTextCursor >>= assign bufferCurrentLine
+  use (bufferLineEditor . textCursorTags) >>= liftIO . newTextCursor >>= assign bufferLineEditor
 
 -- Not for export: exposes structure of internal mutable vector. Moves a region of elements near the
 -- cursor from top to bottom, or from bottom to top. Negative value for select indicates to select
@@ -1622,7 +1620,7 @@ moveByLine (Relative (LineIndex select)) = liftEditText $ do
   linesAboveCursor .= before
   linesBelowCursor .= after
 
--- | Move the cursor to a different character position within the 'bufferCurrentLine' by an @n ::
+-- | Move the cursor to a different character position within the 'bufferLineEditor' by an @n ::
 -- Int@ number of characters. A negative @n@ indicates moving toward the start of the line, a
 -- positive @n@ indicates moving toward the end of the line.
 moveByChar
@@ -1644,7 +1642,7 @@ moveByChar (Relative (CharIndex select)) = liftEditLine $ do
 unsafeInsertChar :: MonadIO m => RelativeToCursor -> Char -> EditText tags m ()
 unsafeInsertChar rel c = do
   growLineIfTooSmall 1
-  buf <- use $ bufferCurrentLine . lineEditBuffer
+  buf <- use $ bufferLineEditor . lineEditBuffer
   off <- use $ relativeToChar rel
   let len = UMVec.length buf
   let i   = case rel of { Before -> off; After -> len - off - 1; }
@@ -1656,7 +1654,7 @@ unsafeInsertString :: MonadIO m => RelativeToCursor -> CharVector -> EditText ta
 unsafeInsertString rel str = do
   let strlen = intSize str
   growLineIfTooSmall strlen
-  buf <- use $ bufferCurrentLine . lineEditBuffer
+  buf <- use $ bufferLineEditor . lineEditBuffer
   off <- use $ relativeToChar rel
   let len = UMVec.length buf
   let i0  = case rel of { Before -> off; After -> len - off - strlen; }
@@ -1763,7 +1761,7 @@ deleteCharsWrap rem@(Relative (CharIndex remaining)) = liftEditText $ do
       case firstLine of
         Nothing                     -> return $ Relative $ CharIndex 0
         Just (firstLine@TextLine{}) -> do
-          charCur <- use $ bufferCurrentLine . charsBeforeCursor
+          charCur <- use $ bufferLineEditor . charsBeforeCursor
           fmap (Relative . CharIndex . fst) $ forLines After (0, remaining) $ \ halt -> \ case
             TextLineUndefined -> error "deleteCharsWrap: forLines iterated on undefined line"
             line              -> get >>= \ result@(delCount, remaining) ->
@@ -1804,7 +1802,7 @@ insertString str = liftEditText $ use (bufferLineBreaker . lineBreaker) >>= init
         writeStr lbrk
         when (not $ null lbrk) $ do
           relativeToChar Before += length lbrk
-          cur <- use bufferCurrentLine
+          cur <- use bufferLineEditor
           let buf = cur ^. lineEditBuffer
           let beforeCount = cur ^. charsBeforeCursor - 1
           beforeChars <- liftIO $ forM [0 .. beforeCount - 1] $ UMVec.read buf
@@ -1907,7 +1905,7 @@ forLinesInBuffer
 forLinesInBuffer = forLinesInRange (Absolute 1) maxBound
 
 -- | Like 'forLinesInRange', but this function takes a 'RelativeToCursor' value, iteration begins
--- at the 'bufferCurrentLine', and if the 'RelativeToCursor' value is 'After' then iteration goes
+-- at the 'bufferLineEditor', and if the 'RelativeToCursor' value is 'After' then iteration goes
 -- forward to the end of the buffer, whereas if the 'RelativeToCursor' value is 'Before' then
 -- iteration goes backward to the start of the buffer.
 forLines
@@ -1939,7 +1937,7 @@ lineBreak rel = liftEditText $ do
   case rel of
     Before -> do
       unsafeInsertString Before lbrk
-      cursor <- use bufferCurrentLine
+      cursor <- use bufferLineEditor
       let vec = cursor ^. lineEditBuffer
       let cur = cursor ^. charsBeforeCursor
       str <- liftIO $! UVec.freeze $! UMVec.slice 0 cur vec
@@ -1948,9 +1946,9 @@ lineBreak rel = liftEditText $ do
         , theTextLineString    = str
         , theTextLineBreakSize = lbrkSize
         }
-      bufferCurrentLine . charsBeforeCursor .= 0
+      bufferLineEditor . charsBeforeCursor .= 0
     After  -> do
-      cursor <- use bufferCurrentLine
+      cursor <- use bufferLineEditor
       let vec = cursor ^. lineEditBuffer
       let len = UMVec.length vec
       let cur = cursor ^. charsAfterCursor
@@ -1961,7 +1959,7 @@ lineBreak rel = liftEditText $ do
           , theTextLineString    = str
           , theTextLineBreakSize = lbrkSize
           }
-        bufferCurrentLine . charsAfterCursor .= 0
+        bufferLineEditor . charsAfterCursor .= 0
       unsafeInsertString After lbrk
 
 ----------------------------------------------------------------------------------------------------
@@ -2280,7 +2278,7 @@ debugPrintBuffer = liftEditText $ do
     putStrLn $ "    bufferLineCount: " ++ show (above + below)
     putStrLn $ " __bufferInsertMode: " ++ show insmode
 
--- | The 'bufferCurrentLine', which is a 'TextCursor' is a separate data structure contained within
+-- | The 'bufferLineEditor', which is a 'TextCursor' is a separate data structure contained within
 -- the 'TextBuffer', and it is often not necessary to know this information when debugging, so you
 -- can print debugging information about the 'TextCursor' by evaluating this function whenever it is
 -- necessary.
@@ -2288,14 +2286,14 @@ debugPrintCursor
   :: (MonadEditText editor, Show tags, MonadIO (editor tags m), MonadIO m)
   => editor tags m ()
 debugPrintCursor = liftEditText $ do
-  cur <- use bufferCurrentLine
+  cur <- use bufferLineEditor
   let charVec    = theLineEditBuffer cur
   let charVecLen = UMVec.length charVec
   let before     = cur ^. charsBeforeCursor
   let after      = cur ^. charsAfterCursor
   liftIO $ do
     str <- forM [0 .. charVecLen - 1] $ UMVec.read charVec
-    putStrLn $ "    bufferCurrentLine: " ++ show str
+    putStrLn $ "     bufferLineEditor: " ++ show str
     putStrLn $ "       textCursorTags: " ++ show (cur ^. textCursorTags)
     putStrLn $ " __cursorVectorLength: " ++ show charVecLen
     putStrLn $ "    charsBeforeCursor: " ++ show before
