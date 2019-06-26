@@ -1407,11 +1407,25 @@ indexToLine = Absolute . LineIndex . (+ 1)
 indexToChar :: Int -> Absolute CharIndex
 indexToChar = Absolute . CharIndex . (+ 1)
 
+countToLine :: Int -> Relative LineIndex
+countToLine = Relative . LineIndex
+
+countToChar :: Int -> Absolute CharIndex
+countToChar = Relative . CharIndex
+
 lineToIndex :: Absolute LineIndex -> Int
 lineToIndex (Absolute (LineIndex i)) = i - 1
 
 charToIndex :: Absolute CharIndex -> Int
 charToIndex (Absolute (CharIndex i)) = i - 1
+
+lineToCount :: Relative LineIndex -> Int
+lineToCount (Relative (LineIndex i)) = i
+
+charToCount :: Relative CharIndex -> Int
+charToCount (Relative (CharIndex i)) = i
+
+----------------------------------------------------------------------------------------------------
 
 -- | Get the current line number of the cursor.
 currentLineNumber
