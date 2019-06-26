@@ -1031,7 +1031,8 @@ getRelToAbs
   => (Relative Int) -> m (Absolute Int)
 getRelToAbs (Relative i) = Absolute . (+ i) <$> getElemCount Before
 
--- Return the starting and ending index of the region of undefined elements.
+-- Return the starting and ending index of the void region of the buffer, which is the contiguous
+-- region of undefined elements within the buffer.
 getVoid
   :: (VecEditMonad (vec st elem) m, GMVec.MVector vec elem)
   => m (Maybe (Absolute Int, Absolute Int))
@@ -1066,8 +1067,9 @@ getSlice doCheck (Relative count) = do
     if doCheck && i > top then throwCountErr count else return $ GMVec.slice i count vec
    else return $ GMVec.slice 0 0 vec
 
--- Make a slice within the contiguous region of invalid elements after the cursor. This can be used
--- as the target of a vector copy. If the buffer is full, 'Nothing' is returned.
+-- Make a slice of the void region of the buffer (the contiguous region of invalid elements after
+-- the cursor). This can be used as the target of a vector copy. If the buffer is full, 'Nothing' is
+-- returned.
 getVoidSlice
   :: (VecEditMonad (vec st elem) m, GMVec.MVector vec elem)
   => Relative Int -> m (Maybe (vec st elem))
@@ -1128,7 +1130,28 @@ delElem
   => RelativeToCursor -> m ()
 delElem rel = join $ putElem rel <$> nullElem
 
--- If, and only if the vector is full, allocate a new vector with enough space to fit the requested
+-- Takes two paramters @oldSize@ and @newSize@. This function finds the minimum power of two scalara
+-- necessary to scale the @oldSize@ such that it is greater than or equal to the @newSize@. Said
+-- another way, this function repeatedly multiplies @oldSize@ by 2 until it is greater than (not
+-- equal to) the @newSize@ value.
+minPow2ScaledSize :: Int -> Int -> Int
+minPow2ScaledSize oldsiz newsiz = head $ dropWhile (<= newsiz) $ iterate (* 2) $ max 1 oldsiz
+
+-- Pass a minimum vector allocation size request as an argument. This function check the allocation
+-- size (using 'getAllocSize') of the current buffer vector. If the current allocation is larger
+-- than the size request argument, 'Nothing' is returned. If the current allocation is smaller than
+-- the size request, a new vector is allocated and returned in a 'Just' constructor. The new buffer
+-- is ONLY allocated and returned; the content of the current buffer is NOT copied, the current
+-- buffer is not replaced.
+prepLargerVector
+  :: (VecEditMonad (vec RealWorld elem) m, GMVec.MVector vec elem)
+  => Int -> m (Maybe (vec RealWorld elem))
+prepLargerVector newsiz = do
+  oldsiz <- getAllocSize
+  if oldsiz >= newsiz then return Nothing else
+    Just <$> newVector (minPow2ScaledSize oldsiz newsiz)
+
+-- If and only if the vector is full, allocate a new vector with enough space to fit the requested
 -- number of elements by doubling the size of the current vector until the size is large enough,
 -- then copy the elements from the current vector to the new vector, and then replace the current
 -- vector with the new one.
@@ -1136,19 +1159,18 @@ growVector
   :: (VecEditMonad (vec RealWorld elem) m, GMVec.MVector vec elem)
   => Int -> m ()
 growVector increase = if increase <= 0 then return () else do
-  siz <- getAllocSize
-  cur <- getElemCount Before
-  aft <- getElemCount After
-  let count  = cur + aft
-  let newsiz = count + increase
-  oldbef <- getLoSlice
-  oldaft <- getHiSlice
-  newVector (head $ dropWhile (<= newsiz) $ iterate (* 2) siz) >>= modVector . const
-  newbef <- getLoSlice
-  newaft <- getHiSlice
-  let copy to = liftIO . if unsafeMode then GMVec.unsafeCopy to else GMVec.copy to
-  copy newbef oldbef
-  copy newaft oldaft
+  count  <- countLines
+  prepLargerVector (count + increase) >>= \ case
+    Nothing     -> return ()
+    Just newvec -> do
+      oldbef <- getLoSlice
+      oldaft <- getHiSlice
+      modVector $ const newvec
+      newbef <- getLoSlice
+      newaft <- getHiSlice
+      let copy = (.) liftIO . if unsafeMode then GMVec.unsafeCopy else GMVec.copy
+      copy newbef oldbef
+      copy newaft oldaft
 
 -- Push a single element to the index 'Before' (currently on) the cursor, or the index 'After' the
 -- cursor, and then shift the cursor to point to the pushed element.
@@ -1517,22 +1539,23 @@ editReplaceCurrentLine
      , Show tags --DEBUG
      )
   => Absolute CharIndex -> TextLine tags -> EditLine tags m ()
-editReplaceCurrentLine (Absolute (CharIndex cur)) line = do
-  let srcvec = line ^. textLineString
+editReplaceCurrentLine cur' line = do
+  let srcvec = theTextLineString line
   let srclen = intSize srcvec
-  cur <- pure $ max 0 $ min (cur - 1) srclen
-  targvec <- use lineEditBuffer
-  let targlen = UMVec.length targvec
-  targvec <- if targlen >= srclen then return targvec else liftIO $
-    UMVec.new $ head $ dropWhile (< srclen) $ iterate (* 2) targlen
-  let targlen = UMVec.length targvec
+  let lbrksz = theTextLineBreakSize line
+  let srctop = srclen - fromIntegral lbrksz
+  let cur    = max 0 $ min srctop $ charToIndex cur'
+  join $ maybe (pure ()) (void . modVector . const) <$> prepLargerVector srclen
   charsBeforeCursor .= cur
-  charsAfterCursor  .= srclen - cur
-  textCursorTags    .= line ^. textLineTags
+  charsAfterCursor  .= srctop - cur
+  cursorBreakSize   .= lbrksz
+  textCursorTags    .= theTextLineTags line
+  targlo <- getLoSlice
+  targhi <- getHiSlice
   liftIO $ do
-    let copy = mapM_ $ UMVec.write targvec *** (srcvec UVec.!) >>> app
-    copy $ (id &&& id) <$> [0 .. cur - 1]
-    copy $ zip [targlen - cur - 1 .. targlen - 1] [srclen - cur - 1 .. srclen - 1]
+    let copy = if unsafeMode then UVec.unsafeCopy else UVec.copy
+    when (cur > 0) $ copy targlo $ UVec.slice 0 cur srcvec
+    copy targhi $ UVec.slice cur (srclen - cur) srcvec
 
 -- | Delete the content of the 'bufferLineEditor' except for the line breaking characters (if any)
 -- at the end of the line. This function does not change the memory allocation for the 'TextCursor',
