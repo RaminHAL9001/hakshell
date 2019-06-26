@@ -1410,7 +1410,7 @@ indexToChar = Absolute . CharIndex . (+ 1)
 countToLine :: Int -> Relative LineIndex
 countToLine = Relative . LineIndex
 
-countToChar :: Int -> Absolute CharIndex
+countToChar :: Int -> Relative CharIndex
 countToChar = Relative . CharIndex
 
 lineToIndex :: Absolute LineIndex -> Int
@@ -1650,12 +1650,7 @@ moveByLine
      , Show tags --DEBUG
      )
   => Relative LineIndex -> editor tags m ()
-moveByLine (Relative (LineIndex select)) = liftEditText $ do
-  vec <- use bufferVector
-  (before, after) <- (,) <$> use linesAboveCursor <*> use linesBelowCursor
-  (before, after) <- liftIO $ shiftElems TextLineUndefined vec select before after
-  linesAboveCursor .= before
-  linesBelowCursor .= after
+moveByLine = liftEditText . shiftCursor True . Relative . lineToCount
 
 -- | Move the cursor to a different character position within the 'bufferLineEditor' by an @n ::
 -- Int@ number of characters. A negative @n@ indicates moving toward the start of the line, a
@@ -1665,15 +1660,7 @@ moveByChar
      , Show tags --DEBUG
      )
   => Relative CharIndex -> editor tags m ()
-moveByChar (Relative (CharIndex select)) = liftEditLine $ do
-  after  <- use charsAfterCursor
-  lbrksz <- use cursorBreakSize
-  select <- pure $ if select <= 0 then select else min select $ max 0 (after - fromIntegral lbrksz)
-  vec    <- use lineEditBuffer
-  (before, after) <- (,) <$> use charsBeforeCursor <*> use charsAfterCursor >>=
-    liftIO . uncurry (shiftElems '\0' vec select)
-  charsBeforeCursor .= before
-  charsAfterCursor  .= after
+moveByChar = liftEditLine . shiftCursor True . Relative . charToCount
 
 -- Not for export: does not filter line-breaking characters.
 unsafeInsertChar :: MonadIO m => RelativeToCursor -> Char -> EditText tags m ()
