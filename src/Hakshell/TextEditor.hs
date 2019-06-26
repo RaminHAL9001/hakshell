@@ -942,6 +942,7 @@ class MonadIO m => MonadEditVec vec m | m -> vec where
   newVector :: Int -> m vec
   modVector :: (vec -> vec) -> m vec
   modCount  :: RelativeToCursor -> (Int -> Int) -> m Int
+  cursorIndex :: RelativeToCursor -> m Int -- line editors and text editor have different cursors
   throwLimitErr :: RelativeToCursor -> m void
   throwIndexErr :: Int -> m void
   throwCountErr :: Int -> m void
@@ -954,6 +955,9 @@ instance MonadIO m => MonadEditVec (MVec.IOVector (TextLine tags)) (EditText tag
   modCount rel f = state $ \ st -> case rel of
     Before -> let i = f $ theLinesAboveCursor st in (i, st{ theLinesAboveCursor = i })
     After  -> let i = f $ theLinesBelowCursor st in (i, st{ theLinesBelowCursor = i })
+  cursorIndex = \ case
+    Before -> subtract 1 <$> getElemCount Before
+    After  -> getElemCount After
   throwLimitErr = throwError . EndOfLineBuffer
   throwIndexErr = throwError . LineIndexOutOfRange . Absolute . LineIndex
   throwCountErr = throwError . LineCountOutOfRange . Relative . LineIndex
@@ -966,6 +970,7 @@ instance MonadIO m => MonadEditVec (UMVec.IOVector Char) (EditLine tags m) where
   modCount rel f = state $ \ st -> case rel of
     Before -> let i = f $ theCharsBeforeCursor st in (i, st{ theCharsBeforeCursor = i })
     After  -> let i = f $ theCharsAfterCursor  st in (i, st{ theCharsAfterCursor  = i })
+  cursorIndex = getElemCount
   throwLimitErr = throwError . EndOfCharBuffer
   throwIndexErr = throwError . CharIndexOutOfRange . Absolute . CharIndex
   throwCountErr = throwError . CharCountOutOfRange . Relative . CharIndex
@@ -994,6 +999,15 @@ countLines = (+) <$> getElemCount Before <*> getElemCount After
 getUnusedSpace :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem) => m Int
 getUnusedSpace = subtract <$> countLines <*> getAllocSize
 
+-- Like 'cursorIndex' but evaluates to an exception if the index is out of bounds.
+cursorIndexChk
+  :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem)
+  => RelativeToCursor -> m Int
+cursorIndexChk rel = do
+  siz <- getAllocSize
+  i   <- cursorIndex rel
+  if 0 <= i && i < siz then return i else throwLimitErr rel
+
 -- The top-most index, regardless of whether the index contains a valid line.
 getTopIndex :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem) => m Int
 getTopIndex = subtract 1 <$> getAllocSize
@@ -1006,7 +1020,9 @@ getTopIndexChk = getElemCount After >>= \ i ->
 -- Translate a 'Before' or 'After' value to an 'Int' index value into a vector. When selecting the
 -- element 'After', a bounds check is performed to ensure that the cursor is not at the end of the
 -- buffer.
-getRelIndex :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem) => RelativeToCursor -> m Int
+getRelIndex
+  :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem)
+  => RelativeToCursor -> m Int
 getRelIndex = \ case { Before -> getElemCount Before; After -> getTopIndexChk; }
 
 -- Gets the index of the first valid line after the cursor. Bounds checking is __NOT__ performed.
@@ -1119,14 +1135,14 @@ getElemIndex i = read <$> getVector <*> pure i >>= liftIO where
 putElem
   :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem)
   => RelativeToCursor -> elem -> m ()
-putElem rel elem = join $ putElemIndex <$> getRelIndex rel <*> pure elem
+putElem rel elem = join $ putElemIndex <$> cursorIndex rel <*> pure elem
 
 -- Like 'getElemIndex' but the index from which the element is read is given by a 'RelativeToCursor'
 -- value, so the index returned by 'getRelIndex'. The cursor position is not modified.
 getElem
   :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem)
   => RelativeToCursor -> m elem
-getElem = getRelIndex >=> getElemIndex
+getElem = cursorIndex >=> getElemIndex
 
 -- Like 'putElem' but the @elem@ value to be put is taken from the 'nullElem' for this 'MonadEditVec'
 -- context. The cursor position is not modified.
@@ -1296,12 +1312,6 @@ relativeToLine = \ case { Before -> linesAboveCursor; After -> linesBelowCursor;
 relativeToChar :: RelativeToCursor -> Lens' (TextBufferState tags) Int
 relativeToChar =
   (bufferLineEditor .) . \ case { Before -> charsBeforeCursor; After -> charsAfterCursor; }
-
--- Get an index into the 'bufferVector' from the current position of the cursor.
-cursorIndex :: Monad m => RelativeToCursor -> EditText tags m Int
-cursorIndex = \ case
-  Before -> use linesAboveCursor
-  After  -> (-) <$> (MVec.length <$> use bufferVector) <*> use linesBelowCursor
 
 -- Not for export: unsafe, requires correct accounting of cursor positions, otherwise segfaults may
 -- occur. The cursor is implemented by keeping a mutable array in which elements before the cursor
