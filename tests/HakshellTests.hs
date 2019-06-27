@@ -1,6 +1,5 @@
 module Main where
 
-import           Hakshell.String
 import           Hakshell.TextEditor
 
 import           Control.Monad.IO.Class
@@ -35,8 +34,8 @@ showLoc
 
 testTextEditor :: (String -> IO ()) -> TextBuffer tags -> EditText tags IO () -> IO ()
 testTextEditor onErr buf f = runEditTextIO f buf >>= \ case
-  Left (TextEditError err) -> onErr $ unpack err
-  Right a -> return a
+  Left err -> onErr $ show err
+  Right a  -> return a
 
 defaultTags :: Tags
 defaultTags = ()

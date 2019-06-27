@@ -163,7 +163,6 @@ import           Data.Semigroup
 import qualified Data.Vector                 as Vec
 import qualified Data.Vector.Mutable         as MVec
 import qualified Data.Vector.Unboxed         as UVec
-import qualified Data.Vector.Generic         as GVec
 import qualified Data.Vector.Generic.Mutable as GMVec
 import qualified Data.Vector.Unboxed.Mutable as UMVec
 import           Data.Word
@@ -589,7 +588,7 @@ data TextEditError
   | LineCountOutOfRange !(Relative LineIndex)
   | CharIndexOutOfRange !(Absolute CharIndex)
   | CharCountOutOfRange !(Relative CharIndex)
-  deriving (Eq, Ord)
+  deriving (Eq, Ord, Show)
 
 -- | A pair of functions used to break strings into lines. This function is called every time a
 -- string is transferred from 'theBufferLineEditor' to to 'theLinesAbove' or 'theLinesBelow' to ensure
@@ -795,24 +794,6 @@ copyTextCursorIO cur = do
 textCursorCharCount :: TextCursor tags -> Int
 textCursorCharCount cur = theCharsBeforeCursor cur + theCharsAfterCursor cur
 
--- Not for export: unsafe because it does not check for line breaks in the given string. This
--- function copies the characters from a 'TextCursor' buffer into a pure 'TextLine'.
-unsafeMakeLine :: TextCursor tags -> IO (TextLine tags)
-unsafeMakeLine cur = do
-  let buf = theLineEditBuffer cur
-  let len = UMVec.length buf
-  let chars start count =
-        if count <= 0 then pure "" else forM [start .. start + count - 1] $ UMVec.read buf
-  let beforeCount = cur ^. charsBeforeCursor
-  let afterCount  = cur ^. charsAfterCursor
-  beforeChars <- chars 0 beforeCount 
-  afterChars  <- chars (len - 1 - afterCount) afterCount
-  return TextLine
-    { theTextLineString    = packSize (textCursorCharCount cur) $ beforeChars ++ afterChars
-    , theTextLineTags      = theTextCursorTags cur
-    , theTextLineBreakSize = 0
-    }
-
 -- | Create a new 'TextCursor' from a 'TextLine'. The 'TextCursor' can be updated with an 'EditLine'
 -- function. Note that this function works in any monadic function type @m@ which instantiates
 -- 'Control.Monad.IO.Class.MonadIO', so this will work in the @IO@ monad, the 'EditText' monad, the
@@ -975,10 +956,6 @@ instance MonadIO m => MonadEditVec (UMVec.IOVector Char) (EditLine tags m) where
   throwIndexErr = throwError . CharIndexOutOfRange . Absolute . CharIndex
   throwCountErr = throwError . CharCountOutOfRange . Relative . CharIndex
 
--- Convenient zero value
-m0 :: Monad m => m Int
-m0 = return 0
-
 -- The vector of the text buffer.
 getVector :: MonadEditVec vec m => m vec
 getVector = modVector id
@@ -1016,14 +993,6 @@ getTopIndex = subtract 1 <$> getAllocSize
 getTopIndexChk :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem) => m Int
 getTopIndexChk = getElemCount After >>= \ i ->
   if i <= 0 then throwLimitErr After else getTopIndex
-
--- Translate a 'Before' or 'After' value to an 'Int' index value into a vector. When selecting the
--- element 'After', a bounds check is performed to ensure that the cursor is not at the end of the
--- buffer.
-getRelIndex
-  :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem)
-  => RelativeToCursor -> m Int
-getRelIndex = \ case { Before -> getElemCount Before; After -> getTopIndexChk; }
 
 -- Gets the index of the first valid line after the cursor. Bounds checking is __NOT__ performed.
 getIndexAfterCur :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem) => m Int
@@ -1130,7 +1099,7 @@ getElemIndex i = read <$> getVector <*> pure i >>= liftIO where
   read = if unsafeMode then GMVec.unsafeRead else GMVec.read
 
 -- Like 'putElemIndex' but the index to which the element is written is given by a
--- 'RelativeToCursor' value, so the index returned by 'getRelIndex'. The cursor position is not
+-- 'RelativeToCursor' value, so the index returned by 'cursorIndex'. The cursor position is not
 -- modified.
 putElem
   :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem)
@@ -1138,7 +1107,7 @@ putElem
 putElem rel elem = join $ putElemIndex <$> cursorIndex rel <*> pure elem
 
 -- Like 'getElemIndex' but the index from which the element is read is given by a 'RelativeToCursor'
--- value, so the index returned by 'getRelIndex'. The cursor position is not modified.
+-- value, so the index returned by 'cursorIndex'. The cursor position is not modified.
 getElem
   :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem)
   => RelativeToCursor -> m elem
@@ -1152,9 +1121,14 @@ delElem
 delElem rel = join $ putElem rel <$> nullElem
 
 -- Takes two paramters @oldSize@ and @newSize@. This function finds the minimum power of two scalara
--- necessary to scale the @oldSize@ such that it is greater than or equal to the @newSize@. Said
--- another way, this function repeatedly multiplies @oldSize@ by 2 until it is greater than (not
--- equal to) the @newSize@ value.
+-- necessary to scale the @oldSize@ such that it is __greater_than__ the @newSize@. Said another
+-- way, this function repeatedly multiplies @oldSize@ by 2 until it is greater than (not equal to)
+-- the @newSize@ value.
+--
+-- Note that this function does ever not return a value equal to @newSize@, the assumption is that
+-- this function is used to grow a buffer, not to make it exactly the size required. If you want
+-- this function to return a value equal to the exact amount, try passing a @newSize@ value equal to
+-- @oldSize * 2^n - 1@ for some integer @n@.
 minPow2ScaledSize :: Int -> Int -> Int
 minPow2ScaledSize oldsiz newsiz = head $ dropWhile (<= newsiz) $ iterate (* 2) $ max 1 oldsiz
 
@@ -1216,8 +1190,8 @@ popElem rel = getElem rel >>= \ elem -> delElem rel >> return elem
 -- bounds.
 shiftCursor
   :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem)
-  => Bool -> Relative Int -> m ()
-shiftCursor doCheck rc@(Relative count) = if count == 0 then return () else getVoid >>= \ case
+  => Relative Int -> m ()
+shiftCursor (Relative count) = if count == 0 then return () else getVoid >>= \ case
   Nothing -> do
     siz <- getAllocSize
     cur <- getElemCount Before
@@ -1632,43 +1606,6 @@ copyLineEditor
   => editor tags m (TextCursor tags)
 copyLineEditor = liftEditText $ use bufferLineEditor >>= liftIO . copyTextCursorIO
 
--- Not for export: exposes structure of internal mutable vector. Moves a region of elements near the
--- cursor from top to bottom, or from bottom to top. Negative value for select indicates to select
--- elements before the cursor, positive means after the cursor. Returns updated before and after
--- values.
-shiftElems
-  :: (GMVec.MVector vector a, PrimMonad m)
-  => a -> vector (PrimState m) a -> Int -> Int -> Int -> m (Int, Int)
-shiftElems nil vec select' before after =
-  if select == 0 then noop
-  else if select > 0
-  then if after  <= 0 then noop else
-       if select ==   1  then moveSingle before (len - after) else moveBlock
-  else if select < 0
-  then if before <= 0 then noop else
-       if select == (-1) then moveSingle (len - 1 - after) before else moveBlock
-  else error $ "internal error: this should never happen. " ++
-         "(shiftElems " ++ show select' ++ ' ':show before ++ ' ':show after ++ ")"
-  where
-    noop   = return (before, after)
-    select = max (negate before) . min after $ select'
-    len    = GMVec.length vec
-    slice  = if unsafeMode then GMVec.unsafeSlice else GMVec.slice
-    (toSlice, fromSlice) =
-      if select > 0
-      then (slice before select vec, slice (len - after) select vec)
-      else if select < 0 then
-        ( slice (len - after + select) (negate select) vec
-        , slice (before + select) (negate select) vec
-        )
-      else error $ "shiftElems: select="++show select++", this should never happen"
-    clear slice = forM_ [0 .. GMVec.length slice - 1] $ flip (GMVec.write slice) nil
-    done = return (before + select, after - select)
-    moveSingle to from =
-      GMVec.read vec from >>= GMVec.write vec to >> GMVec.write vec from nil >> done
-    moveBlock = 
-      GMVec.move toSlice fromSlice >> clear fromSlice >> done
-
 -- | This function calls 'moveByLine' and then 'moveByChar' to move the cursor by a number of lines
 -- and characters relative to the current cursor position.
 moveCursor
@@ -1686,7 +1623,7 @@ moveByLine
      , Show tags --DEBUG
      )
   => Relative LineIndex -> editor tags m ()
-moveByLine = liftEditText . shiftCursor True . Relative . lineToCount
+moveByLine = liftEditText . shiftCursor . Relative . lineToCount
 
 -- | Move the cursor to a different character position within the 'bufferLineEditor' by an @n ::
 -- Int@ number of characters. A negative @n@ indicates moving toward the start of the line, a
@@ -1696,7 +1633,7 @@ moveByChar
      , Show tags --DEBUG
      )
   => Relative CharIndex -> editor tags m ()
-moveByChar = liftEditLine . shiftCursor True . Relative . charToCount
+moveByChar = liftEditLine . shiftCursor . Relative . charToCount
 
 -- | Go to an absolute line number, the first line is 1 (line 0 and below all send the cursor to
 -- line 1), the last line is 'Prelude.maxBound'.
@@ -1763,7 +1700,7 @@ insertChar
   => RelativeToCursor -> Char -> editor tags m (Relative CharIndex)
 insertChar rel c = liftEditText $ Relative . CharIndex <$> do
   isBreak <- use $ bufferLineBreaker . lineBreakPredicate
-  if isBreak c then return 0 else liftEditLine (pushElem Before c) >> return 1
+  if isBreak c then return 0 else liftEditLine (pushElem rel c) >> return 1
 
 -- | This function only deletes characters on the current line, if the cursor is at the start of the
 -- line and you evaluate @'deleteChars' 'Before'@, this function does nothing. This function does
@@ -1797,52 +1734,7 @@ deleteCharsWrap
      , Show tags --DEBUG
      )
   => Relative CharIndex -> editor tags m (Relative CharIndex)
-deleteCharsWrap rem@(Relative (CharIndex remaining)) = liftEditText $ do
-  insMode <- use bufferInsertMode
-  if remaining < 0 then
-    if insMode then do
-      (Relative (CharIndex delCount)) <- deleteChars rem
-      remaining <- pure $ remaining - delCount
-      popLine Before >>= \ case
-        Nothing -> return $ Relative $ CharIndex delCount
-        Just{}  -> fmap (Relative . CharIndex . fst) $
-          forLines Before (delCount, remaining) $ \ halt -> \ case
-            TextLineUndefined -> error "deleteCharsWrap: forLines iterated on undefined line"
-            line              -> get >>= \ result@(delCount, remaining) ->
-              if remaining <= 0 then halt result else do
-                let lbrksz = fromIntegral $ theTextLineBreakSize line
-                let len    = intSize line - min 1 lbrksz
-                put (delCount + len, remaining - len)
-                if len < remaining then return [] else do
-                  liftEditText $ unsafeInsertString After $ theTextLineString $
-                    sliceLineToEnd After (Absolute $ CharIndex $ len - remaining) line
-                  pure <$> copyCurrentLine
-    else do
-      firstLine <- popLine Before
-      case firstLine of
-        Nothing                     -> return $ Relative $ CharIndex 0
-        Just (firstLine@TextLine{}) -> do
-          charCur <- use $ bufferLineEditor . charsBeforeCursor
-          fmap (Relative . CharIndex . fst) $ forLines After (0, remaining) $ \ halt -> \ case
-            TextLineUndefined -> error "deleteCharsWrap: forLines iterated on undefined line"
-            line              -> get >>= \ result@(delCount, remaining) ->
-              if remaining <= 0 then halt result else do
-                let lbrksz = fromIntegral $ theTextLineBreakSize line
-                let len    = intSize line - min 1 lbrksz
-                put (delCount + len, remaining - len)
-                return $ if len < remaining then [] else pure TextLine
-                  { theTextLineString    =
-                      UVec.slice 0 (intSize line - lbrksz - remaining) (theTextLineString line) <>
-                      UVec.slice charCur (intSize firstLine - charCur) (theTextLineString firstLine)
-                  , theTextLineTags      = theTextLineTags line
-                  , theTextLineBreakSize = theTextLineBreakSize firstLine
-                  }
-        _                           -> error $
-          "deleteCharsWrap: unsafePopLine Before --> TextLineUndefined"++
-          "\n  remaining = "++show remaining++"\n"
-  else if remaining > 0 then do
-    error "TODO: deleteCharsWrap After"
-  else return $ Relative $ CharIndex 0
+deleteCharsWrap = error "TODO"
 
 -- | This function evaluates the 'lineBreaker' function on the given string, and beginning from the
 -- current cursor position, begins inserting all the lines of text produced by the 'lineBreaker'
