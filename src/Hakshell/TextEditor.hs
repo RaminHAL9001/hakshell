@@ -98,7 +98,7 @@ module Hakshell.TextEditor
     currentTextLocation, currentLineNumber, currentColumnNumber,
     -- ** Manipulating Lines of Text
     beginInsertMode, endInsertMode,
-    copyCurrentLine, replaceCurrentLine,
+    copyLineEditorText, replaceCurrentLine,
     pushLine, popLine,
     readLineIndex, writeLineIndex,
     forLines, forLinesInRange, forLinesInBuffer,
@@ -161,6 +161,7 @@ import           Control.Monad.State.Class
 
 import           Data.Semigroup
 import qualified Data.Vector                 as Vec
+import qualified Data.Vector.Generic         as GVec
 import qualified Data.Vector.Mutable         as MVec
 import qualified Data.Vector.Unboxed         as UVec
 import qualified Data.Vector.Generic.Mutable as GMVec
@@ -417,7 +418,9 @@ editLine
      , Show tags --DEBUG
      )
   => EditLine tags m a -> EditText tags m a
-editLine f = beginInsertMode >>= flip resumeEditLine f
+editLine f = do
+  modeChanged <- beginInsertMode
+  resumeEditLine f <* when modeChanged (void endInsertMode)
 
 -- not for export
 --
@@ -428,12 +431,10 @@ editLine f = beginInsertMode >>= flip resumeEditLine f
 resumeEditLine
   :: (MonadIO m
      , Show tags --DEBUG
-     ) => Bool -> EditLine tags m a -> EditText tags m a
-resumeEditLine modeChanged (EditLine f) = do
-  let end = when modeChanged $ void endInsertMode
-  use bufferLineEditor >>= runStateT (runExceptT f) >>= \ case
-    (Left err, _   ) -> end >> throwError err
-    (Right  a, line) -> bufferLineEditor .= line >> end >> return a
+     ) => EditLine tags m a -> EditText tags m a
+resumeEditLine (EditLine f) = use bufferLineEditor >>= runStateT (runExceptT f) >>= \ case
+  (Left err, _   ) -> throwError err
+  (Right  a, line) -> bufferLineEditor .= line >> return a
 
 ----------------------------------------------------------------------------------------------------
 
@@ -960,7 +961,7 @@ instance MonadIO m => MonadEditVec (UMVec.IOVector Char) (EditLine tags m) where
 getVector :: MonadEditVec vec m => m vec
 getVector = modVector id
 
--- Returns the number of valid elements on or before the cursor.
+-- Returns the number of valid elements on or 'Before' the cursor, or 'After' the cursor.
 getElemCount :: MonadEditVec vec m => RelativeToCursor -> m Int
 getElemCount = flip modCount id
 
@@ -968,7 +969,7 @@ getElemCount = flip modCount id
 getAllocSize :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem) => m Int
 getAllocSize = GMVec.length <$> getVector
 
--- The number of valid lines in the buffer @(bufCurIndex + bufferLinesBelowCursor)@.
+-- The number of valid lines in the buffer @('getElemCount' 'Before' + 'getElemCount' 'After')@.
 countLines :: MonadEditVec vec m => m Int
 countLines = (+) <$> getElemCount Before <*> getElemCount After
 
@@ -1163,9 +1164,9 @@ growVector increase = if increase <= 0 then return () else do
       modVector $ const newvec
       newbef <- getLoSlice
       newaft <- getHiSlice
-      let copy = (.) liftIO . if unsafeMode then GMVec.unsafeCopy else GMVec.copy
-      copy newbef oldbef
-      copy newaft oldaft
+      liftIO $ do
+        GMVec.copy newbef oldbef
+        GMVec.copy newaft oldaft
 
 -- Push a single element to the index 'Before' (currently on) the cursor, or the index 'After' the
 -- cursor, and then shift the cursor to point to the pushed element.
@@ -1205,12 +1206,28 @@ shiftCursor (Relative count) = if count == 0 then return () else getVoid >>= \ c
     else do
       vec  <- getVector
       from <- getSlice True $ Relative count -- necessary bounds checking is done in 'getSlice'
+      let slice = if unsafeMode then GMVec.unsafeSlice else GMVec.slice
       let to = vec &
-            if      count > 1 then GMVec.slice lo count
-            else if count < 1 then GMVec.slice (hi + count) (negate count)
+            if      count > 1 then slice lo count
+            else if count < 1 then slice (hi + count) (negate count)
             else error "shiftCursor: internal error, this should never happen"
-      let copy = if unsafeMode then GMVec.unsafeCopy else GMVec.copy
-      liftIO $ copy to from
+      liftIO $ GMVec.copy to from
+
+-- Create a duplicate of the vector within.
+dupVector :: (GMVec.MVector v a, MonadEditVec (v RealWorld a) m) => m (v RealWorld a)
+dupVector = getVector >>= liftIO . GMVec.clone
+
+-- Copy the current mutable buffer vector to an immutable vector.
+freezeVector :: (GVec.Vector v a, MonadEditVec (GVec.Mutable v RealWorld a) m) => m (v a)
+freezeVector = do
+  newvec <- countLines >>= newVector
+  bef <- getLoSlice
+  aft <- getHiSlice
+  let slice = if unsafeMode then GMVec.unsafeSlice else GMVec.slice
+  liftIO $ do
+    GMVec.copy (slice 0 (GMVec.length bef) newvec) bef
+    GMVec.copy (slice (GMVec.length bef) (GMVec.length aft) newvec) aft
+    GVec.unsafeFreeze newvec
 
 ----------------------------------------------------------------------------------------------------
 
@@ -1301,11 +1318,10 @@ growVec vec before after addElems = do
   let len = GMVec.length vec
   if reqSize <= len then return vec else do
     let newSize = head $ dropWhile (< reqSize) $ iterate (* 2) len
-    let copy  = if unsafeMode then GMVec.copy  else GMVec.unsafeCopy
     let slice = if unsafeMode then GMVec.slice else GMVec.unsafeSlice
     newVec <- GMVec.new newSize
-    copy (slice 0 before newVec) (slice 0 before vec)
-    copy (slice (len - after) after newVec) (slice (len - after) after vec)
+    GMVec.copy (slice 0 before newVec) (slice 0 before vec)
+    GMVec.copy (slice (len - after) after newVec) (slice (len - after) after vec)
     return newVec
 
 -- Not for export: creates a deep-copy of a vector with a cursor, in which elements before the
@@ -1318,11 +1334,10 @@ copyVec
 copyVec oldVec before after = do
   let len   = GMVec.length oldVec
   let upper = len - after
-  let copy  = if unsafeMode then GMVec.unsafeCopy  else GMVec.copy
   let slice = if unsafeMode then GMVec.unsafeSlice else GMVec.slice
   newVec <- GMVec.new len
-  when (before > 0) $ copy (slice     0 before newVec) (slice     0 before oldVec)
-  when (after  > 0) $ copy (slice upper  after newVec) (slice upper  after oldVec)
+  when (before > 0) $ GMVec.copy (slice     0 before newVec) (slice     0 before oldVec)
+  when (after  > 0) $ GMVec.copy (slice upper  after newVec) (slice upper  after oldVec)
   return newVec
 
 -- Not for export: should be executed automatically by insertion operations. Increases the size of
@@ -1440,13 +1455,20 @@ currentTextLocation
   => editor tags m TextLocation
 currentTextLocation = TextLocation <$> currentLineNumber <*> currentColumnNumber
 
+copyLineEditor'
+  :: (MonadIO m
+     , Show tags --DEBUG
+     )
+  => EditLine tags m (TextLine tags)
+copyLineEditor' = TextLine <$> freezeVector <*> use textCursorTags <*> use cursorBreakSize
+
 -- | Create a copy of the 'bufferLineEditor'.
-copyCurrentLine
-  :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
+copyLineEditorText
+  :: (MonadEditLine editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
      )
   => editor tags m (TextLine tags)
-copyCurrentLine = liftEditText $ getElem Before
+copyLineEditorText = liftEditLine copyLineEditor'
 
 -- | Read a 'TextLine' from an @('Absolute' 'LineIndex')@ address.
 readLineIndex
@@ -1456,7 +1478,7 @@ readLineIndex
   => Absolute LineIndex -> editor tags m (TextLine tags)
 readLineIndex i = liftEditText $ getAbsoluteChk (Absolute $ lineToIndex i) >>= getElemIndex
 
--- | Write a 'TextLine' (as produced by 'copyCurrentLine' or readLineIndex') to an @('Absolute'
+-- | Write a 'TextLine' (as produced by 'copyLineEditorText' or readLineIndex') to an @('Absolute'
 -- 'LineIndex')@ address.
 writeLineIndex
   :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
@@ -1491,7 +1513,7 @@ beginInsertMode = liftEditText $ do
       if after <= 0 then use bufferDefaultLine else popElem After
     before <- getElemCount Before
     elem   <- getElemIndex (before - 1)
-    resumeEditLine False $ join $
+    resumeEditLine $ join $
       editReplaceCurrentLine <$> (indexToChar <$> getElemCount Before) <*> pure elem
     return True
 
@@ -1517,7 +1539,7 @@ endInsertMode
 endInsertMode = liftEditText $ do
   insMode <- use bufferInsertMode
   if not insMode then return False else do
-    (copyCurrentLine <* clearCurrentLine) >>= putElem Before
+    (resumeEditLine copyLineEditor' <* clearCurrentLine) >>= putElem Before
     bufferInsertMode .= False
     return True
 
@@ -1558,9 +1580,9 @@ editReplaceCurrentLine cur' line = do
   targlo <- getLoSlice
   targhi <- getHiSlice
   liftIO $ do
-    let copy = if unsafeMode then UVec.unsafeCopy else UVec.copy
-    when (cur > 0) $ copy targlo $ UVec.slice 0 cur srcvec
-    copy targhi $ UVec.slice cur (srclen - cur) srcvec
+    let slice = if unsafeMode then UVec.unsafeSlice else UVec.slice
+    when (cur > 0) $ UVec.copy targlo $ slice 0 cur srcvec
+    UVec.copy targhi $ slice cur (srclen - cur) srcvec
 
 -- | Delete the content of the 'bufferLineEditor' except for the line breaking characters (if any)
 -- at the end of the line. This function does not change the memory allocation for the 'TextCursor',
@@ -1668,17 +1690,6 @@ gotoPosition (TextLocation{theLocationLineIndex=line,theLocationCharIndex=col}) 
   liftEditText $ gotoLine line >> gotoChar col
 
 -- Not for export: does not filter line-breaking characters.
-unsafeInsertChar :: MonadIO m => RelativeToCursor -> Char -> EditText tags m ()
-unsafeInsertChar rel c = do
-  growLineIfTooSmall 1
-  buf <- use $ bufferLineEditor . lineEditBuffer
-  off <- use $ relativeToChar rel
-  let len = UMVec.length buf
-  let i   = case rel of { Before -> off; After -> len - off - 1; }
-  relativeToChar rel += 1
-  liftIO $ UMVec.write buf i c
-
--- Not for export: does not filter line-breaking characters.
 unsafeInsertString :: MonadIO m => RelativeToCursor -> CharVector -> EditText tags m ()
 unsafeInsertString rel str = do
   let strlen = intSize str
@@ -1743,55 +1754,32 @@ insertString
   :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
      )
-  => String -> editor tags m ()
-insertString str = liftEditText $ use (bufferLineBreaker . lineBreaker) >>= init . ($ str) where
-  writeStr dbginput =
-    trace ("writeStr "++show dbginput) $ --DEBUG
-    mapM_ (unsafeInsertChar Before)
-    dbginput --DEBUG
-  writeLine dbginput@(str, lbrk) =
-    trace ("writeLine "++show dbginput) $ --DEBUG
-    do  writeStr str
-        writeStr lbrk
-        when (not $ null lbrk) $ do
-          relativeToChar Before += length lbrk
-          cur <- use bufferLineEditor
-          let buf = cur ^. lineEditBuffer
-          let beforeCount = cur ^. charsBeforeCursor - 1
-          beforeChars <- liftIO $ forM [0 .. beforeCount - 1] $ UMVec.read buf
-          pushLine Before $ TextLine
-            { theTextLineString    = packSize beforeCount beforeChars
-            , theTextLineTags      = cur ^. textCursorTags
-            , theTextLineBreakSize = fromIntegral $ length lbrk
-            }
-          trace ("clearCurrentLine") $ clearCurrentLine
-  init = \ case
-    []                 -> return ()
-    [(str,"")]         -> writeStr str
-    line@(_,lbrk):more -> do
-      join $ editLine $ do
-        vec  <- use lineEditBuffer
-        cur  <- use charsAfterCursor
-        tags <- use textCursorTags
-        let len = UMVec.length vec
-        if cur <= 0 then return $ pure () else do
-          cut <- liftIO $! UVec.freeze $! UMVec.slice (len - cur - 1) cur vec
-          --cut <- liftIO $ packSize cur <$> forM [len - cur - 1 .. len - 1] (UMVec.read vec)
-          return $ do
-            vec <- use bufferVector
-            unless (null lbrk) $ linesBelowCursor += 1
-            cur <- use linesBelowCursor
-            liftIO $ MVec.write vec (MVec.length vec - cur) $ TextLine
-              { theTextLineString    = cut
-              , theTextLineTags      = tags
-              , theTextLineBreakSize = 0
-              }
-      writeLine line
-      loop more
-  loop = \ case
-    []         -> return ()
+  => String -> editor tags m (Relative CharIndex)
+insertString str = liftEditText $ do
+  breaker <- use (bufferLineBreaker . lineBreaker)
+  modeChanged <- beginInsertMode
+  let writeStr = resumeEditLine . fmap sum . mapM ((>> (return 1)) . pushElem Before)
+  let writeLine (str, lbrk) = do
+        (strlen, lbrklen) <- (,) <$> writeStr str <*> writeStr lbrk
+        let maxlen = fromIntegral (maxBound :: Word16) :: Int
+        if lbrklen >= maxlen
+         then error $ "insertString: line break string length is "++show lbrklen++
+                "exceeeds maximum length of "++show maxlen++" characters"
+         else do
+          resumeEditLine $ cursorBreakSize .= fromIntegral lbrklen
+          resumeEditLine copyLineEditor' >>= pushElem Before
+          resumeEditLine clearCurrentLine
+          return $ strlen + lbrklen
+  let loop count = seq count . \ case
+        []         -> return count
+        [(str,"")] -> (+ count) <$> writeStr str
+        line:more  -> writeLine line >>= flip loop more
+  result <- Relative . CharIndex <$> case breaker str of
+    []         -> return 0
     [(str,"")] -> writeStr str
-    line:more  -> writeLine line >> loop more
+    lines      -> loop 0 lines
+  when modeChanged $ void endInsertMode
+  return result
 
 -- Not for export: this code shared by 'forLinesInRange' and 'forLines' but requires knowledge of
 -- the 'TextBuffer' internals in order to use, so is not something end users should need to know
@@ -2090,7 +2078,6 @@ textView from0 to0 (TextBuffer mvar) = liftIO $ withMVar mvar $ \ st -> do
   let fromLine  = limit lineCount fromLine0
   let toLine    = limit lineCount toLine0
   let newLen    = toLine - fromLine + 1
-  let copy      = if unsafeMode then MVec.unsafeCopy  else MVec.copy
   let slice     = if unsafeMode then MVec.unsafeSlice else MVec.slice
   if lineCount < 0
    then error $ "textView: (lineCount="++show lineCount++") < 0, this should never happen"
@@ -2100,15 +2087,15 @@ textView from0 to0 (TextBuffer mvar) = liftIO $ withMVar mvar $ \ st -> do
      then MVec.write newBuf 0 =<<
           MVec.read oldBuf (if fromLine < above then fromLine else upper - above + fromLine)
      else if fromLine < above && toLine <  above
-     then copy newBuf (slice fromLine newLen oldBuf)
+     then MVec.copy newBuf (slice fromLine newLen oldBuf)
      else if fromLine >= above && toLine >= above
-     then copy newBuf (slice (upper - above + fromLine) newLen oldBuf)
+     then MVec.copy newBuf (slice (upper - above + fromLine) newLen oldBuf)
      else if fromLine < above && toLine >= above
      then do
        let aboveLen = above - fromLine
-       copy (slice 0 aboveLen newBuf) (slice fromLine aboveLen oldBuf)
+       MVec.copy (slice 0 aboveLen newBuf) (slice fromLine aboveLen oldBuf)
        let belowLen = toLine - above + 1
-       copy (slice aboveLen belowLen newBuf) (slice upper belowLen oldBuf)
+       MVec.copy (slice aboveLen belowLen newBuf) (slice upper belowLen oldBuf)
      else error "textView: this should never happen"
     let trim idx slice = MVec.read newBuf idx >>= \ case
           TextLineUndefined -> error $ "newBuf["++show idx++"] is undefined"
