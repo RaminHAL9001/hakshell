@@ -83,8 +83,9 @@ textViewTests = do
     debugPrintBuffer
   let reportView a b = do
         report $ "view "++showLoc a++"->"++showLoc b++"\n"
-        v <- textView a b buf
-        debugPrintView v
+        textView a b buf >>= \ case
+          Left err -> error $ show err
+          Right  v -> debugPrintView v
   reportView (mkLoc  3 25) (mkLoc  6 24)
   reportView (mkLoc 14  1) (mkLoc 16 48)
   reportView (mkLoc  1  1) (mkLoc  3 48)

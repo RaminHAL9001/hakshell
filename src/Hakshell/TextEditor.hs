@@ -103,7 +103,7 @@ module Hakshell.TextEditor
     readLineIndex, writeLineIndex,
     forLines, forLinesInRange, forLinesInBuffer,
     -- * Text Views
-    TextView, textView, textViewOnLines, textViewAppend,
+    TextView, textView, textViewOnLines, textViewAppend, emptyTextView,
     newTextBufferFromView, textViewCharCount, textViewVector,
     FoldTextView, forLinesInView,
     -- * Cursor Positions
@@ -239,14 +239,22 @@ newtype Absolute a = Absolute a
 -- inference will automatically declare a 'LineIndex' without you needing to write @(LineIndex 1)@
 -- constructor unless you really want to.
 newtype LineIndex = LineIndex Int
-  deriving (Eq, Ord, Show, Read, Bounded, Enum, Num)
+  deriving (Eq, Ord, Show, Read, Enum, Num)
 
 -- | A number for indexing a column, i.e. a character within a line. This data type instantiates
 -- the 'Prelude.Num' typeclass so that you can write an integer literal in your code and (if used in
 -- the correct context) the type inference will automatically declare a 'CharIndex' without you
 -- needing to write @(LineIndex 1)@ constructor unless you really want to.
 newtype CharIndex = CharIndex Int
-  deriving (Eq, Ord, Show, Read, Bounded, Enum, Num)
+  deriving (Eq, Ord, Show, Read, Enum, Num)
+
+instance Bounded CharIndex where
+  minBound = CharIndex 1
+  maxBound = CharIndex maxBound
+
+instance Bounded LineIndex where
+  minBound = LineIndex 1
+  maxBound = LineIndex maxBound
 
 ----------------------------------------------------------------------------------------------------
 
@@ -1096,6 +1104,39 @@ getLoSlice = stack "getLoSlice" $ getElemCount Before >>= getSlice False . Relat
 getHiSlice :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem) => m (vec st elem)
 getHiSlice = stack "getHiSlice" $ getElemCount After >>= getSlice False . Relative
 
+-- Select a region of valid elements given an index and size values, taking into account the
+-- position of the cursor, and copy the region into a new contiguous mutable vector that contains no
+-- invalid elements.
+copyRegion
+  :: (GMVec.MVector vec elem,
+       MonadEditVec (vec (PrimState m) elem) (t m), PrimMonad m,
+       MonadTrans t
+     )
+  => Absolute Int -> Relative Int -> t m (vec (PrimState m) elem)
+copyRegion (Absolute i) (Relative count) = stack ("copyRegion "++show i++' ':show count) $ do
+  vec <- getVector
+  bef <- getElemCount Before
+  let aft = i + count
+  if count == 0 then newVector 0
+   else if i <  bef && aft <  bef then
+    lift $ GMVec.clone $ GMVec.slice i count vec
+   else if i <= bef && aft >= bef then
+    GMVec.slice <$> getAbsolute (Absolute i) <*> pure count <*> pure vec >>= lift . GMVec.clone
+   else if i <  bef && aft >= bef then do
+    let dist = i - bef
+    oldlo  <- getSlice False $ Relative dist
+    oldhi  <- getSlice False $ Relative $ dist + count
+    let oldlolen = GMVec.length oldlo
+    let oldhilen = GMVec.length oldhi
+    newvec <- lift $ GMVec.new $ oldlolen + oldhilen
+    let newlo = GMVec.slice 0 oldlolen newvec
+    let newhi = GMVec.slice oldlolen oldhilen newvec 
+    let copy  = (.) lift . if unsafeMode then GMVec.unsafeCopy else GMVec.copy
+    copy newlo oldlo
+    copy newhi oldhi
+    return newvec
+   else error "copyRegion: internal error, this should never happen"
+
 -- Write an element to a vector index, overwriting whatever was there before. __WARNING__: there is
 -- no bounds checking.
 putElemIndex
@@ -1760,7 +1801,7 @@ deleteCharsWrap
      , Show tags --DEBUG
      )
   => Relative CharIndex -> editor tags m (Relative CharIndex)
-deleteCharsWrap = error "TODO"
+deleteCharsWrap = error "TODO: deleteCharsWrap"
 
 -- | This function evaluates the 'lineBreaker' function on the given string, and beginning from the
 -- current cursor position, begins inserting all the lines of text produced by the 'lineBreaker'
@@ -1927,6 +1968,12 @@ data TextLocation
     }
   deriving (Eq, Ord)
 
+instance Show TextLocation where
+  show (TextLocation
+        { theLocationLineIndex=(Absolute (LineIndex line))
+        , theLocationCharIndex=(Absolute (CharIndex char))
+        }) = "TextLocation "++show line++' ':show char
+
 relativeLine :: RelativeToCursor -> Int -> Relative LineIndex
 relativeChar :: RelativeToCursor -> Int -> Relative CharIndex
 (relativeLine, relativeChar) = (f LineIndex, f CharIndex) where
@@ -2027,6 +2074,10 @@ instance MonadTrans (FoldTextView r fold tags) where
 
 type FoldTextViewHalt void fold tags m r = r -> FoldTextView r fold tags m void
 
+-- | An empty 'TextView', containing zero lines of text.
+emptyTextView :: TextView tags
+emptyTextView = TextView{ textViewCharCount = 0, textViewVector = Vec.empty }
+
 -- | This function works similar to 'Data.Monoid.mappend' or the @('Data.Semigroup.<>')@ operator,
 -- but allows you to provide your own appending function for the @tags@ value. Tags are appended if
 -- the final lines of the left 'TextView' has no line break and therefore must to be prepended to
@@ -2065,89 +2116,57 @@ textViewAppend appendTags
           )
     }
 
-reorder :: Ord a => a -> a -> (a, a)
-reorder a b = (min a b, max a b)
-
 -- | Create a 'TextView' from the content of a 'TextBuffer' in the given range delimited by the two
 -- given 'TextLocation' values.
---
--- __NOTE__ that if the range contains the current 'TextCursor', be sure to evaluate 'endInsertMode'
--- function before evaluating 'textViewOnLines', otherwise the updates to the current line will not
--- be reflected in the created 'TextView'.
 textView
-  :: MonadIO m
-  => TextLocation -> TextLocation
-  -> TextBuffer tags -> m (TextView tags)
-textView from0 to0 (TextBuffer mvar) = liftIO $ withMVar mvar $ \ st -> do
-  let (from, to) = reorder from0 to0
-  let (Absolute (LineIndex fromLine0)) = theLocationLineIndex from
-  let (Absolute (LineIndex toLine0))   = theLocationLineIndex to
-  let (Absolute (CharIndex fromChar0)) = theLocationCharIndex from
-  let (Absolute (CharIndex toChar0))   = theLocationCharIndex to
-  let oldBuf    = theBufferVector     st
-  let above     = theLinesAboveCursor st
-  let below     = theLinesBelowCursor st
-  let lineCount = above + below
-  let upper     = MVec.length oldBuf - below
-  let limit top = max 0 . min top . subtract 1
-  let fromLine  = limit lineCount fromLine0
-  let toLine    = limit lineCount toLine0
-  let newLen    = toLine - fromLine + 1
-  let slice     = if unsafeMode then MVec.unsafeSlice else MVec.slice
-  if lineCount < 0
-   then error $ "textView: (lineCount="++show lineCount++") < 0, this should never happen"
-   else do
-    newBuf <- MVec.new newLen
-    if fromLine == toLine
-     then MVec.write newBuf 0 =<<
-          MVec.read oldBuf (if fromLine < above then fromLine else upper - above + fromLine)
-     else if fromLine < above && toLine <  above
-     then MVec.copy newBuf (slice fromLine newLen oldBuf)
-     else if fromLine >= above && toLine >= above
-     then MVec.copy newBuf (slice (upper - above + fromLine) newLen oldBuf)
-     else if fromLine < above && toLine >= above
-     then do
-       let aboveLen = above - fromLine
-       MVec.copy (slice 0 aboveLen newBuf) (slice fromLine aboveLen oldBuf)
-       let belowLen = toLine - above + 1
-       MVec.copy (slice aboveLen belowLen newBuf) (slice upper belowLen oldBuf)
-     else error "textView: this should never happen"
-    let trim idx slice = MVec.read newBuf idx >>= \ case
-          TextLineUndefined -> error $ "newBuf["++show idx++"] is undefined"
-          line              -> do
-            let vec = theTextLineString line
-            let len = UVec.length vec
-            let (fromChar, toChar) = (limit (len - 1) fromChar0, limit (len - 1) toChar0)
-            MVec.write newBuf idx $ line
-              { theTextLineString =
-                  UVec.force $ uncurry UVec.slice (slice len fromChar toChar) vec
-              }
-    if fromLine == toLine
-      then trim 0 $ \ _len from to -> (min from to, abs (to - from) + 1)
-      else do
-        trim 0 $ \ len from _to -> (from, len - from)
-        trim (newLen - 1) $ \ _len _from to -> (0, to + 1)
-    newBuf <- Vec.unsafeFreeze newBuf
+  :: (MonadIO m
+     , Show tags --DEBUG
+     )
+  => TextLocation -> TextLocation -> TextBuffer tags
+  -> m (Either TextEditError (TextView tags))
+textView from to = stack ("textView ("++show from++") ("++show to++")") . liftIO . runEditTextIO (mkview (min from to) (max from to)) where
+  mkview from to = countLines >>= \ nmax -> if nmax <= 0 then return emptyTextView else do
+    copyLineEditorText >>= putElem Before
+    let unline = max 0 . min (nmax - 1) . lineToIndex . theLocationLineIndex
+    let (lo, hi) = (unline from, unline to)
+    newvec <- copyRegion (Absolute lo) $ Relative $ 1 + hi - lo
+    let top = MVec.length newvec - 1
+    let unchar len lbrksz = max 0 . min (len - lbrksz) . charToIndex . theLocationCharIndex
+    let onvec i f = liftIO $ MVec.read newvec i >>= MVec.write newvec i . \ case
+          line@TextLine{}   ->
+            let vec      = line ^. textLineString
+                veclen   = UVec.length vec
+                lbrksz   = fromIntegral $ theTextLineBreakSize line
+                (i, len) = f veclen lbrksz
+            in line & textLineString %~ UVec.slice i len
+          TextLineUndefined -> error $
+            "textView: trimmed vector contains undefined line at index "++show i
+    onvec top $ \ len lbrksz -> (0, unchar len lbrksz to) 
+    onvec 0   $ \ len lbrksz -> let i = unchar len lbrksz from in (i, len - i)
+    let freeze = liftIO . if unsafeMode then Vec.unsafeFreeze else Vec.freeze
+    newvec <- freeze newvec
     return TextView
-      { textViewCharCount = sum $ Vec.toList newBuf >>= \ case
+      { textViewCharCount = sum $ Vec.toList newvec >>= \ case
           TextLineUndefined               -> []
           TextLine{theTextLineString=vec} -> [UVec.length vec]
-      , textViewVector    = newBuf
+      , textViewVector    = newvec
       }
 
 -- | Like 'textView', creates a new text view, but rather than taking two 'TextLocation's to delimit
 -- the range, takes two @('Absolute' 'LineIndex')@ values to delimit the range.
 textViewOnLines
-  :: MonadIO m
-  => TextLocation -> TextLocation
-  -> TextBuffer tags -> m (TextView tags)
+  :: (MonadIO m
+     , Show tags --DEBUG
+     )
+  => Absolute LineIndex -> Absolute LineIndex
+  -> TextBuffer tags -> m (Either TextEditError (TextView tags))
 textViewOnLines from to = textView
   (TextLocation
-   { theLocationLineIndex = min (theLocationLineIndex from) (theLocationLineIndex to)
+   { theLocationLineIndex = min from to
    , theLocationCharIndex = Absolute $ CharIndex 0
    })
   (TextLocation
-   { theLocationLineIndex = max (theLocationLineIndex from) (theLocationLineIndex to)
+   { theLocationLineIndex = max from to
    , theLocationCharIndex = Absolute $ CharIndex maxBound
    })
 
