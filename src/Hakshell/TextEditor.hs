@@ -227,12 +227,12 @@ defaultInitBufferSize = 512
 
 -- | Used for indexing lines and characters relative to the cursor.
 newtype Relative a = Relative a
-  deriving (Eq, Ord, Show, Read, Bounded, Enum, Num)
+  deriving (Eq, Ord, Show, Read, Enum, Num)
 
 -- | Used for indexing absolute lines and characters (relative to the start of the document, which
 -- is line 1).
 newtype Absolute a = Absolute a
-  deriving (Eq, Ord, Show, Read, Bounded, Enum, Num)
+  deriving (Eq, Ord, Show, Read, Enum, Num)
 
 -- | A number for indexing a line. This data type instantiates the 'Prelude.Num' typeclass so that
 -- you can write an integer literal in your code and (if used in the correct context) the type
@@ -248,13 +248,13 @@ newtype LineIndex = LineIndex Int
 newtype CharIndex = CharIndex Int
   deriving (Eq, Ord, Show, Read, Enum, Num)
 
-instance Bounded CharIndex where
-  minBound = CharIndex 1
-  maxBound = CharIndex maxBound
+instance Bounded (Absolute CharIndex) where
+  minBound = Absolute $ CharIndex 1
+  maxBound = Absolute $ CharIndex maxBound
 
-instance Bounded LineIndex where
-  minBound = LineIndex 1
-  maxBound = LineIndex maxBound
+instance Bounded (Absolute LineIndex) where
+  minBound = Absolute $ LineIndex 1
+  maxBound = Absolute $ LineIndex maxBound
 
 ----------------------------------------------------------------------------------------------------
 
@@ -1801,7 +1801,10 @@ deleteCharsWrap
      , Show tags --DEBUG
      )
   => Relative CharIndex -> editor tags m (Relative CharIndex)
-deleteCharsWrap = error "TODO: deleteCharsWrap"
+deleteCharsWrap req = liftEditText $ copyLineEditorText >>= putElem Before >>
+  deleteChars req >>= (if req >= 0 then fwdloop else revloop) . subtract req where
+    fwdloop count = error "TODO: deleteCharsWrap.fwdloop"
+    revloop count = error "TODO: deleteCharsWrap.revloop"
 
 -- | This function evaluates the 'lineBreaker' function on the given string, and beginning from the
 -- current cursor position, begins inserting all the lines of text produced by the 'lineBreaker'
