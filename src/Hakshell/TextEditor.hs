@@ -129,7 +129,7 @@ module Hakshell.TextEditor
     bufferLineEditor, textLineString, bufferDefaultTags,
     lineBreakerNLCR,
     -- ** Line Editing
-    TextLine, emptyTextLine, nullTextLine, sliceLineToEnd, textLineIsUndefined,
+    TextLine, emptyTextLine, nullTextLine, sliceLineToEnd, textLineWeight, textLineIsUndefined,
     TextCursor, newCursorFromLine, textCursorCharCount, textLineTags,
     -- ** Errors
     TextEditError(..),
@@ -647,6 +647,22 @@ data TextLine tags
     }
   deriving Functor
 
+instance IntSized (TextLine tags) where
+  intSize = \ case
+    TextLineUndefined               -> 0
+    TextLine{theTextLineString=str} -> UVec.length str
+
+instance Unpackable (TextLine tags) where
+  unpack = \ case
+    TextLineUndefined               -> ""
+    TextLine{theTextLineString=str} -> UVec.toList str
+
+instance Show tags => Show (TextLine tags) where
+  show = \ case
+    TextLineUndefined -> "(null)"
+    TextLine{theTextLineString=vec,theTextLineTags=tags,theTextLineBreakSize=lbrksz} ->
+      '(' : show (unpack vec) ++ ' ' : show lbrksz ++ ' ' : show tags ++ ")"
+
 -- | The empty 'TextLine' value.
 emptyTextLine :: tags -> TextLine tags
 emptyTextLine tags = TextLine
@@ -679,6 +695,22 @@ sliceLineToEnd rel (Absolute (CharIndex n)) = \ case
 textLineIsUndefined :: TextLine tags -> Bool
 textLineIsUndefined = \ case { TextLineUndefined -> True; _ -> False; }
 
+-- | The weight of a 'TextLine' is essentially the number of unit characters the 'TextLine'
+-- contains, which most of the time is exactly equal to the vector length of 'theTextLineString',
+-- but not always. In some cases, a 'TextLine' has multiple line break characters, especially on the
+-- Windows operating system in which a line break contains two characters: @"\\n\\r"@. However when
+-- using a text editor on such an operating system, pressing the backspace key on the keyboard when
+-- at the start of the line will wrap the deletion operation to the previous line, deleting all
+-- newline characters in a single key press. Thus the two characters @"\\n\\r"@ have a weight of 1
+-- key press.
+--
+-- This text editor engine accommodates arbitrary line break character sequences by providing this
+-- 'textLineWeight' metric, which always treats all line breaking characters as a single unit. If
+-- there are no line breaking characters, or if there is only one line breaking character, the
+-- 'textLineWeight' is identical to the value given by 'intSize'.
+textLineWeight :: TextLine tags -> Int
+textLineWeight line = intSize line + fromIntegral (min 1 $ max 0 $ theTextLineBreakSize line) 
+
 ----------------------------------------------------------------------------------------------------
 
 -- | The current line that is being edited.
@@ -691,22 +723,6 @@ data TextCursor tags
     , theTextCursorTags    :: tags
     }
   deriving Functor
-
-instance IntSized (TextLine tags) where
-  intSize = \ case
-    TextLineUndefined               -> 0
-    TextLine{theTextLineString=str} -> UVec.length str
-
-instance Unpackable (TextLine tags) where
-  unpack = \ case
-    TextLineUndefined               -> ""
-    TextLine{theTextLineString=str} -> UVec.toList str
-
-instance Show tags => Show (TextLine tags) where
-  show = \ case
-    TextLineUndefined -> "(null)"
-    TextLine{theTextLineString=vec,theTextLineTags=tags,theTextLineBreakSize=lbrksz} ->
-      '(' : show (unpack vec) ++ ' ' : show lbrksz ++ ' ' : show tags ++ ")"
 
 -- Not for export: this buffer is formatted such that characters before the cursror are near index
 -- zero, while characters after the cursor are near the final index.
@@ -1422,7 +1438,7 @@ pushLine rel line = liftEditText $ do
   growBufferIfTooSmall 1
   i <- cursorIndex rel --DEBUG
   traceM $ "pushLine: rel="++show rel++", cursorIndex="++show i++", line="++show line --DEBUG
-  MVec.write <$> use bufferVector <*> cursorIndex rel <*> pure line >>= liftIO
+  MVec.write <$> use bufferVector <*> cursorIndex rel <*> pure line >>= liftIO --TODO: replace with 'pushElem'
   relativeToLine rel += 1
   i <- cursorIndex rel --DEBUG
   traceM $ "pushLine: rel="++show rel++", cursorIndex="++show i --DEBUG
@@ -1437,7 +1453,7 @@ unsafePopLine rel = do
   i   <- subtract 1 <$> cursorIndex rel
   traceM $ "unsafePopLine: rel="++show rel++", cursorIndex="++show i
   line <-  --DEBUG
-    liftIO (MVec.read vec i <* MVec.write vec i TextLineUndefined) <*
+    liftIO (MVec.read vec i <* MVec.write vec i TextLineUndefined) <* --TODO: replace with 'popElem'
       ((case rel of{ Before -> linesAboveCursor; After -> linesBelowCursor; }) -= 1)
   traceM $ "unsafePopLine: "++show line --DEBUG
   return line --DEBUG
@@ -1801,10 +1817,32 @@ deleteCharsWrap
      , Show tags --DEBUG
      )
   => Relative CharIndex -> editor tags m (Relative CharIndex)
-deleteCharsWrap req = liftEditText $ copyLineEditorText >>= putElem Before >>
-  deleteChars req >>= (if req >= 0 then fwdloop else revloop) . subtract req where
-    fwdloop count = error "TODO: deleteCharsWrap.fwdloop"
-    revloop count = error "TODO: deleteCharsWrap.revloop"
+deleteCharsWrap request = liftEditText $ if request == 0 then return 0 else
+  let direction = if request < 0 then Before else After in
+  -- First, delete the chararacters in the line editor, see if that satisfies the request...
+  deleteChars request >>= \ delcount -> if abs delcount >= abs request then return delcount else
+  -- otherwise ues 'forLines' to delete each line until the request has been satsified.
+  fmap snd $ forLines direction (abs request + delcount, delcount) $ \ halt line ->
+    get >>= \ st@(request, delcount) ->
+    if request <= 0 then halt st else
+    let weight = countToChar $ textLineWeight line in
+    if weight <= request then
+      put (request - weight, delcount - countToChar (intSize line)) >> return []
+     else do
+      case direction of
+        Before -> do
+          let len = countToChar (intSize line)
+                  - fromIntegral (theTextLineBreakSize line) - weight + 1
+          liftEditText $ unsafeInsertString After $
+            UVec.slice 0 (charToCount len) $ theTextLineString line
+          put (request - weight, delcount - len)
+        After  -> do
+          liftEditText $ unsafeInsertString Before $
+            UVec.slice (charToCount weight) (intSize line - charToCount weight)
+            (theTextLineString line)
+          put (request - weight, delcount - weight)
+      pure <$> liftEditLine copyLineEditorText
+        
 
 -- | This function evaluates the 'lineBreaker' function on the given string, and beginning from the
 -- current cursor position, begins inserting all the lines of text produced by the 'lineBreaker'
@@ -1830,13 +1868,11 @@ insertString str = look ("insertString "++show str) $ liftEditText $ do
           resumeEditLine clearCurrentLine
           return $ strlen + lbrklen
   let loop count = seq count . \ case
-        []         -> return count
-        [(str,"")] -> (+ count) <$> writeStr str
-        line:more  -> writeLine line >>= flip loop more
+        []        -> return count
+        line:more -> writeLine line >>= flip loop more
   result <- Relative . CharIndex <$> case breaker str of
-    []         -> return 0
-    [(str,"")] -> writeStr str
-    lines      -> loop 0 lines
+    []    -> return 0
+    lines -> loop 0 lines
   when modeChanged $ void endInsertMode
   return result
 
