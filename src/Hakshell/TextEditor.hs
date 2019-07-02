@@ -431,21 +431,7 @@ editLine
      , Show tags --DEBUG
      )
   => EditLine tags m a -> EditText tags m a
-editLine f = do
-  modeChanged <- beginInsertMode
-  resumeEditLine f <* when modeChanged (void endInsertMode)
-
--- not for export
---
--- This function assumes the 'bufferLineEditor' is set to the current line already, and thus does
--- not evaluate 'beginInsertMode'. It is necessary for all functions in this module to use
--- 'resumeEditLine' rather than 'liftEditLine' internally to prevent an infinite recursions caused
--- by the fact that the exported, public-facing 'editLine' calls 'beginInsertMode'.
-resumeEditLine
-  :: (MonadIO m
-     , Show tags --DEBUG
-     ) => EditLine tags m a -> EditText tags m a
-resumeEditLine (EditLine f) = use bufferLineEditor >>= runStateT (runExceptT f) >>= \ case
+editLine (EditLine f) = use bufferLineEditor >>= runStateT (runExceptT f) >>= \ case
   (Left err, _   ) -> throwError err
   (Right  a, line) -> bufferLineEditor .= line >> return a
 
@@ -1610,7 +1596,7 @@ beginInsertMode = look "beginInsertMode" $ liftEditText $ do
       if after <= 0 then use bufferDefaultLine else popElem After
     before <- getElemCount Before
     elem   <- getElemIndex (before - 1)
-    resumeEditLine $ join $
+    editLine $ join $
       editReplaceCurrentLine <$> (indexToChar <$> getElemCount Before) <*> pure elem
     return True
 
@@ -1636,7 +1622,7 @@ endInsertMode
 endInsertMode = look "endInsertMode" $ liftEditText $ do
   insMode <- use bufferInsertMode
   if not insMode then return False else do
-    (resumeEditLine copyLineEditor' <* clearCurrentLine) >>= putElem Before
+    (editLine copyLineEditor' <* clearCurrentLine) >>= putElem Before
     bufferInsertMode .= False
     return True
 
@@ -1883,7 +1869,7 @@ insertString str = look ("insertString "++show str) $ liftEditText $ do
   breaker <- use (bufferLineBreaker . lineBreaker)
   let writeStr =
         look "insertString.writeStr" . --DEBUG
-        resumeEditLine . fmap sum . mapM ((>> (return 1)) . pushElem Before)
+        editLine . fmap sum . mapM ((>> (return 1)) . pushElem Before)
         . (\ str -> trace ("(insertString.writeStr "++show str++")") str) --DEBUG
   let writeLine line@(str, lbrk) = look ("writeLine "++show line) $ do
         (strlen, lbrklen) <- (,) <$> writeStr str <*> writeStr lbrk
@@ -1893,9 +1879,9 @@ insertString str = look ("insertString "++show str) $ liftEditText $ do
          then error $ "insertString: line break string length is "++show lbrklen++
                 "exceeeds maximum length of "++show maxlen++" characters"
          else do
-          resumeEditLine $ cursorBreakSize .= fromIntegral lbrklen
-          resumeEditLine copyLineEditor' >>= pushElem Before
-          resumeEditLine clearCurrentLine
+          editLine $ cursorBreakSize .= fromIntegral lbrklen
+          editLine copyLineEditor' >>= pushElem Before
+          editLine clearCurrentLine
           return $ strlen + lbrklen
   let loop count = seq count . \ case
         []        -> return count
