@@ -168,7 +168,12 @@ import qualified Data.Vector.Generic.Mutable as GMVec
 import qualified Data.Vector.Unboxed.Mutable as UMVec
 import           Data.Word
 
-import Debug.Trace
+--import Debug.Trace
+trace :: String -> a -> a
+trace = const id
+
+traceM :: Monad m => String -> m ()
+traceM = const $ return ()
 
 ----------------------------------------------------------------------------------------------------
 
@@ -1005,12 +1010,12 @@ getAllocSize :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem) => m Int
 getAllocSize = peek "getAllocSize" $ GMVec.length <$> getVector
 
 -- The number of valid lines in the buffer @('getElemCount' 'Before' + 'getElemCount' 'After')@.
-countLines :: MonadEditVec vec m => m Int
-countLines = peek "countLines" $ (+) <$> getElemCount Before <*> getElemCount After
+countElems :: MonadEditVec vec m => m Int
+countElems = peek "countElems" $ (+) <$> getElemCount Before <*> getElemCount After
 
 -- The number of lines in the buffer that are not valid, @(bufAllocSize - bufLineCount)@
 getUnusedSpace :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem) => m Int
-getUnusedSpace = peek "getUnusedSpace" $ subtract <$> countLines <*> getAllocSize
+getUnusedSpace = peek "getUnusedSpace" $ subtract <$> countElems <*> getAllocSize
 
 -- Like 'cursorIndex' but evaluates to an exception if the index is out of bounds.
 cursorIndexChk
@@ -1225,7 +1230,7 @@ growVector
   :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem)
   => Int -> m ()
 growVector increase = stack ("growVector "++show increase) $ if increase <= 0 then return () else do
-  count  <- countLines
+  count  <- countElems
   prepLargerVector (count + increase) >>= \ case
     Nothing     -> return ()
     Just newvec -> do
@@ -1290,7 +1295,7 @@ dupVector = getVector >>= liftIO . GMVec.clone
 -- Copy the current mutable buffer vector to an immutable vector.
 freezeVector :: (GVec.Vector v a, MonadEditVec (GVec.Mutable v RealWorld a) m) => m (v a)
 freezeVector = stack ("freezeVector") $ do
-  newvec <- countLines >>= newVector
+  newvec <- countElems >>= newVector
   bef <- getLoSlice
   aft <- getHiSlice
   let slice = if unsafeMode then GMVec.unsafeSlice else GMVec.slice
@@ -2164,7 +2169,7 @@ textView
   => TextLocation -> TextLocation -> TextBuffer tags
   -> m (Either TextEditError (TextView tags))
 textView from to = stack ("textView ("++show from++") ("++show to++")") . liftIO . runEditTextIO (mkview (min from to) (max from to)) where
-  mkview from to = countLines >>= \ nmax -> if nmax <= 0 then return emptyTextView else do
+  mkview from to = countElems >>= \ nmax -> if nmax <= 0 then return emptyTextView else do
     copyLineEditorText >>= putElem Before
     let unline = max 0 . min (nmax - 1) . lineToIndex . theLocationLineIndex
     let (lo, hi) = (unline from, unline to)
@@ -2278,7 +2283,7 @@ debugPrintBuffer = liftEditText $ do
         if textLineIsUndefined line
           then do
             liftIO $ if nullCount < (1 :: Int) then showLine else
-              if nullCount < 4 then putStrLn "...." else return ()
+              when (nullCount < 4) $ putStrLn "...."
             (printLines $! nullCount + 1) $! i + 1
           else liftIO showLine >> (printLines 0 $! i + 1)
   printLines 0 0
