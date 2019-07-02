@@ -2,6 +2,7 @@ module Main where
 
 import           Hakshell.TextEditor
 
+import           Control.Monad (unless)
 import           Control.Monad.IO.Class
 
 ----------------------------------------------------------------------------------------------------
@@ -9,8 +10,9 @@ import           Control.Monad.IO.Class
 main :: IO ()
 main = do
   begin
-  textViewTests
-  basicTests
+  lineEditorTests
+  --textViewTests
+  --basicTests
 
 begin :: IO ()
 begin = putStrLn "\n-------------------------\nBegin HakshellTest Log\n-------------------------\n"
@@ -42,6 +44,20 @@ defaultTags = ()
 
 report :: MonadIO m => String -> m ()
 report = liftIO . putStr
+
+----------------------------------------------------------------------------------------------------
+
+lineEditorTests :: IO ()
+lineEditorTests = do
+  report "--- line editor tests ---\n"
+  buf <- newTextBuffer defaultTags
+  testTextEditor error buf $ do
+    let str =  "Hello, world!" :: String
+    mapM_ (insertChar After) str
+    line <- copyLineEditorText
+    let rts = unpack line
+    unless (rts == str) $ error $ "expected: "++show str++"\nextracted: "++show rts
+    return ()
 
 basicTests :: IO ()
 basicTests = do

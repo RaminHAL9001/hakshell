@@ -117,7 +117,7 @@ module Hakshell.TextEditor
     -- ** Text Editing Typeclasses
     MonadEditText(..), MonadEditLine(..),
     -- ** Instances of Text Editing Type Classes
-    EditText, newLineEditorIO, copyLineEditorIO, newLineEditor, copyLineEditor,
+    EditText, copyLineEditorIO, newLineEditor, copyLineEditor,
     FoldMapLines, MapLines, EditLine, editLine,
     FoldMapLinesHalt,
     FoldMapChars, foldMapChars, runFoldMapChars, execFoldMapChars, evalFoldMapChars,
@@ -130,7 +130,7 @@ module Hakshell.TextEditor
     lineBreakerNLCR,
     -- ** Line Editing
     TextLine, emptyTextLine, nullTextLine, sliceLineToEnd, textLineWeight, textLineIsUndefined,
-    LineEditor, newCursorFromLine, textCursorCharCount, textLineTags,
+    LineEditor, parentTextEditor, lineEditorCharCount, textLineTags,
     -- ** Errors
     TextEditError(..),
     -- * Debugging
@@ -156,6 +156,7 @@ import           Control.Monad.Cont.Class
 import           Control.Monad.Except
 import           Control.Monad.Error.Class
 import           Control.Monad.Primitive
+import           Control.Monad.Reader
 import           Control.Monad.State
 import           Control.Monad.State.Class
 
@@ -265,7 +266,10 @@ instance Bounded (Absolute LineIndex) where
 
 -- | This is a type of functions that can modify the textual content stored in a 'TextBufferState'.
 newtype EditText tags m a
-  = EditText{ unwrapEditText :: ExceptT TextEditError (StateT (TextBufferState tags) m) a }
+  = EditText
+    { unwrapEditText ::
+        ReaderT (TextBuffer tags) (ExceptT TextEditError (StateT (TextBufferState tags) m)) a
+    }
   deriving (Functor, Applicative, Monad, MonadIO)
 
 instance Monad m => MonadState (TextBufferState tags) (EditText tags m) where
@@ -276,7 +280,7 @@ instance Monad m => MonadError TextEditError (EditText tags m) where
   catchError (EditText try) catch = EditText $ catchError try $ unwrapEditText . catch
 
 instance MonadTrans (EditText tags) where
-  lift = EditText . lift . lift
+  lift = EditText . lift . lift . lift
 
 -- | Evaluate an 'EditText' function on the given 'TextBufferState'. The given 'EditText' function
 -- is evaluates all updates on the given 'TextBuffer' atomically and in-place (i.e. without copying
@@ -285,8 +289,8 @@ instance MonadTrans (EditText tags) where
 -- type's @m@ parameter is set to the @IO@ type, meaning you cannot use this function if the
 -- 'EditText's @m@ parameter is something other than @IO@, like for example a 'ReaderT' type.
 runEditTextIO :: EditText tags IO a -> TextBuffer tags -> IO (Either TextEditError a)
-runEditTextIO (EditText f) (TextBuffer mvar) = modifyMVar mvar $
-  fmap (\ (a,b) -> (b,a)) . runStateT (runExceptT f)
+runEditTextIO (EditText f) this@(TextBuffer mvar) = modifyMVar mvar $
+  fmap (\ (a,b) -> (b,a)) . runStateT (runExceptT $ runReaderT f this)
 
 -- | Evaluate an 'EditText' function on the given 'TextBufferState', but unlike 'runEditTextIO', a
 -- copy of the entire text buffer is first created, and all updates are performed on the copy
@@ -297,7 +301,7 @@ runEditTextOnCopy
   :: MonadIO m
   => EditText tags m a -> TextBuffer tags -> m (Either TextEditError a, TextBuffer tags)
 runEditTextOnCopy (EditText f) = liftIO . copyTextBuffer >=> \ copy@(TextBuffer mvar) -> do
-  (result, st) <- liftIO (readMVar mvar) >>= runStateT (runExceptT f)
+  (result, st) <- liftIO (readMVar mvar) >>= runStateT (runExceptT $ runReaderT f copy)
   liftIO $ void $ swapMVar mvar st
   return (result, copy)
 
@@ -708,12 +712,16 @@ textLineWeight line = intSize line + fromIntegral (min 1 $ max 0 $ theTextLineBr
 data LineEditor tags
   = LineEditor
     { theLineEditBuffer    :: !(UMVec.IOVector Char)
+    , parentTextEditor     :: (TextBuffer tags)
+      -- ^ A line editor can be removed from it's parent 'TextEditor'. A 'LineEditor' is defined
+      -- such that it can only directly edit text in it's parent 'TextEditor'. A 'LineEditor' can
+      -- indirectly edit text in any other parent, but only if a complete copy of the content of the
+      -- line editor is made and passed it to some other 'TextEditor'.
     , theCharsBeforeCursor :: !Int
     , theCharsAfterCursor  :: !Int
     , theCursorBreakSize   :: !Word16
     , theLineEditorTags    :: tags
     }
-  deriving Functor
 
 -- Not for export: this buffer is formatted such that characters before the cursror are near index
 -- zero, while characters after the cursor are near the final index.
@@ -748,7 +756,11 @@ textCursorTags = lens theLineEditorTags $ \ a b -> a{ theLineEditorTags = b }
 -- tag, so it is necessary to pass an initializing tag value of type @tags@ -- if you need nothing
 -- but plain text editing, @tags@ can be unit @()@.
 newTextBuffer :: tags -> IO (TextBuffer tags)
-newTextBuffer = fmap TextBuffer . (newTextBufferState defaultInitBufferSize >=> newMVar)
+newTextBuffer tags = do
+  mvar <- newEmptyMVar
+  let this = TextBuffer mvar
+  newTextBufferState this defaultInitBufferSize tags >>= putMVar mvar
+  return this
 
 -- | Create a deep-copy of a 'TextBuffer'. Everything is copied perfectly, including the cursor
 -- position, and the content and state of the cursor.
@@ -758,9 +770,9 @@ copyTextBuffer (TextBuffer mvar) = withMVar mvar $ \ old -> do
   newCur <- copyLineEditorIO $ theBufferLineEditor old
   fmap TextBuffer $ newMVar $ old{ theBufferLineEditor = newCur, theBufferVector = newBuf }
 
-newTextBufferState :: Int -> tags -> IO (TextBufferState tags)
-newTextBufferState size tags = do
-  cur <- newLineEditorIO tags
+newTextBufferState :: TextBuffer tags -> Int -> tags -> IO (TextBufferState tags)
+newTextBufferState this size tags = do
+  cur <- newLineEditorIO this tags
   buf <- MVec.replicate size TextLineUndefined
   let emptyLine = TextLine
         { theTextLineTags      = tags
@@ -778,18 +790,19 @@ newTextBufferState size tags = do
     , theBufferInsertMode  = False
     }
 
--- | Use this to initialize a new empty 'LineEditor'. This is usually only handy if you want to
+-- Use this to initialize a new empty 'LineEditor'. This is usually only handy if you want to
 -- define and test your own 'EditLine' functions and need to evaluate 'editLine' by hand rather than
 -- allowing the 'TextEdit' APIs automatically manage line editing. A 'TextBufferState' always
 -- contains one empty line, but a line must have a @tags@ tag, so it is necessary to pass an
 -- initializing tag value of type @tags@.
 --
 -- See also the 'newLineEditor' function which calls this function within a 'MonadEditLine' context.
-newLineEditorIO :: tags -> IO (LineEditor tags)
-newLineEditorIO tag = do
+newLineEditorIO :: TextBuffer tags -> tags -> IO (LineEditor tags)
+newLineEditorIO parent tag = do
   buf <- UMVec.new 1024
   return LineEditor
     { theLineEditBuffer    = buf
+    , parentTextEditor     = parent
     , theCharsBeforeCursor = 0
     , theCharsAfterCursor  = 0
     , theCursorBreakSize   = 0
@@ -807,15 +820,15 @@ copyLineEditorIO cur = do
   return cur{ theLineEditBuffer = buf }
 
 -- | Determine how many characters have been stored into this buffer.
-textCursorCharCount :: LineEditor tags -> Int
-textCursorCharCount cur = theCharsBeforeCursor cur + theCharsAfterCursor cur
+lineEditorCharCount :: LineEditor tags -> Int
+lineEditorCharCount cur = theCharsBeforeCursor cur + theCharsAfterCursor cur
 
--- | Create a new 'LineEditor' from a 'TextLine'. The 'LineEditor' can be updated with an 'EditLine'
+-- Create a new 'LineEditor' from a 'TextLine'. The 'LineEditor' can be updated with an 'EditLine'
 -- function. Note that this function works in any monadic function type @m@ which instantiates
 -- 'Control.Monad.IO.Class.MonadIO', so this will work in the @IO@ monad, the 'EditText' monad, the
 -- 'EditLine' monad, and in other contexts as well.
-newCursorFromLine :: MonadIO m => Int -> TextLine tags -> m (LineEditor tags)
-newCursorFromLine cur line = liftIO $ do
+newCursorFromLine :: MonadIO m => TextBuffer tags -> Int -> TextLine tags -> m (LineEditor tags)
+newCursorFromLine parent cur line = liftIO $ do
   -- This function is safe to export because we assume a 'TextLine' never contains more than one
   -- line terminator, and always only at the end of the buffer. The 'TextLine' constructor is not
   -- exported.
@@ -831,7 +844,8 @@ newCursorFromLine cur line = liftIO $ do
   forM_ (zip [0 .. lenBefore - 1] before) $ uncurry $ UMVec.write buf
   forM_ (zip [len - lenAfter .. len - 1] after) $ uncurry $ UMVec.write buf
   return LineEditor
-    { theLineEditBuffer = buf
+    { theLineEditBuffer    = buf
+    , parentTextEditor     = parent
     , theCharsBeforeCursor = lenBefore
     , theCharsAfterCursor  = lenAfter
     , theCursorBreakSize   = breakSize
@@ -1423,7 +1437,7 @@ copyVec oldVec before after = do
   return newVec
 
 -- Not for export: should be executed automatically by insertion operations. Increases the size of
--- the 'lineEditBuffer' to be large enough to contain the current 'textCursorCharCount' plus the
+-- the 'lineEditBuffer' to be large enough to contain the current 'lineEditorCharCount' plus the
 -- given number of elements.
 growLineIfTooSmall :: MonadIO m => Int -> EditText tags m ()
 growLineIfTooSmall grow = do
@@ -1512,6 +1526,14 @@ charToCount :: Relative CharIndex -> Int
 charToCount (Relative (CharIndex i)) = i
 
 ----------------------------------------------------------------------------------------------------
+
+-- Not for export: I don't want to encourage the use of a self-reference within an 'EditText'
+-- function. It is already easy enough to cause a deadlock by evaluating 'runEditText' with 'liftIO'
+-- within a 'runEditText' function.
+--
+-- Obtain a reference to the 'TextBuffer' that this was given to this function's monadic evaluator.
+thisTextBuffer :: Monad m => EditText tags m (TextBuffer tags)
+thisTextBuffer = EditText ask
 
 -- | Get the current line number of the cursor.
 currentLineNumber
@@ -1701,8 +1723,8 @@ newLineEditor
      , Show tags --DEBUG
      )
   => editor tags m (LineEditor tags)
-newLineEditor = liftEditText $
-  use (bufferLineEditor . textCursorTags) >>= liftIO . newLineEditorIO
+newLineEditor = liftEditText $ thisTextBuffer >>= \ this ->
+  use (bufferLineEditor . textCursorTags) >>= liftIO . newLineEditorIO this
 
 -- | Create a copy of the current 'lineEditBuffer' and return it. This function calls
 -- 'copyLineEditorIO' using the value of the current 'lineEditBuffer'.
@@ -2230,8 +2252,10 @@ textViewOnLines from to = textView
 -- the cursor will start at the beginning of the editable 'TextBuffer'.
 newTextBufferFromView :: MonadIO m => RelativeToCursor -> tags -> TextView tags -> m (TextBuffer tags)
 newTextBufferFromView rel tags (TextView{textViewVector=vec}) = liftIO $ do
+  mvar <- newEmptyMVar
+  let this = TextBuffer mvar
   let oldLen = Vec.length vec
-  st0 <- newTextBufferState (max 16 $ oldLen * 2) tags
+  st0 <- newTextBufferState this (max 16 $ oldLen * 2) tags
   let newBuf = theBufferVector st0
   let newLen = MVec.length newBuf
   let cursor = if oldLen == 0 then 0 else
@@ -2240,7 +2264,8 @@ newTextBufferFromView rel tags (TextView{textViewVector=vec}) = liftIO $ do
         Before -> ([0 ..], st & linesAboveCursor .~ cursor)
         After  -> ([newLen - oldLen ..], st & linesBelowCursor .~ cursor)
   forM_ (zip idx $ Vec.toList vec) $ uncurry $ MVec.write newBuf
-  TextBuffer <$> newMVar st
+  putMVar mvar st
+  return this
 
 -- | Perform a fold over every 'TextLine' in the 'TextView' using a function of type 'FoldTextView'.
 forLinesInView
