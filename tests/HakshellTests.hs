@@ -2,7 +2,8 @@ module Main where
 
 import           Hakshell.TextEditor
 
-import           Control.Monad (unless)
+import           Data.Char
+
 import           Control.Monad.IO.Class
 
 ----------------------------------------------------------------------------------------------------
@@ -51,13 +52,19 @@ lineEditorTests :: IO ()
 lineEditorTests = do
   report "--- line editor tests ---\n"
   buf <- newTextBuffer defaultTags
-  testTextEditor error buf $ do
-    let str =  "Hello, world!" :: String
-    mapM_ (insertChar After) str
-    line <- copyLineEditorText
-    let rts = unpack line
-    unless (rts == str) $ error $ "expected: "++show str++"\nextracted: "++show rts
-    return ()
+  let instr dir str = testTextEditor error buf $ do
+        report $ "--- insert string "++
+          ((\ (c:cx) -> toLower c : cx) $ show dir)++" cursor: "++show str++" ---\n"
+        mapM_ (insertChar dir) str
+        copyLineEditorText >>= liftIO . print
+  instr After $ reverse "CharacterS AfteR"
+  instr Before "CharacterS BeforE "
+  let move dir = testTextEditor error buf $ do
+        report $ "--- moveByChar "++show dir++" ---\n"
+        moveByChar dir
+        copyLineEditorText >>= liftIO . print
+  move (-5)
+  move  15
 
 basicTests :: IO ()
 basicTests = do
