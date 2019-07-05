@@ -1,3 +1,6 @@
+{-# LANGUAGE KindSignatures #-}
+{-# LANGUAGE AllowAmbiguousTypes #-}
+
 -- | This module integrates text processing facilities into Hakshell.
 --
 -- * Overview
@@ -1114,14 +1117,14 @@ getIsFull = peek "getIsFull" $ (== 0) <$> getUnusedSpace
 -- 'getLineAfterCur'. Pass a boolean value indicating whether or not you would like to perform
 -- bounds checking, if so an exception will be raised if the line index goes out of bounds.
 getSlice
-  :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem)
-  => Relative Int -> m (vec st elem)
+  :: (MonadEditVec (mvec st elem) m, GMVec.MVector mvec elem)
+  => Relative Int -> m (mvec st elem)
 getSlice (Relative count) = stack ("getSlice "++show count) $ do
   vec <- getVector
   if count < 0
    then do
-    i <- (+ count) <$> getElemCount Before
-    return $ trace ("(getSlice.slice "++show i++' ':show count++")") $ GMVec.slice i (abs count) vec
+    i <- (+ count) <$> getElemCount Before -- TODO: should this be (cursorIndex before)?
+    return $ trace ("(getSlice.slice "++show i++' ':show (abs count)++")") $ GMVec.slice i (abs count) vec
    else if count > 0
    then do
     i   <- cursorIndex After
@@ -1307,33 +1310,64 @@ popElem
   => RelativeToCursor -> m elem
 popElem rel = stack ("popElem "++show rel) $ getElem rel >>= \ elem -> delElem rel >> return elem
 
--- Move the cursor, which will shift elements around the vector, using a algorithm of O(n) steps,
--- where @n@ is the 'Relative' shift value. Pass a boolean value indicating whether or not you would
--- like to perform bounds checking, if so an exception will be raised if the line index goes out of
--- bounds.
-shiftCursor
-  :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem)
-  => Relative Int -> m ()
-shiftCursor (Relative count) = stack ("shiftCursor "++show count) $ if count == 0 then return () else getVoid >>= \ case
-  Nothing -> do
-    siz <- getAllocSize
-    cur <- getElemCount Before
-    let i = cur + count
-    if not $ 0 <= i && i < siz then throwCountErr count else void $ do
-      modCount Before (+ count)
-      modCount After  (+ count)
+shiftCursor2 :: MonadIO m => Relative Int -> EditLine tags m ()
+shiftCursor2 (Relative count) = stack ("shiftCursor "++show count) $ if count == 0 then return () else getVoid >>= \ case
+  Nothing -> done
   Just (Absolute lo, Absolute hi) ->
     if      count ==  1 then popElem After  >>= pushElem Before
     else if count == -1 then popElem Before >>= pushElem After
     else do
       vec  <- getVector
-      from <- getSlice $ Relative count -- necessary bounds checking is done in 'getSlice'
+      from <- getSlice (Relative count)
+      let _frozen = UVec.freeze from
+      fromfrz <- liftIO _frozen --DEBUG
+      traceM $ "(shiftCursor.getSlice "++show count++" -> "++show fromfrz++" -> from)" --DEBUG
       let slice = if unsafeMode then GMVec.unsafeSlice else GMVec.slice
       let to = vec &
-            if      count > 1 then trace ("(shiftCursor.slice "++show lo++' ':show (abs count)++")") $ slice lo count
-            else if count < 1 then trace ("(shiftCursor.slice "++show (hi + count)++' ':show (negate count)++")") $ slice (hi + count) (negate count)
+            if      count > 1 then trace ("(shiftCursor.slice "++show lo++' ':show (abs count)++" -> to)") $ slice lo count
+            else if count < 1 then trace ("(shiftCursor.slice "++show (hi + 1 + count)++' ':show (negate count)++" -> to)") $ slice (hi + 1 + count) (negate count)
             else error "shiftCursor: internal error, this should never happen"
-      liftIO $ GMVec.copy to from
+      tofrz <- liftIO (UVec.freeze to)          --DEBUG
+      traceM $ "(shiftCursor.slice -> "++show tofrz++")" --DEBUG
+      liftIO $ GMVec.move to from
+      done
+  where
+    done :: MonadIO m => EditLine tags m ()
+    done = void $ modCount Before (+ count) >> modCount After (subtract count)
+
+-- Move the cursor, which will shift elements around the vector, using a algorithm of O(n) steps,
+-- where @n@ is the 'Relative' shift value. Pass a boolean value indicating whether or not you would
+-- like to perform bounds checking, if so an exception will be raised if the line index goes out of
+-- bounds.
+shiftCursor
+  :: (GMVec.MVector vec elem, MonadEditVec (vec RealWorld elem) m)
+  => Relative Int -> m ()
+shiftCursor (Relative count) = stack ("shiftCursor "++show count) $ if count == 0 then return () else getVoid >>= \ case
+  Nothing -> done
+  Just (Absolute lo, Absolute hi) ->
+    if      count ==  1 then popElem After  >>= pushElem Before
+    else if count == -1 then popElem Before >>= pushElem After
+    else do
+      vec  <- getVector
+      from <- getSlice (Relative count)
+      let slice = if unsafeMode then GMVec.unsafeSlice else GMVec.slice
+      let to = vec &
+            if      count > 1 then trace ("(shiftCursor.slice "++show lo++' ':show (abs count)++" -> to)") $ slice lo count
+            else if count < 1 then trace ("(shiftCursor.slice "++show (hi + 1 + count)++' ':show (negate count)++" -> to)") $ slice (hi + 1 + count) (negate count)
+            else error "shiftCursor: internal error, this should never happen"
+      liftIO $ GMVec.move to from
+      done
+  where
+    done = void $ modCount Before (+ count) >> modCount After (subtract count)
+
+-- | Like 'shiftCursor' but performs bounds checking. This function does not throw an out-of-range
+-- exception, rather it simply calls 'shiftCursor' with the minimal in-range value, as shifting the
+-- cursor (in my opinion) should not result in an error.
+shiftCursorChk2 :: MonadIO m => Relative Int -> EditLine tags m ()
+shiftCursorChk2 (Relative count) = getElemCount (if count <= 0 then Before else After) >>=
+  shiftCursor2 . Relative .
+  (\ i -> trace ("(shiftCursorChk2 "++show count++" -> "++show i++")") i) . --DEBUG
+  ((signum count) *) . min (safeAbs count) . safeAbs where
 
 -- | Like 'shiftCursor' but performs bounds checking. This function does not throw an out-of-range
 -- exception, rather it simply calls 'shiftCursor' with the minimal in-range value, as shifting the
@@ -1343,7 +1377,7 @@ shiftCursorChk
   => Relative Int -> m ()
 shiftCursorChk (Relative count) = getElemCount (if count <= 0 then Before else After) >>=
   shiftCursor . Relative .
-  (\ i -> trace ("(shiftCursorChk "++show count++' ':show i++")") i) . --DEBUG
+  (\ i -> trace ("(shiftCursorChk "++show count++" -> "++show i++")") i) . --DEBUG
   ((signum count) *) . min (safeAbs count) . safeAbs where
 
 -- Create a duplicate of the vector within.
@@ -1351,11 +1385,20 @@ dupVector :: (GMVec.MVector v a, MonadEditVec (v RealWorld a) m) => m (v RealWor
 dupVector = getVector >>= liftIO . GMVec.clone
 
 -- Copy the current mutable buffer vector to an immutable vector.
-freezeVector :: (GVec.Vector v a, MonadEditVec (GVec.Mutable v RealWorld a) m) => m (v a)
+freezeVector
+  :: forall vec elem m
+  . (GVec.Vector vec elem, MonadEditVec (GVec.Mutable vec RealWorld elem) m
+    , Show (vec elem) --DEBUG
+    )
+  => m (vec elem)
 freezeVector = stack ("freezeVector") $ do
   newvec <- countElems >>= newVector
   bef <- getLoSlice
+  beffrz <- liftIO $ (GVec.freeze bef :: IO (vec elem))     --DEBUG
+  traceM $ "(freezeVector.getLoSlice -> "++show beffrz++")" --DEBUG
   aft <- getHiSlice
+  aftfrz <- liftIO $ (GVec.freeze aft :: IO (vec elem))     --DEBUG
+  traceM $ "(freezeVector.getLoSlice -> "++show aftfrz++")" --DEBUG
   let slice = if unsafeMode then GMVec.unsafeSlice else GMVec.slice
   liftIO $ do
     trace ("(freezeVector.slice 0 "++show (GMVec.length bef)++")") $ --DEBUG
@@ -1787,7 +1830,7 @@ moveCursor row col = moveByLine row >> moveByChar col
 -- moving the cursor toward the start of the buffer, a positive @n@ indicates moving the cursor
 -- toward the end of the buffer.
 moveByLine
-  :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
+  :: forall editor tags m . (MonadEditText editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
      )
   => Relative LineIndex -> editor tags m ()
@@ -1801,7 +1844,7 @@ moveByChar
      , Show tags --DEBUG
      )
   => Relative CharIndex -> editor tags m ()
-moveByChar = liftEditLine . shiftCursorChk . Relative . charToCount
+moveByChar = liftEditLine . shiftCursorChk2 . Relative . charToCount
 
 -- | Go to an absolute line number, the first line is 1 (line 0 and below all send the cursor to
 -- line 1), the last line is 'Prelude.maxBound'.
