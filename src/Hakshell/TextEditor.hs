@@ -229,6 +229,12 @@ unsafeMode = False
 defaultInitBufferSize :: Int
 defaultInitBufferSize = 512
 
+-- Overflow-safe absolute value function. Many programming language compilers have unintuitive
+-- behavior when evaluating the expresion @(abs minBound)@ due to integer overflow, GHC also suffers
+-- from this problem
+safeAbs :: (Ord n, Num n, Bounded n) => n -> n
+safeAbs n = if n >= 0 then n else negate $ if n == minBound then n + 1 else n
+
 ----------------------------------------------------------------------------------------------------
 
 -- | Used for indexing lines and characters relative to the cursor.
@@ -261,6 +267,14 @@ instance Bounded (Absolute CharIndex) where
 instance Bounded (Absolute LineIndex) where
   minBound = Absolute $ LineIndex 1
   maxBound = Absolute $ LineIndex maxBound
+
+instance Bounded (Relative CharIndex) where
+  minBound = Relative $ CharIndex minBound
+  maxBound = Relative $ CharIndex maxBound
+
+instance Bounded (Relative LineIndex) where
+  minBound = Relative $ LineIndex minBound
+  maxBound = Relative $ LineIndex maxBound
 
 ----------------------------------------------------------------------------------------------------
 
@@ -1328,7 +1342,9 @@ shiftCursorChk
   :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem)
   => Relative Int -> m ()
 shiftCursorChk (Relative count) = getElemCount (if count <= 0 then Before else After) >>=
-  shiftCursor . Relative . ((signum count) *) . min (abs count)
+  shiftCursor . Relative .
+  (\ i -> trace ("(shiftCursorChk "++show count++' ':show i++")") i) . --DEBUG
+  ((signum count) *) . min (safeAbs count) . safeAbs where
 
 -- Create a duplicate of the vector within.
 dupVector :: (GMVec.MVector v a, MonadEditVec (v RealWorld a) m) => m (v RealWorld a)
@@ -1878,9 +1894,9 @@ deleteCharsWrap
 deleteCharsWrap request = liftEditText $ if request == 0 then return 0 else
   let direction = if request < 0 then Before else After in
   -- First, delete the chararacters in the line editor, see if that satisfies the request...
-  deleteChars request >>= \ delcount -> if abs delcount >= abs request then return delcount else
+  deleteChars request >>= \ delcount -> if safeAbs delcount >= safeAbs request then return delcount else
   -- otherwise ues 'forLines' to delete each line until the request has been satsified.
-  fmap snd $ forLines direction (abs request + delcount, delcount) $ \ halt line ->
+  fmap snd $ forLines direction (safeAbs request + delcount, delcount) $ \ halt line ->
     get >>= \ st@(request, delcount) ->
     if request <= 0 then halt st else
     let weight = countToChar $ textLineWeight line in
@@ -1984,7 +2000,7 @@ forLinesInRange absFrom@(Absolute (LineIndex from)) (Absolute (LineIndex to)) fo
   gotoLine absFrom
   lineCount <- (+) <$> use linesAboveCursor <*> use linesBelowCursor
   let dist = to - from
-  forLinesLoop fold f (min lineCount . max 1 $ abs dist) $ if dist < 0
+  forLinesLoop fold f (min lineCount . max 1 $ safeAbs dist) $ if dist < 0
     then (unsafePopLine Before, pushLine After)
     else (unsafePopLine After,  pushLine Before)
 
@@ -2305,7 +2321,7 @@ forLinesInView (TextView{textViewVector=vec}) fold f = flip execStateT fold $
 ----------------------------------------------------------------------------------------------------
 
 ralign :: Int -> String
-ralign n = case abs n of
+ralign n = case safeAbs n of
   i | i < 10 -> "      " ++ show i
   i | i < 100 -> "     " ++ show i
   i | i < 1000 -> "    " ++ show i

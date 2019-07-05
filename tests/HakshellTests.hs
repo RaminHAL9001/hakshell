@@ -63,8 +63,10 @@ lineEditorTests = do
         report $ "--- moveByChar "++show dir++" ---\n"
         moveByChar dir
         copyLineEditorText >>= liftIO . print
-  move (-6)
-  move  18
+  move minBound
+  instr Before " what "
+  move maxBound
+  instr Before " now "
 
 basicTests :: IO ()
 basicTests = do
