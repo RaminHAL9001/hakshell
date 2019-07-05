@@ -57,14 +57,14 @@ lineEditorTests = do
           ((\ (c:cx) -> toLower c : cx) $ show dir)++" cursor: "++show str++" ---\n"
         mapM_ (insertChar dir) str
         copyLineEditorText >>= liftIO . print
-  instr After $ reverse "CharacterS AfteR"
-  instr Before "CharacterS BeforE "
+  instr After $ reverse "characters after"
+  instr Before "characters before "
   let move dir = testTextEditor error buf $ do
         report $ "--- moveByChar "++show dir++" ---\n"
         moveByChar dir
         copyLineEditorText >>= liftIO . print
-  move (-5)
-  move  15
+  move (-6)
+  move  18
 
 basicTests :: IO ()
 basicTests = do

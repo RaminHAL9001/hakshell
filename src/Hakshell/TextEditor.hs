@@ -1102,7 +1102,7 @@ getIsFull = peek "getIsFull" $ (== 0) <$> getUnusedSpace
 getSlice
   :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem)
   => Relative Int -> m (vec st elem)
-getSlice (Relative count) = stack ("getSlice "++' ':show count) $ do
+getSlice (Relative count) = stack ("getSlice "++show count) $ do
   vec <- getVector
   if count < 0
    then do
@@ -1320,6 +1320,15 @@ shiftCursor (Relative count) = stack ("shiftCursor "++show count) $ if count == 
             else if count < 1 then trace ("(shiftCursor.slice "++show (hi + count)++' ':show (negate count)++")") $ slice (hi + count) (negate count)
             else error "shiftCursor: internal error, this should never happen"
       liftIO $ GMVec.copy to from
+
+-- | Like 'shiftCursor' but performs bounds checking. This function does not throw an out-of-range
+-- exception, rather it simply calls 'shiftCursor' with the minimal in-range value, as shifting the
+-- cursor (in my opinion) should not result in an error.
+shiftCursorChk
+  :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem)
+  => Relative Int -> m ()
+shiftCursorChk (Relative count) = getElemCount (if count <= 0 then Before else After) >>=
+  shiftCursor . Relative . ((signum count) *) . min (abs count)
 
 -- Create a duplicate of the vector within.
 dupVector :: (GMVec.MVector v a, MonadEditVec (v RealWorld a) m) => m (v RealWorld a)
@@ -1766,7 +1775,7 @@ moveByLine
      , Show tags --DEBUG
      )
   => Relative LineIndex -> editor tags m ()
-moveByLine = liftEditText . shiftCursor . Relative . lineToCount
+moveByLine = liftEditText . shiftCursorChk . Relative . lineToCount
 
 -- | Move the cursor to a different character position within the 'bufferLineEditor' by an @n ::
 -- Int@ number of characters. A negative @n@ indicates moving toward the start of the line, a
@@ -1776,7 +1785,7 @@ moveByChar
      , Show tags --DEBUG
      )
   => Relative CharIndex -> editor tags m ()
-moveByChar = liftEditLine . shiftCursor . Relative . charToCount
+moveByChar = liftEditLine . shiftCursorChk . Relative . charToCount
 
 -- | Go to an absolute line number, the first line is 1 (line 0 and below all send the cursor to
 -- line 1), the last line is 'Prelude.maxBound'.
