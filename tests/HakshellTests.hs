@@ -13,7 +13,7 @@ main = do
   begin
   lineEditorTests
   --textViewTests
-  --basicTests
+  basicTests
 
 begin :: IO ()
 begin = putStrLn "\n-------------------------\nBegin HakshellTest Log\n-------------------------\n"
