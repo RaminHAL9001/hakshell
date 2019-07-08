@@ -375,6 +375,9 @@ instance MonadTrans (FoldMapLines r fold tags) where
 -- @
 type FoldMapLinesHalt void fold tags m r = r -> FoldMapLines r fold tags m void
 
+foldMapLiftEditText :: Monad m => EditText tags m a -> FoldMapLines r fold tags m a
+foldMapLiftEditText = FoldMapLines . lift . lift . lift
+
 -- | Convert a 'FoldMapLines' into an 'EditText' function. This function is analogous to the
 -- 'runStateT' function. This function does not actually perform a fold or map operation, rather it
 -- simply unwraps the 'EditText' monad that exists within the 'FoldMapLines' monad.
@@ -1002,6 +1005,16 @@ instance MonadIO m => MonadEditVec (UMVec.IOVector Char) (EditLine tags m) where
   throwIndexErr = throwError . CharIndexOutOfRange . Absolute . CharIndex
   throwCountErr = throwError . CharCountOutOfRange . Relative . CharIndex
 
+instance MonadIO m => MonadEditVec (MVec.IOVector (TextLine tags))  (FoldMapLines r fold tags m) where
+  nullElem      = foldMapLiftEditText nullElem
+  newVector     = foldMapLiftEditText . newVector
+  modVector     = foldMapLiftEditText . modVector
+  modCount dir  = foldMapLiftEditText . modCount dir
+  cursorIndex   = foldMapLiftEditText . cursorIndex
+  throwLimitErr = foldMapLiftEditText . throwLimitErr
+  throwIndexErr = foldMapLiftEditText . throwIndexErr
+  throwCountErr = foldMapLiftEditText . throwCountErr
+
 stack :: Monad m => String -> m a -> m a --DEBUG
 --stack msg f = traceM ("(begin: "++msg++")") >> f <* traceM ("(_end_: "++msg++")") --DEBUG
 stack = const id
@@ -1411,6 +1424,13 @@ instance MonadEditLine (FoldMapLines r fold) where
 data RelativeToCursor = Before | After
   deriving (Eq, Ord, Read, Show, Bounded, Enum)
 
+class HasOpposite a where { opposite :: a -> a; }
+instance HasOpposite Bool where { opposite = not; }
+instance HasOpposite Int  where { opposite = negate; }
+instance HasOpposite Integer where { opposite = negate; }
+instance HasOpposite RelativeToCursor where
+  opposite = \ case { Before -> After; After -> Before }
+
 -- Not for export: This function takes a 'RelativeToCursor' value and constructs a lens that can be
 -- used to access 'TextLine's within the 'LineEditor'.
 relativeToLine :: RelativeToCursor -> Lens' (TextBufferState tags) Int
@@ -1483,36 +1503,19 @@ pushLine
      , Show tags -- DEBUG
      )
   => RelativeToCursor -> TextLine tags -> editor tags m ()
-pushLine rel line = liftEditText $ do
-  growBufferIfTooSmall 1
-  MVec.write <$> use bufferVector <*> cursorIndex rel <*> pure line >>= liftIO --TODO: replace with 'pushElem'
-  relativeToLine rel += 1
-
-unsafePopLine
-  :: (MonadIO m
-     , Show tags --DEBUG
-     )
-  => RelativeToCursor -> EditText tags m (TextLine tags)
-unsafePopLine rel = do
-  vec <- use bufferVector
-  i   <- subtract 1 <$> cursorIndex rel
-  liftIO (MVec.read vec i <* MVec.write vec i TextLineUndefined) <* --TODO: replace with 'popElem'
-    ((case rel of{ Before -> linesAboveCursor; After -> linesBelowCursor; }) -= 1)
+pushLine rel = liftEditText . pushElem rel
 
 -- | Pop a 'TextLine' from before or after the cursor. This function does not effect the content of
--- the 'bufferLineEditor'. If you 'popLine' from 'Before' the cursor when the 'bufferLineEditor'
--- is at the beginning of the buffer, or if you 'popLine' from 'After' the cursor when the
--- 'bufferLineEditor' is at the end of the buffer, 'Prelude.Nothing' will be returned.
+-- the 'bufferLineEditor'. If you 'popLine' from 'Before' the cursor when the 'bufferLineEditor' is
+-- at the beginning of the buffer, or if you 'popLine' from 'After' the cursor when the
+-- 'bufferLineEditor' is at the end of the buffer, this function evaluates to an 'EndOfLineBuffer'
+-- exception.
 popLine
   :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
      )
-  => RelativeToCursor -> editor tags m (Maybe (TextLine tags))
-popLine = liftEditText . \ case
-  Before -> use linesAboveCursor >>= \ before ->
-    if before <= 0 then return Nothing else Just <$> unsafePopLine Before
-  After  -> use linesBelowCursor >>= \ after ->
-    if after <= 0 then return Nothing else Just <$> unsafePopLine After
+  => RelativeToCursor -> editor tags m (TextLine tags)
+popLine = liftEditText . popElem
 
 ----------------------------------------------------------------------------------------------------
 
@@ -1862,11 +1865,10 @@ deleteChars (Relative (CharIndex n)) = liftEditLine $ fmap (Relative . CharIndex
 -- adjacent lines such that the travel of deletion wraps to the end of the prior line or the
 -- beginning of the next line, depending on the direction of travel.
 deleteCharsWrap
-  :: ( MonadEditText editor, MonadIO (editor tags m), MonadIO m
+  :: ( MonadIO m
      , Show tags --DEBUG
-     )
-  => Relative CharIndex -> editor tags m (Relative CharIndex)
-deleteCharsWrap request = liftEditText $ if request == 0 then return 0 else
+     ) => Relative CharIndex -> EditText tags m (Relative CharIndex)
+deleteCharsWrap request = if request == 0 then return 0 else
   let direction = if request < 0 then Before else After in
   -- First, delete the chararacters in the line editor, see if that satisfies the request...
   deleteChars request >>= \ delcount -> if safeAbs delcount >= safeAbs request then return delcount else
@@ -1934,12 +1936,11 @@ forLinesLoop
   => fold
   -> (FoldMapLinesHalt void fold tags m fold ->
       TextLine tags -> FoldMapLines fold fold tags m [TextLine tags])
-  -> Int
-  -> (EditText tags m (TextLine tags), TextLine tags -> FoldMapLines fold fold tags m ())
-  -> EditText tags m fold
-forLinesLoop fold f count (pop, push) = execFoldMapLines (callCC $ loop count) fold where
+  -> Int -> RelativeToCursor -> EditText tags m fold
+forLinesLoop fold f count dir = execFoldMapLines (callCC $ loop count) fold where
   loop count halt = if count <= 0 then get else
-    liftEditText pop >>= f halt >>= mapM_ push >> loop (count - 1) halt
+    liftEditText (popElem dir) >>= f halt >>= mapM_ (pushElem $ opposite dir) >>
+    loop (count - 1) halt
 
 -- | This function moves the cursor to the first @'Absolute' 'LineIndex'@ parameter given (will
 -- evaluate 'endInsertMode)', then evaluate a folding and mapping monadic function over a range of
@@ -1972,9 +1973,7 @@ forLinesInRange absFrom@(Absolute (LineIndex from)) (Absolute (LineIndex to)) fo
   gotoLine absFrom
   lineCount <- (+) <$> use linesAboveCursor <*> use linesBelowCursor
   let dist = to - from
-  forLinesLoop fold f (min lineCount . max 1 $ safeAbs dist) $ if dist < 0
-    then (unsafePopLine Before, pushLine After)
-    else (unsafePopLine After,  pushLine Before)
+  forLinesLoop fold f (min lineCount . max 1 $ safeAbs dist) $ if dist < 0 then Before else After
 
 -- | Conveniently calls 'forLinesInRange' with the first two parameters as @('Absolute' 1)@ and
 -- @('Absolute' 'maxBound')@.
@@ -1993,7 +1992,7 @@ forLinesInBuffer = forLinesInRange (Absolute 1) maxBound
 -- forward to the end of the buffer, whereas if the 'RelativeToCursor' value is 'Before' then
 -- iteration goes backward to the start of the buffer.
 forLines
-  :: (MonadIO m
+  :: ( MonadIO m
      , Show tags --DEBUG
      )
   => RelativeToCursor
@@ -2005,8 +2004,8 @@ forLines rel fold f = do
   above <- use linesAboveCursor
   below <- use linesBelowCursor
   uncurry (forLinesLoop fold f) $ case rel of
-    Before -> (above, (unsafePopLine Before, pushLine After))
-    After  -> (below, (unsafePopLine After, pushLine Before))
+    Before -> (above, Before)
+    After  -> (below, After)
 
 -- | Use the 'defaultLineBreak' value to break the line at the current cursor position.
 lineBreak
