@@ -1,41 +1,10 @@
 -- | This module integrates text processing facilities into Hakshell.
 --
--- * Overview
+-- * Preface
 --
--- This module provides editable text in the form of a 'TextBuffer', and read-only text in the form
--- of a 'TextView'.
+-- Please skip to the API documentation below if you simply want to know how to use this module.
 --
--- Editing operations on a 'TextBuffer' are atomic and thread-safe, but do not alow for computations
--- on the buffer to be evaluated in parallel. Create a 'TextBuffer' with 'newTextBuffer', and then
--- evaluate 'EditText' functions using the 'runEditTextIO' function or 'runEditTextOnCopy'
--- function. 'EditText' combinators allow for moving the cursor around with functions such as
--- 'gotoPosition', and inserting text with functions such as 'insertChar' and 'insertString'.
---
--- Line breaks can be inserted using 'lineBreak'. Line breaks can be configured to follow the UNIX
--- tradition of using a single character '\n', or the DOS and CP/M tradition of using the
--- two-charater '\r\n' symbol. The default is UNIX style, with the 'defaultLineBreak', but the DOS
--- style can be set with 'lineBreakerNLCR'.
---
--- The 'TextBuffer' contains a local mutable line editor called a 'LineEditor'. Any single line from
--- within the buffer can be copied into the local 'LineEditor' using 'beginInsertMode'. The cursor
--- can be moved around using 'gotoChar' or 'moveByChar', characters can be inserted or deleted, then
--- the content of the 'LineEditor' can be copied back to the 'TextBuffer' using 'endInsertMode'.
---
--- Bulk edit operations can be performed using the 'forLinesInRangeM' function which evaluates a
--- continuation of type 'FoldMapLines' using a control flow pattern similar to a "for loop" in the
--- procedural programming style. The 'FoldMapLines' function lifts the ordinary 'EditText'
--- combinators type so edits can be evaluated on every line in the loop range. The 'FoldMapLines'
--- function type uses the 'Control.Monad.Cont.ContT' monad transformer internally so your bulk
--- editing algorithm can break out of the for loop at any time by simply evaluating the
--- 'FoldMapLinesHalt' function passed to your bulk editor function.
---
--- 'TextView's are a shallow, immutable snapshot of all, or a portion of, a 'TextBuffer'. The
--- internal structure of a 'TextView' is identical to that of the 'TextBuffer' so no additional
--- conversion or copying is necessary, making the creation of views extremely fast. Create a
--- 'TextView' using 'textViewOnLines' or 'textViewOnRange'. Once a 'TextView' is created other
--- threads may immediately resume performing updates on the 'TextBuffer'.
---
--- * Why a Hakshell needs a built-in editor
+-- ** Why a Hakshell needs a built-in editor
 -- 
 -- Any useful system shell needs some form of text editor. Some systems, like traditional UNIX
 -- systems, prefer to keep the editor separate from the shell's command line interpreter. In Linux,
@@ -52,7 +21,7 @@
 -- allowing programs to be designed around the idiom of processing files. Likewise, the UNIX
 -- userland tools were designed around automated text processing. The very notion of "pipes",
 -- introduced by UNIX, declares a formal methodology for defining composable text filters. So the
--- distinction between a shell and an editor is really not so distinct. Binary data is of course can
+-- distinction between a shell and an editor is really not so distinct. Binary data of course can
 -- also be piped, but as often as possible there are tools for representing the binary information
 -- as text, and even re-constructing binary from it's textual representation.
 --
@@ -85,56 +54,144 @@
 -- for automated text processing APIs, upon which programmers can build text editors and text
 -- processors, and hence a text editor API is an integral part of the "Hakshell" library.
 module Hakshell.TextEditor
-  ( -- * Text Editing API
-    -- ** Create and Start Editing a 'TextBufferState'
+  ( -- * Text Buffers
+
+    -- ** The 'TextLine' data type
+    --
+    -- A 'TextBuffer' is a memory-efficient vector containing 'TextLine's. A 'TextLine' is created
+    -- by evaluating a 'TextEdit' function such as 'insertString'. A 'TextLine' within a
+    -- 'TextBuffer' can be updated by navigating the cursor to the line using 'gotoChar' or
+    -- 'moveByChar', which will copy the 'TextLine' into a 'LineEditor' which you can then edit
+    -- by evaluating a function of type 'EditLine' with the 'editLine' function.
+
+    TextLine, emptyTextLine, nullTextLine, sliceLineToEnd, textLineWeight, textLineIsUndefined,
+
+    -- *** 'TextLine' lenses
+
+    textLineString, textLineTags,
+
+    -- ** The 'TextBuffer' data type
+    --
+    -- A 'TextBuffer' can be created with 'newTextBuffer', and then edited by evaluating a function
+    -- of type 'EditText' on it with the 'runEditTextIO' function. You typically fill a 'TextBuffer'
+    -- with a "String" using 'insertString'. A 'TextBuffer' contains a cursor which you can move
+    -- around using the 'gotoChar' and 'moveByChar' functions. Text is deleted with the
+    -- 'deleteCharsWrap' function.
+
     TextBuffer, newTextBuffer, copyTextBuffer,
-    runEditTextIO, runEditTextOnCopy,
-    runMapLines, runFoldMapLines, execFoldMapLines, evalFoldMapLines,
-    -- ** Text Editing Combinators
-    RelativeToCursor(..),
-    insertString, insertChar, lineBreak,
-    clearCurrentLine, resetCurrentLine,
-    deleteChars, deleteCharsWrap, textCursorTags,
+
+    -- ** The 'EditText' function type
+
+    EditText, runEditTextIO, runEditTextOnCopy,
+
+    insertString, lineBreak, deleteCharsWrap, pushLine, popLine,
     currentTextLocation, currentLineNumber, currentColumnNumber,
-    -- ** Manipulating Lines of Text
-    beginInsertMode, endInsertMode,
-    copyLineEditorText, replaceCurrentLine,
-    pushLine, popLine,
-    readLineIndex, writeLineIndex,
-    forLines, forLinesInRange, forLinesInBuffer,
-    -- * Text Views
+    readLineIndex, writeLineIndex, beginInsertMode, endInsertMode,
+
+    -- *** Error Data Type
+
+    TextEditError(..),
+
+    -- ** Moving the Cursor
+
+    getCursor, gotoCursor, saveCursorEval, gotoPosition, gotoLine, gotoChar,
+
+    Absolute(..),  LineIndex(..), CharIndex(..), TextLocation(..),
+
+    -- *** Moving the cursor relative to the cursor
+
+    moveCursor, moveByLine,
+
+    Relative(..), RelativeToCursor(..),
+    RelativeToAbsoluteCursor, -- <- does not export members
+    relativeToAbsolute, relativeLine, relativeChar, lineIndex, charIndex,
+
+    -- ** The 'EditLine' function type
+    --
+    -- When evaluating 'editLine' within the context of an 'EditText' function, the line currently
+    -- under the cursor can be edited at a character-by-character level.
+
+    EditLine, editLine, insertChar, deleteChars, lineEditorTags, moveByChar,
+    copyLineEditorText, replaceCurrentLine, clearCurrentLine, resetCurrentLine,
+
+    -- ** Text Views
+    --
+    -- A 'TextView' is an immutable copy of a portion of a 'TextBuffer'. By creating a 'TextView'
+    -- you take a snapshot of a 'TextBuffer' at a point in time which can then be pasted into
+    -- another 'TextBuffer', or used to draw the window of an interactive text editor application.
+
     TextView, textView, textViewOnLines, textViewAppend, emptyTextView,
     newTextBufferFromView, textViewCharCount, textViewVector,
+
+    -- *** Fold over a 'TextView'.
+    --
+    -- It is possible to perform a folding operation on a 'TextView', this is often a good way to
+    -- draw a graphical represntation of text, or to translate the 'TextView' to some other data
+    -- type.
+
     FoldTextView, forLinesInView,
-    -- * Cursor Positions
-    Relative(..), Absolute(..), LineIndex(..), CharIndex(..), TextLocation(..),
-    RelativeToAbsoluteCursor, -- <- does not export members
-    relativeToAbsolute,
-    relativeLine, relativeChar,
-    lineIndex, charIndex, getCursor, gotoCursor, saveCursorEval,
-    gotoPosition, gotoLine, gotoChar, moveCursor, moveByLine, moveByChar,
-    -- * Function and Data Types
-    -- ** Text Editing Typeclasses
-    MonadEditText(..), MonadEditLine(..),
-    -- ** Instances of Text Editing Type Classes
-    EditText, copyLineEditorIO, newLineEditor, copyLineEditor,
-    FoldMapLines, MapLines, EditLine, editLine,
-    FoldMapLinesHalt,
-    FoldMapChars, foldMapChars, runFoldMapChars, execFoldMapChars, evalFoldMapChars,
+
+    -- * Batch Editing
+
+    -- ** Folding over lines of text
+    --
+    -- Folding and mapping can both be done in a single pass. It is also possible to halt a
+    -- folding/mapping function by evaluating a halting continuation function provided by
+    -- 'forLinesInRange', 'forLines', and 'forLinesInBuffer'.
+
+    FoldMapLines, FoldMapLinesHalt, forLines, forLinesInRange, forLinesInBuffer,
+
+    -- *** Mapping over lines of text
+    --
+    -- The 'MapLines' function type is a special case of 'FoldMapLines'.
+
+    MapLines, runMapLines,
+
+    -- *** Evaluate a 'FoldMapLines' function without input
+    --
+    -- These functions do not iterate over a range of lines in the buffer, rather they evaluate a
+    -- function of type 'FoldMapLines' just once, which reduces it to a function of type 'EditText'.
+
+    runFoldMapLines, execFoldMapLines, evalFoldMapLines,
+
+    -- ** Folding over characters
+
+    FoldMapChars, foldMapChars, runFoldMapChars,
+
+    -- *** Mapping over characters in a line of text
+    --
+    -- The 'MapChars' function type is a special case of 'FoldMapChars'.
+
     MapChars, runMapChars,
-    -- * Text Editor Data Structures
-    -- ** Text Buffer
-    TextBufferState, LineBreaker(..),
-    bufferLineBreaker, lineBreaker, lineBreakPredicate, defaultLineBreak,
-    bufferLineEditor, textLineString, bufferDefaultTags,
-    lineBreakerNLCR,
-    -- ** Line Editing
-    TextLine, emptyTextLine, nullTextLine, sliceLineToEnd, textLineWeight, textLineIsUndefined,
-    LineEditor, parentTextEditor, lineEditorCharCount, textLineTags,
-    -- ** Errors
-    TextEditError(..),
+
+    -- *** Evaluate a 'FoldMapChars' function without input
+    --
+    -- These functions do not iterate over a range of characters in the buffer, rather they evaluate
+    -- a function of type 'FoldMapChars' just once, which reduces it to a function of type
+    -- 'EditLine'.
+
+    execFoldMapChars, evalFoldMapChars,
+
+    -- ** Text Editing Typeclasses
+    --
+    -- These type classes are defined so that some of the 'EditText' type of functions can be
+    -- evaluated within a batch editing type of function witouht having to supply a lifting
+    -- function.
+
+    MonadEditText(..), MonadEditLine(..),
+
+    -- * Line Break Behavior
+    --
+    -- The line break behavior of the 'TextBuffer' can be programmed to behave differently from the
+    -- ordinary default behavior of breaking input strings on the @'\n'@ character.
+
+    LineBreaker(..), bufferLineBreaker, lineBreaker, lineBreakPredicate,
+    defaultLineBreak, bufferLineEditor, bufferDefaultTags, lineBreakerNLCR,
+
     -- * Debugging
+
     debugPrintBuffer, debugPrintView, debugPrintCursor,
+
     -- * Re-Exports
     -- ** "Hakshell.String"
     module Hakshell.String,
@@ -675,6 +732,16 @@ instance Show tags => Show (TextLine tags) where
     TextLine{theTextLineString=vec,theTextLineTags=tags,theTextLineBreakSize=lbrksz} ->
       '(' : show (unpack vec) ++ ' ' : show lbrksz ++ ' ' : show tags ++ ")"
 
+-- | The null-terminated, UTF-8 encoded string of bytes stored in this line of text.
+textLineString :: Lens' (TextLine tags) CharVector
+textLineString = lens theTextLineString $ \ a b -> a{ theTextLineString = b }
+
+-- | Arbitrary information stored with this text. Typcial use cases for this field may include
+-- syntax coloring rules, structured data parsed from the 'textLineString', text search indicies, a
+-- diff of changes made, or all of the above.
+textLineTags :: Lens' (TextLine tags) tags
+textLineTags = lens theTextLineTags $ \ a b -> a{ theTextLineTags = b }
+
 -- | The empty 'TextLine' value.
 emptyTextLine :: tags -> TextLine tags
 emptyTextLine tags = TextLine
@@ -765,8 +832,8 @@ cursorBreakSize = lens theCursorBreakSize $ \ a b -> a{ theCursorBreakSize = b }
 -- modify the tags value of the line under the cursor, evaluate one of the functions 'use',
 -- 'modifying', @('Control.Lens..=')@, or @('Control.Lens.%=')@ within an 'EditText' function, or
 -- any function which instantiates 'MonadEditText'.
-textCursorTags :: Lens' (LineEditor tags) tags
-textCursorTags = lens theLineEditorTags $ \ a b -> a{ theLineEditorTags = b }
+lineEditorTags :: Lens' (LineEditor tags) tags
+lineEditorTags = lens theLineEditorTags $ \ a b -> a{ theLineEditorTags = b }
 
 -- | Use this to initialize a new empty 'TextBufferState'. The default 'bufferLineBreaker' is set to
 -- 'lineBreakerNLCR'. A 'TextBufferState' always contains one empty line, but a line must have a @tags@
@@ -945,16 +1012,6 @@ bufferInsertMode = lens theBufferInsertMode $ \ a b -> a{ theBufferInsertMode = 
 -- | The current line of text being edited under the cursor.
 bufferLineEditor :: Lens' (TextBufferState tags) (LineEditor tags)
 bufferLineEditor = lens theBufferLineEditor $ \ a b -> a{ theBufferLineEditor = b }
-
--- | The null-terminated, UTF-8 encoded string of bytes stored in this line of text.
-textLineString :: Lens' (TextLine tags) CharVector
-textLineString = lens theTextLineString $ \ a b -> a{ theTextLineString = b }
-
--- | Arbitrary information stored with this text. Typcial use cases for this field may include
--- syntax coloring rules, structured data parsed from the 'textLineString', text search indicies, a
--- diff of changes made, or all of the above.
-textLineTags :: Lens' (TextLine tags) tags
-textLineTags = lens theTextLineTags $ \ a b -> a{ theTextLineTags = b }
 
 ----------------------------------------------------------------------------------------------------
 
@@ -1582,7 +1639,7 @@ copyLineEditor'
      , Show tags --DEBUG
      )
   => EditLine tags m (TextLine tags)
-copyLineEditor' = TextLine <$> freezeVector <*> use textCursorTags <*> use cursorBreakSize
+copyLineEditor' = TextLine <$> freezeVector <*> use lineEditorTags <*> use cursorBreakSize
 
 -- | Create a copy of the 'bufferLineEditor'.
 copyLineEditorText
@@ -1702,7 +1759,7 @@ editReplaceCurrentLine cur' line = stack ("editReplaceCurrentLine "++show cur'++
   charsBeforeCursor .= targlolen
   charsAfterCursor  .= targhilen
   cursorBreakSize   .= lbrksz
-  textCursorTags    .= theTextLineTags line
+  lineEditorTags    .= theTextLineTags line
   liftIO $ do
     let slice = if unsafeMode then UVec.unsafeSlice else UVec.slice
     when (cur > 0) $ UVec.copy targlo $ trace ("(editReplaceCurrentLine.slice 0"++show targlolen++")") $ slice 0 targlolen srcvec
@@ -1734,14 +1791,14 @@ resetCurrentLine = liftEditText $ newLineEditor >>= assign bufferLineEditor
 
 -- | Create a new 'LineEditor' value within the current 'EditText' context, using the default tags
 -- given by 'bufferDefaultTags'. This function calls 'newLineEditorIO' using the value of
--- 'textCursorTags'.
+-- 'lineEditorTags'.
 newLineEditor
   :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
      )
   => editor tags m (LineEditor tags)
 newLineEditor = liftEditText $ thisTextBuffer >>= \ this ->
-  use (bufferLineEditor . textCursorTags) >>= liftIO . newLineEditorIO this
+  use (bufferLineEditor . lineEditorTags) >>= liftIO . newLineEditorIO this
 
 -- | Create a copy of the current 'lineEditBuffer' and return it. This function calls
 -- 'copyLineEditorIO' using the value of the current 'lineEditBuffer'.
@@ -2025,7 +2082,7 @@ lineBreak rel = liftEditText $ do
       let cur = cursor ^. charsBeforeCursor
       str <- liftIO $! UVec.freeze $! UMVec.slice 0 cur vec
       pushLine Before $ TextLine
-        { theTextLineTags      = cursor ^. textCursorTags
+        { theTextLineTags      = cursor ^. lineEditorTags
         , theTextLineString    = str
         , theTextLineBreakSize = lbrkSize
         }
@@ -2038,7 +2095,7 @@ lineBreak rel = liftEditText $ do
       when (cur > 0) $ do
         str <- liftIO $! UVec.freeze $! UMVec.slice (len - cur) cur vec
         pushLine After $ TextLine
-          { theTextLineTags      = cursor ^. textCursorTags
+          { theTextLineTags      = cursor ^. lineEditorTags
           , theTextLineString    = str
           , theTextLineBreakSize = lbrkSize
           }
@@ -2357,7 +2414,7 @@ debugPrintCursor = liftEditText $ do
   liftIO $ do
     str <- forM [0 .. charVecLen - 1] $ UMVec.read charVec
     putStrLn $ "     bufferLineEditor: " ++ show str
-    putStrLn $ "       textCursorTags: " ++ show (cur ^. textCursorTags)
+    putStrLn $ "       lineEditorTags: " ++ show (cur ^. lineEditorTags)
     putStrLn $ " __cursorVectorLength: " ++ show charVecLen
     putStrLn $ "    charsBeforeCursor: " ++ show before
     putStrLn $ "     charsAfterCursor: " ++ show after
