@@ -1186,7 +1186,7 @@ getSlice (Relative count) = stack ("getSlice "++show count) $ do
 getSliceChk
   :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem)
   => Relative Int -> m (vec st elem)
-getSliceChk rel@(Relative count) = do
+getSliceChk rel@(Relative count) = stack "getSliceChk" $ do
   if count < 0
    then do
     bef <- getElemCount Before
@@ -1965,23 +1965,19 @@ insertString str = look ("insertString "++show str) $ liftEditText $ do
   let writeStr = editLine . fmap sum . mapM ((>> (return 1)) . pushElem Before)
   let writeLine line@(str, lbrk) = look ("writeLine "++show line) $ do
         (strlen, lbrklen) <- (,) <$> writeStr str <*> writeStr lbrk
-        traceM $ "(insertString.writeLine -> strlen="++show strlen++", lbrklen="++show lbrklen++")"
+        traceM $ "(insertString.writeLine -> strlen="++show strlen++", lbrklen="++show lbrklen++")" --DEBUG
         let maxlen = fromIntegral (maxBound :: Word16) :: Int
         if lbrklen >= maxlen
          then error $ "insertString: line break string length is "++show lbrklen++
                 "exceeeds maximum length of "++show maxlen++" characters"
-         else do
-          editLine $ cursorBreakSize .= fromIntegral lbrklen
-          editLine copyLineEditor' >>= pushElem Before
-          editLine clearCurrentLine
-          return $ strlen + lbrklen
+         else ( editLine $
+                  (cursorBreakSize .= fromIntegral lbrklen) >>
+                  copyLineEditor' <* (charsBeforeCursor .= 0 >> charsAfterCursor .= 0)
+              ) >>= pushElem Before >> return (strlen + lbrklen)
   let loop count = seq count . \ case
         []        -> return count
         line:more -> writeLine line >>= flip loop more
-  result <- Relative . CharIndex <$> case breaker str of
-    []    -> trace "(insertString.breaker -> [])" $ return 0
-    lines -> trace ("(insertString.breaker -> "++show lines++")") $ loop 0 lines
-  return result
+  Relative . CharIndex <$> loop 0 (breaker str)
 
 -- Not for export: this code shared by 'forLinesInRange' and 'forLines' but requires knowledge of
 -- the 'TextBuffer' internals in order to use, so is not something end users should need to know
