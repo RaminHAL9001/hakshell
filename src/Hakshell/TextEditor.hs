@@ -760,7 +760,7 @@ nullTextLine nullTags = \ case
   line              ->
     if UVec.null (theTextLineString line) then nullTags (theTextLineTags line) else False
 
--- | Cut a line at some index, keeping the characters 'Before' or 'After' the index.
+-- | Cut and remove a line at some index, keeping the characters 'Before' or 'After' the index.
 sliceLineToEnd :: RelativeToCursor -> Absolute CharIndex -> TextLine tags -> TextLine tags
 sliceLineToEnd rel (Absolute (CharIndex n)) = \ case
   TextLineUndefined -> TextLineUndefined
@@ -788,7 +788,8 @@ textLineIsUndefined = \ case { TextLineUndefined -> True; _ -> False; }
 -- there are no line breaking characters, or if there is only one line breaking character, the
 -- 'textLineWeight' is identical to the value given by 'intSize'.
 textLineWeight :: TextLine tags -> Int
-textLineWeight line = intSize line + fromIntegral (min 1 $ max 0 $ theTextLineBreakSize line) 
+textLineWeight line = intSize line - breaksize + min 1 (max 0 breaksize) where
+  breaksize = fromIntegral $ theTextLineBreakSize line
 
 ----------------------------------------------------------------------------------------------------
 
@@ -1073,7 +1074,7 @@ instance MonadIO m => MonadEditVec (MVec.IOVector (TextLine tags))  (FoldMapLine
   throwCountErr = foldMapLiftEditText . throwCountErr
 
 globalDebugLevel :: Int
-globalDebugLevel = 20
+globalDebugLevel = 10
 
 debugLevel :: Monad m => (String -> m a -> m a) -> Int -> String -> m a -> m a
 debugLevel report lvl msg f = if lvl > globalDebugLevel then f else report msg f
@@ -1183,11 +1184,11 @@ getSlice (Relative count) = stack 20 ("getSlice "++show count) $ do
   if count < 0
    then do
     i <- (+ count) <$> getElemCount Before -- TODO: should this be (cursorIndex before)?
-    return $ trace ("(getSlice.slice "++show i++' ':show (abs count)++")") $ GMVec.slice i (abs count) vec
+    return $ GMVec.slice i (abs count) vec
    else if count > 0
    then do
     i   <- cursorIndex After
-    return $ trace ("(getSlice.slice "++show i++' ':show count++")") $ GMVec.slice i count vec
+    return $ GMVec.slice i count vec
    else return $ GMVec.slice 0 0 vec
 
 -- Like 'getSlice' but 
@@ -1216,9 +1217,9 @@ getVoidSlice (Relative count) = stack 20 ("getVoidSlice "++show count) $ do
   vsp <- getVoid
   return $ vsp <&> \ (Absolute lo, Absolute hi) ->
    if count < 0
-   then trace ("(getVoidSlice.slice "++show (hi + count)++' ':show (abs count)++")") $ GMVec.slice (hi + count) (abs count) vec
+   then GMVec.slice (hi + count) (abs count) vec
    else if count > 0
-   then trace ("(getVoidSlice.slice "++show lo++' ':show count++")") $ GMVec.slice lo count vec
+   then GMVec.slice lo count vec
    else GMVec.slice 0 0 vec
 
 -- Obtain a slice (using 'getSlice') for the portion of the vector containing elements before or on
@@ -1388,8 +1389,8 @@ shiftCursor (Relative count) =
         from <- getSlice (Relative count)
         let slice = if unsafeMode then GMVec.unsafeSlice else GMVec.slice
         let to = vec &
-              if      count > 1 then trace ("(shiftCursor.slice "++show lo++' ':show (abs count)++" -> to)") $ slice lo count
-              else if count < 1 then trace ("(shiftCursor.slice "++show (hi + count)++' ':show (negate count)++" -> to)") $ slice (hi + count) (negate count)
+              if      count > 1 then slice lo count
+              else if count < 1 then slice (hi + count) (negate count)
               else error "shiftCursor: internal error, this should never happen"
         liftIO $ GMVec.move to from
         done
@@ -1771,8 +1772,8 @@ editReplaceCurrentLine cur' line =
     lineEditorTags    .= theTextLineTags line
     liftIO $ do
       let slice = if unsafeMode then UVec.unsafeSlice else UVec.slice
-      when (cur > 0) $ UVec.copy targlo $ trace ("(editReplaceCurrentLine.slice 0"++show targlolen++")") $ slice 0 targlolen srcvec
-      UVec.copy targhi $ trace ("(editReplaceCurrentLine.slice "++show targlolen++' ':show targhilen++")") $ slice targlolen targhilen srcvec
+      when (cur > 0) $ UVec.copy targlo $ slice 0 targlolen srcvec
+      UVec.copy targhi $ slice targlolen targhilen srcvec
 
 -- | Delete the content of the 'bufferLineEditor' except for the line breaking characters (if any)
 -- at the end of the line. This function does not change the memory allocation for the 'LineEditor',
@@ -1882,7 +1883,7 @@ gotoPosition (TextLocation{theLocationLineIndex=line,theLocationCharIndex=col}) 
 
 -- Not for export: does not filter line-breaking characters.
 unsafeInsertString :: MonadIO m => RelativeToCursor -> CharVector -> EditText tags m ()
-unsafeInsertString rel str = do
+unsafeInsertString rel str = look 10 ("unsafeInsertString "++show rel++' ':show str) $ do
   let strlen = intSize str
   growLineIfTooSmall strlen
   buf <- use $ bufferLineEditor . lineEditBuffer
@@ -1913,7 +1914,8 @@ deleteChars
      , Show tags --DEBUG
      )
   => Relative CharIndex -> editor tags m (Relative CharIndex)
-deleteChars (Relative (CharIndex n)) = liftEditLine $ fmap (Relative . CharIndex) $
+deleteChars rel@(Relative (CharIndex n)) = stack 10 ("deleteChars "++show rel) $
+  liftEditLine $ fmap (Relative . CharIndex) $
   if n < 0 then do
     before <- getElemCount Before
     let count = negate $ min before $ abs n 
@@ -1938,9 +1940,11 @@ deleteCharsWrap
 deleteCharsWrap request = if request == 0 then return 0 else
   let direction = if request < 0 then Before else After in
   -- First, delete the chararacters in the line editor, see if that satisfies the request...
-  deleteChars request >>= \ delcount -> if safeAbs delcount >= safeAbs request then return delcount else
+  deleteChars request >>= \ delcount ->
+  if safeAbs delcount >= safeAbs request then return delcount else
   -- otherwise ues 'forLines' to delete each line until the request has been satsified.
   fmap snd $ forLines direction (safeAbs request + delcount, delcount) $ \ halt line ->
+    trace ("(deleteCharsWrap: "++show line++")") $
     get >>= \ st@(request, delcount) ->
     if request <= 0 then halt st else
     let weight = countToChar $ textLineWeight line in
@@ -1949,8 +1953,8 @@ deleteCharsWrap request = if request == 0 then return 0 else
      else do
       case direction of
         Before -> do
-          let len = countToChar (intSize line)
-                  - fromIntegral (theTextLineBreakSize line) - weight + 1
+          let len = countToChar (intSize line) - weight -
+                    fromIntegral (theTextLineBreakSize line) + 1
           liftEditText $ unsafeInsertString After $
             UVec.slice 0 (charToCount len) $ theTextLineString line
           put (request - weight, delcount - len)
@@ -1975,7 +1979,6 @@ insertString str = look 10 ("insertString "++show str) $ liftEditText $ do
   let writeStr = editLine . fmap sum . mapM ((>> (return 1)) . pushElem Before)
   let writeLine line@(str, lbrk) = look 10 ("writeLine "++show line) $ do
         (strlen, lbrklen) <- (,) <$> writeStr str <*> writeStr lbrk
-        traceM $ "(insertString.writeLine -> strlen="++show strlen++", lbrklen="++show lbrklen++")" --DEBUG
         let maxlen = fromIntegral (maxBound :: Word16) :: Int
         if lbrklen >= maxlen
          then error $ "insertString: line break string length is "++show lbrklen++
@@ -2001,7 +2004,7 @@ forLinesLoop
       TextLine tags -> FoldMapLines fold fold tags m [TextLine tags])
   -> Int -> RelativeToCursor -> EditText tags m fold
 forLinesLoop fold f count dir = execFoldMapLines (callCC $ loop count) fold where
-  loop count halt = if count <= 0 then get else
+  loop count halt = trace ("(forLinesLoop "++show count++")") $ if count <= 0 then get else
     liftEditText (popElem dir) >>= f halt >>= mapM_ (pushElem $ opposite dir) >>
     loop (count - 1) halt
 
@@ -2050,10 +2053,10 @@ forLinesInBuffer
   -> EditText tags m fold
 forLinesInBuffer = forLinesInRange (Absolute 1) maxBound
 
--- | Like 'forLinesInRange', but this function takes a 'RelativeToCursor' value, iteration begins
--- at the 'bufferLineEditor', and if the 'RelativeToCursor' value is 'After' then iteration goes
--- forward to the end of the buffer, whereas if the 'RelativeToCursor' value is 'Before' then
--- iteration goes backward to the start of the buffer.
+-- | Like 'forLinesInRange', but this function takes a 'RelativeToCursor' value, iteration begins at
+-- the cursor position where the 'bufferLineEditor' is set, and if the 'RelativeToCursor' value is
+-- 'After' then iteration goes forward to the end of the buffer, whereas if the 'RelativeToCursor'
+-- value is 'Before' then iteration goes backward to the start of the buffer.
 forLines
   :: ( MonadIO m
      , Show tags --DEBUG
@@ -2066,9 +2069,11 @@ forLines
 forLines rel fold f = do
   above <- use linesAboveCursor
   below <- use linesBelowCursor
-  uncurry (forLinesLoop fold f) $ case rel of
-    Before -> (above, Before)
-    After  -> (below, After)
+  uncurry (forLinesLoop fold f) $
+    (\ a -> trace ("(forLines -> forLinesLoop "++show a++")") a) $ --DEBUG
+    case rel of
+      Before -> (above, Before)
+      After  -> (below, After)
 
 -- | Use the 'defaultLineBreak' value to break the line at the current cursor position.
 lineBreak
