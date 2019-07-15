@@ -113,6 +113,7 @@ module Hakshell.TextEditor
 
     EditLine, editLine, insertChar, deleteChars, lineEditorTags, moveByChar,
     copyLineEditorText, replaceCurrentLine, clearCurrentLine, resetCurrentLine,
+    lineEditorCharCount,
 
     -- ** Text Views
     --
@@ -1153,7 +1154,7 @@ getAbsolute (Absolute i) = peek 30 ("getAbsolute "++show i) $ getElemCount Befor
 -- Convert a @('Relative' 'LineIndex')@ to an @('Absolute' 'LineIndex')@.
 getRelToAbs
   :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem)
-  => (Relative Int) -> m (Absolute Int)
+  => Relative Int -> m (Absolute Int)
 getRelToAbs (Relative i) = peek 30 ("getRelToAbs "++show i) $ Absolute . (+ i) <$> getElemCount Before
 
 -- Return the starting and ending index of the void region of the buffer, which is the contiguous
@@ -1363,6 +1364,21 @@ pushElem rel elem = stack 20 ("pushElem "++show rel) $ do
   let inc = void $ modCount rel (+ 1)
   case rel of { Before -> put >> inc; After -> inc >> put; }
 
+-- Push a vector of elements starting at the index 'Before' (currently on) the cursor, or the index
+-- 'After' the cursor.
+pushElemVec
+  :: (GVec.Vector vec elem, MonadEditVec (GVec.Mutable vec RealWorld elem) m)
+  => RelativeToCursor -> vec elem -> m ()
+pushElemVec rel src = stack 20 ("pushElemVec "++show rel) $ do
+  let len = GVec.length src
+  let copy = if unsafeMode then GVec.unsafeCopy else GVec.copy
+  growVector len
+  targ <- getVoidSlice (Relative $ case rel of { Before -> negate len; After -> len }) >>= \ case
+    Nothing   -> error $ "pushElemVec: internal error, \"growVector\" failed to create space"
+    Just targ -> return targ
+  liftIO $ copy targ src
+  when (rel == Before) $ void $ modCount Before (+ len)
+
 -- Pop a single element from the index 'Before' (currently on) the cursor, or from the index 'After'
 -- the cursor, and then shift the cursor to point to the pushed element.
 popElem
@@ -1497,38 +1513,6 @@ instance HasOpposite Integer where { opposite = negate; }
 instance HasOpposite RelativeToCursor where
   opposite = \ case { Before -> After; After -> Before }
 
--- Not for export: This function takes a 'RelativeToCursor' value and constructs a lens that can be
--- used to access 'TextLine's within the 'LineEditor'.
-relativeToLine :: RelativeToCursor -> Lens' (TextBufferState tags) Int
-relativeToLine = \ case { Before -> linesAboveCursor; After -> linesBelowCursor; }
-  -- This function may dissapear if I decide to buffer lines in a mutable vector.
-
--- Not for export: This function takes a 'RelativeToCursor' value and constructs a lens that can be
--- used to access a character index within the 'bufferLineEditor'.
-relativeToChar :: RelativeToCursor -> Lens' (TextBufferState tags) Int
-relativeToChar =
-  (bufferLineEditor .) . \ case { Before -> charsBeforeCursor; After -> charsAfterCursor; }
-
--- Not for export: unsafe, requires correct accounting of cursor positions, otherwise segfaults may
--- occur. The cursor is implemented by keeping a mutable array in which elements before the cursor
--- fill the array from index zero up to the cursor, and the elements after the cursror fill the
--- array from the top-most index of the array down to the index computed from the top-most index of
--- the array subtracted by the total number of elements in the array plus the cursor position.
-growVec
-  :: (GMVec.MVector vector a, PrimMonad m)
-  => vector (PrimState m) a
-  -> Int -> Int -> Int -> m (vector (PrimState m) a)
-growVec vec before after addElems = do
-  let reqSize = before + after + addElems
-  let len = GMVec.length vec
-  if reqSize <= len then return vec else do
-    let newSize = head $ dropWhile (< reqSize) $ iterate (* 2) len
-    let slice = if unsafeMode then GMVec.slice else GMVec.unsafeSlice
-    newVec <- GMVec.new newSize
-    GMVec.copy (slice 0 before newVec) (slice 0 before vec)
-    GMVec.copy (slice (len - after) after newVec) (slice (len - after) after vec)
-    return newVec
-
 -- Not for export: creates a deep-copy of a vector with a cursor, in which elements before the
 -- cursor are aligned at the start of the vector, and elements after the cursor are aligned at the
 -- end of the vector.
@@ -1544,23 +1528,6 @@ copyVec oldVec before after = do
   when (before > 0) $ GMVec.copy (slice     0 before newVec) (slice     0 before oldVec)
   when (after  > 0) $ GMVec.copy (slice upper  after newVec) (slice upper  after oldVec)
   return newVec
-
--- Not for export: should be executed automatically by insertion operations. Increases the size of
--- the 'lineEditBuffer' to be large enough to contain the current 'lineEditorCharCount' plus the
--- given number of elements.
-growLineIfTooSmall :: MonadIO m => Int -> EditText tags m ()
-growLineIfTooSmall grow = do
-  cur <- use bufferLineEditor
-  buf <- liftIO $
-    growVec (cur ^. lineEditBuffer) (cur ^. charsBeforeCursor) (cur ^. charsAfterCursor) grow
-  bufferLineEditor . lineEditBuffer .= buf
-
-growBufferIfTooSmall :: MonadIO m => Int -> EditText tags m ()
-growBufferIfTooSmall grow = do
-  buf   <- use bufferVector
-  above <- use linesAboveCursor
-  below <- use linesBelowCursor
-  liftIO (growVec buf above below grow) >>= assign bufferVector
 
 -- | Push a 'TextLine' before or after the cursor. This function does not effect the content of the
 -- 'bufferLineEditor'.
@@ -1881,18 +1848,6 @@ gotoPosition
 gotoPosition (TextLocation{theLocationLineIndex=line,theLocationCharIndex=col}) =
   liftEditText $ gotoLine line >> gotoChar col
 
--- Not for export: does not filter line-breaking characters.
-unsafeInsertString :: MonadIO m => RelativeToCursor -> CharVector -> EditText tags m ()
-unsafeInsertString rel str = look 10 ("unsafeInsertString "++show rel++' ':show str) $ do
-  let strlen = intSize str
-  growLineIfTooSmall strlen
-  buf <- use $ bufferLineEditor . lineEditBuffer
-  off <- use $ relativeToChar rel
-  let len = UMVec.length buf
-  let i0  = case rel of { Before -> off; After -> len - off - strlen; }
-  relativeToChar rel += strlen
-  liftIO $ forM_ (zip [0 ..] $ unpack str) $ \ (i, c) -> UMVec.write buf (i0 + i) c
-
 -- | Insert a single character. If the 'lineBreakPredicate' function evaluates to 'Prelude.True',
 -- meaning the given character is a line breaking character, this function does nothing. To insert
 -- line breaks, using 'insertString'. Returns the number of characters added to the buffer.
@@ -1955,11 +1910,11 @@ deleteCharsWrap request = if request == 0 then return 0 else
         Before -> do
           let len = countToChar (intSize line) - weight -
                     fromIntegral (theTextLineBreakSize line) + 1
-          liftEditText $ unsafeInsertString After $
+          liftEditLine $ pushElemVec After $
             UVec.slice 0 (charToCount len) $ theTextLineString line
           put (request - weight, delcount - len)
         After  -> do
-          liftEditText $ unsafeInsertString Before $
+          liftEditLine $ pushElemVec Before $
             UVec.slice (charToCount weight) (intSize line - charToCount weight)
             (theTextLineString line)
           put (request - weight, delcount - weight)
@@ -2087,7 +2042,7 @@ lineBreak rel = liftEditText $ do
   let lbrkSize = fromIntegral $ intSize lbrk
   case rel of
     Before -> do
-      unsafeInsertString Before lbrk
+      liftEditLine $ pushElemVec Before lbrk
       cursor <- use bufferLineEditor
       let vec = cursor ^. lineEditBuffer
       let cur = cursor ^. charsBeforeCursor
@@ -2111,7 +2066,7 @@ lineBreak rel = liftEditText $ do
           , theTextLineBreakSize = lbrkSize
           }
         bufferLineEditor . charsAfterCursor .= 0
-      unsafeInsertString After lbrk
+      liftEditLine $ pushElemVec After lbrk
 
 ----------------------------------------------------------------------------------------------------
 
