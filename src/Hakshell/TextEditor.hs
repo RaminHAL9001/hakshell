@@ -61,10 +61,12 @@ module Hakshell.TextEditor
     -- A 'TextBuffer' is a memory-efficient vector containing 'TextLine's. A 'TextLine' is created
     -- by evaluating a 'TextEdit' function such as 'insertString'. A 'TextLine' within a
     -- 'TextBuffer' can be updated by navigating the cursor to the line using 'gotoChar' or
-    -- 'moveByChar', which will copy the 'TextLine' into a 'LineEditor' which you can then edit
+    -- 'moveByChar'. Moving the cursor to an address (addresses are line numbers) will copy the
+    -- 'TextLine' at that address into a 'LineEditor'. You can then edit the text in a 'LineEditor'
     -- by evaluating a function of type 'EditLine' with the 'editLine' function.
 
-    TextLine, emptyTextLine, nullTextLine, sliceLineToEnd, textLineWeight, textLineIsUndefined,
+    TextLine, emptyTextLine, nullTextLine, textLineWeight, textLineIsUndefined,
+    sliceLine, sliceLineToEnd,
 
     -- *** 'TextLine' lenses
 
@@ -743,6 +745,10 @@ textLineString = lens theTextLineString $ \ a b -> a{ theTextLineString = b }
 textLineTags :: Lens' (TextLine tags) tags
 textLineTags = lens theTextLineTags $ \ a b -> a{ theTextLineTags = b }
 
+-- not for export
+textLineBreakSize :: Lens' (TextLine tags) Word16
+textLineBreakSize = lens theTextLineBreakSize $ \ a b -> a{ theTextLineBreakSize = b }
+
 -- | The empty 'TextLine' value.
 emptyTextLine :: tags -> TextLine tags
 emptyTextLine tags = TextLine
@@ -762,15 +768,50 @@ nullTextLine nullTags = \ case
     if UVec.null (theTextLineString line) then nullTags (theTextLineTags line) else False
 
 -- | Cut and remove a line at some index, keeping the characters 'Before' or 'After' the index.
-sliceLineToEnd :: RelativeToCursor -> Absolute CharIndex -> TextLine tags -> TextLine tags
-sliceLineToEnd rel (Absolute (CharIndex n)) = \ case
+sliceLineToEnd
+  ::
+    (Show tags) => --DEBUG
+    RelativeToCursor -> Absolute CharIndex -> TextLine tags -> TextLine tags
+sliceLineToEnd rel i = trace ("(sliceLineToEnd "++show rel++" ("++show i++"))") . \ case
   TextLineUndefined -> TextLineUndefined
-  line              -> line & textLineString %~ \ vec ->
-    let len = UVec.length vec in case rel of
-      Before -> UVec.slice  0 (len - n) vec
-      After  -> UVec.slice (len - n) n  vec
+  line -> check $ slice line where
+    slice = case rel of
+      Before -> sliceLine 0 $ Relative $ CharIndex $ charToIndex i
+      After  -> sliceLine i $ Relative $ CharIndex $ textLineWeight line - charToIndex i
+    check = \ case
+      Left  err    -> error $ "sliceLineToEnd: internal error, "++show err
+      Right result -> result
 
--- | Evaluates toe True if the 'TextLine' is undefined. An undefined 'TextLine' is different from an
+-- | Cut the string within a 'TextLine' into a smaller substring.
+sliceLine
+  ::
+    (Show tags) => --DEBUG
+    Absolute CharIndex -> Relative CharIndex -> TextLine tags
+  -> Either TextEditError (TextLine tags)
+sliceLine i0 reqsiz0 = look 20 ("sliceLine ("++show i0++") ("++show reqsiz0++")") . \ case
+  TextLineUndefined -> Left $ TextEditError $ pack $
+    "sliceLine ("++show i0++") ("++show reqsiz0++"): evaluated on undefined value"
+  line@TextLine{theTextLineString=vec} ->
+    let i      = charToIndex i0
+        reqsiz = charToCount reqsiz0
+        sum    = start + reqsiz
+        len    = UVec.length vec
+        weight = textLineWeight line
+        start  = min i sum
+        top    = max i sum
+        lbrksz = fromIntegral $ theTextLineBreakSize line
+        (slicsz, newlbrksz) =
+          if top > len - lbrksz then (len - start, fromIntegral lbrksz) else (abs reqsiz, 0)
+    in  if sum < 0 || sum > weight
+         then Left $
+           if start < 0 || start >= weight
+           then CharIndexOutOfRange i0
+           else CharCountOutOfRange reqsiz0
+         else Right $ if sum == i then emptyTextLine $ theTextLineTags line else line
+          & (textLineString .~ UVec.slice start slicsz vec)
+          . (textLineBreakSize .~ newlbrksz)
+
+-- | Evaluates to True if the 'TextLine' is undefined. An undefined 'TextLine' is different from an
 -- empty string, it is similar to the 'Prelude.Nothing' constructor.
 textLineIsUndefined :: TextLine tags -> Bool
 textLineIsUndefined = \ case { TextLineUndefined -> True; _ -> False; }
@@ -1919,7 +1960,6 @@ deleteCharsWrap request = if request == 0 then return 0 else
             (theTextLineString line)
           put (request - weight, delcount - weight)
       pure <$> liftEditLine copyLineEditorText
-        
 
 -- | This function evaluates the 'lineBreaker' function on the given string, and beginning from the
 -- current cursor position, begins inserting all the lines of text produced by the 'lineBreaker'

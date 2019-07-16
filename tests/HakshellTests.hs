@@ -12,7 +12,7 @@ main :: IO ()
 main = do
   begin
   lineEditorTests
-  --textViewTests
+  textViewTests
   basicTests
 
 begin :: IO ()
@@ -75,14 +75,17 @@ basicTests = do
   let reportInsert str = testTextEditor error buf $ do
         report $ "insertString " ++ show str ++ "\n"
         insertString str
+        -- TODO: show the content of the whole buffer as a string here.
         debugPrintBuffer
   let reportMove msg line col = testTextEditor error buf $ do
         report $ "Move cursor "++msg++", line="++show line++" col="++show col++" ...\n"
         gotoCursor $ mkLoc line col
+        -- TODO: show the content of the whole buffer as a string here.
         debugPrintBuffer
   let reportDelete msg n = testTextEditor error buf $ do
         report $ "Delete on "++msg++", "++show n++" characters...\n"
         deleteCharsWrap $ Relative $ CharIndex n
+        -- TODO: show the content of the whole buffer as a string here.
         debugPrintBuffer
   reportInsert "one two three\n"
   reportInsert "four five six\nseven eight nine\nten eleven twelve\n"
