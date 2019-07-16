@@ -110,12 +110,13 @@ module Hakshell.TextEditor
 
     -- ** The 'EditLine' function type
     --
-    -- When evaluating 'editLine' within the context of an 'EditText' function, the line currently
-    -- under the cursor can be edited at a character-by-character level.
+    -- Evaluate the a function of type 'EditLine' using the 'editLine' function within the context
+    -- of an 'EditText' function. This places a line of text into a 'LineEditor' which allows the
+    -- text to be edited character-by-character.
 
     EditLine, editLine, insertChar, deleteChars, lineEditorTags, moveByChar,
-    copyLineEditorText, replaceCurrentLine, clearCurrentLine, resetCurrentLine,
-    lineEditorCharCount,
+    copyLineEditorText, copyCharsRange, copyCharsBetween,
+    replaceCurrentLine, clearCurrentLine, resetCurrentLine, lineEditorCharCount,
 
     -- ** Text Views
     --
@@ -1116,7 +1117,7 @@ instance MonadIO m => MonadEditVec (MVec.IOVector (TextLine tags))  (FoldMapLine
   throwCountErr = foldMapLiftEditText . throwCountErr
 
 globalDebugLevel :: Int
-globalDebugLevel = 10
+globalDebugLevel = 30
 
 debugLevel :: Monad m => (String -> m a -> m a) -> Int -> String -> m a -> m a
 debugLevel report lvl msg f = if lvl > globalDebugLevel then f else report msg f
@@ -1279,29 +1280,29 @@ getHiSlice = stack 20 "getHiSlice" $ getElemCount After >>= getSlice . Relative
 -- invalid elements.
 copyRegion
   :: (GMVec.MVector vec elem,
-       MonadEditVec (vec (PrimState m) elem) (t m), PrimMonad m,
-       MonadTrans t
+      MonadEditVec (vec RealWorld elem) m
      )
-  => Absolute Int -> Relative Int -> t m (vec (PrimState m) elem)
+  => Absolute Int -> Relative Int -> m (vec RealWorld elem)
 copyRegion (Absolute i) (Relative count) = stack 20 ("copyRegion "++show i++' ':show count) $ do
   vec <- getVector
   bef <- getElemCount Before
   let aft = i + count
+  traceM $ "(copyRegion: i="++show i++", count="++show count++", bef="++show bef++", aft="++show aft++")"
   if count == 0 then newVector 0
    else if i <  bef && aft <  bef then
-    lift $ GMVec.clone $ GMVec.slice i count vec
+    liftIO $ GMVec.clone $ GMVec.slice i count vec
    else if i <= bef && aft >= bef then
-    GMVec.slice <$> getAbsolute (Absolute i) <*> pure count <*> pure vec >>= lift . GMVec.clone
+    GMVec.slice <$> getAbsolute (Absolute i) <*> pure count <*> pure vec >>= liftIO . GMVec.clone
    else if i <  bef && aft >= bef then do
     let dist = i - bef
     oldlo  <- getSlice $ Relative dist
     oldhi  <- getSlice $ Relative $ dist + count
     let oldlolen = GMVec.length oldlo
     let oldhilen = GMVec.length oldhi
-    newvec <- lift $ GMVec.new $ oldlolen + oldhilen
+    newvec <- liftIO $ GMVec.new $ oldlolen + oldhilen
     let newlo = GMVec.slice 0 oldlolen newvec
     let newhi = GMVec.slice oldlolen oldhilen newvec 
-    let copy  = (.) lift . if unsafeMode then GMVec.unsafeCopy else GMVec.copy
+    let copy  = (.) liftIO . if unsafeMode then GMVec.unsafeCopy else GMVec.copy
     copy newlo oldlo
     copy newhi oldhi
     return newvec
@@ -1665,6 +1666,35 @@ copyLineEditorText
      )
   => editor tags m (TextLine tags)
 copyLineEditorText = liftEditLine copyLineEditor'
+
+-- | Create a 'TextLine' by copying the the characters in the given range from the line under the
+-- cursor.
+copyCharsRange
+  :: (MonadIO m
+     , Show tags --DEBUG
+     )
+  => Absolute CharIndex -> Relative CharIndex -> EditLine tags m (TextLine tags)
+copyCharsRange i count = look 10 ("copyCharsRange ("++show i++") ("++show count++")") $ do
+  -- TODO: handle line breaks correctly
+  vec <- liftIO . UVec.freeze =<<
+    copyRegion (Absolute $ charToIndex i) (Relative $ charToCount count)
+  tags <- use lineEditorTags
+  return TextLine
+    { theTextLineString    = vec
+    , theTextLineTags      = tags
+    , theTextLineBreakSize = 0
+    }
+
+-- | Create a 'TextLine' by copying the the characters in between the two given indicies from the
+-- line under the cursor. The characters on the two given indicies are included in the resulting
+-- 'TextLine'.
+copyCharsBetween
+  :: (MonadIO m
+     , Show tags --DEBUG
+     )
+  => Absolute CharIndex -> Absolute CharIndex -> EditLine tags m (TextLine tags)
+copyCharsBetween from' to' = let (from, to) = if from > to then (to, from) else (from, to) in
+  copyCharsRange from (to - from + 1)
 
 -- | Read a 'TextLine' from an @('Absolute' 'LineIndex')@ address.
 readLineIndex

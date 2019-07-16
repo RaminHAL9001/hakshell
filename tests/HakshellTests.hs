@@ -12,8 +12,8 @@ main :: IO ()
 main = do
   begin
   lineEditorTests
-  textViewTests
-  basicTests
+  --textViewTests
+  --basicTests
 
 begin :: IO ()
 begin = putStrLn "\n-------------------------\nBegin HakshellTest Log\n-------------------------\n"
@@ -63,10 +63,16 @@ lineEditorTests = do
         report $ "--- moveByChar "++show dir++" ---\n"
         moveByChar dir
         copyLineEditorText >>= liftIO . print
-  move minBound
-  instr Before " what "
-  move maxBound
-  instr Before " now "
+  let select i count = testTextEditor error buf $ do
+        report $ "--- copyLineRange "++show i++' ':show count++" ---\n"
+        editLine (copyCharsRange i count) >>= liftIO . print
+  select 12 11
+--  move minBound
+--  instr Before "what "
+--  move maxBound
+--  instr Before " now"
+--  move 17
+--  instr Before "the "
 
 basicTests :: IO ()
 basicTests = do
@@ -95,7 +101,6 @@ basicTests = do
   reportDelete "same line" (-4)
   reportDelete "to \"three\" on previous line" (-8)
   report "OK\n"
-  
 
 textViewTests :: IO ()
 textViewTests = do
