@@ -67,12 +67,12 @@ lineEditorTests = do
         report $ "--- copyLineRange "++show i++' ':show count++" ---\n"
         editLine (copyCharsRange i count) >>= liftIO . print
   select 12 11
---  move minBound
---  instr Before "what "
---  move maxBound
---  instr Before " now"
---  move 17
---  instr Before "the "
+  move minBound
+  instr Before "what "
+  move maxBound
+  instr Before " now"
+  move (-20)
+  instr Before "the "
 
 basicTests :: IO ()
 basicTests = do

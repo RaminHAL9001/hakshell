@@ -1088,8 +1088,8 @@ instance MonadIO m => MonadEditVec (MVec.IOVector (TextLine tags)) (EditText tag
     Before -> subtract 1 <$> getElemCount Before
     After  -> cursorIndexAfter
   throwLimitErr = throwError . EndOfLineBuffer
-  throwIndexErr = throwError . LineIndexOutOfRange . Absolute . LineIndex
-  throwCountErr = throwError . LineCountOutOfRange . Relative . LineIndex
+  throwIndexErr = throwError . LineIndexOutOfRange . indexToLine
+  throwCountErr = throwError . LineCountOutOfRange . countToLine
 
 instance MonadIO m => MonadEditVec (UMVec.IOVector Char) (EditLine tags m) where
   nullElem = pure '\0'
@@ -1103,8 +1103,8 @@ instance MonadIO m => MonadEditVec (UMVec.IOVector Char) (EditLine tags m) where
     Before -> getElemCount Before
     After  -> cursorIndexAfter
   throwLimitErr = throwError . EndOfCharBuffer
-  throwIndexErr = throwError . CharIndexOutOfRange . Absolute . CharIndex
-  throwCountErr = throwError . CharCountOutOfRange . Relative . CharIndex
+  throwIndexErr = throwError . CharIndexOutOfRange . indexToChar
+  throwCountErr = throwError . CharCountOutOfRange . countToChar
 
 instance MonadIO m => MonadEditVec (MVec.IOVector (TextLine tags))  (FoldMapLines r fold tags m) where
   nullElem      = foldMapLiftEditText nullElem
@@ -1283,30 +1283,37 @@ copyRegion
       MonadEditVec (vec RealWorld elem) m
      )
   => Absolute Int -> Relative Int -> m (vec RealWorld elem)
-copyRegion (Absolute i) (Relative count) = stack 20 ("copyRegion "++show i++' ':show count) $ do
-  vec <- getVector
-  bef <- getElemCount Before
-  let aft = i + count
-  traceM $ "(copyRegion: i="++show i++", count="++show count++", bef="++show bef++", aft="++show aft++")"
-  if count == 0 then newVector 0
-   else if i <  bef && aft <  bef then
-    liftIO $ GMVec.clone $ GMVec.slice i count vec
-   else if i <= bef && aft >= bef then
-    GMVec.slice <$> getAbsolute (Absolute i) <*> pure count <*> pure vec >>= liftIO . GMVec.clone
-   else if i <  bef && aft >= bef then do
-    let dist = i - bef
-    oldlo  <- getSlice $ Relative dist
-    oldhi  <- getSlice $ Relative $ dist + count
-    let oldlolen = GMVec.length oldlo
-    let oldhilen = GMVec.length oldhi
-    newvec <- liftIO $ GMVec.new $ oldlolen + oldhilen
-    let newlo = GMVec.slice 0 oldlolen newvec
-    let newhi = GMVec.slice oldlolen oldhilen newvec 
+copyRegion (Absolute i) (Relative count) = stack 20 ("copyRegion "++show i++' ':show count) $
+  if count == 0 then liftIO $ GMVec.new 0 else do
+    let sum = i + count
+    let lo  = min i sum
+    let hi  = max i sum
+    let siz = abs count
     let copy  = (.) liftIO . if unsafeMode then GMVec.unsafeCopy else GMVec.copy
-    copy newlo oldlo
-    copy newhi oldhi
-    return newvec
-   else error "copyRegion: internal error, this should never happen"
+    oldvec <- getVector
+    len    <- getAllocSize
+    before <- getElemCount Before
+    if lo >= before
+     then liftIO $ GMVec.clone $ GMVec.slice (len - siz + i) siz oldvec
+     else if hi < before then liftIO $ GMVec.clone $ GMVec.slice lo siz oldvec else do
+      let sublen = before - i
+      lovec  <- getSlice $ Relative $ negate sublen
+      hivec  <- getSlice $ Relative $ hi - before
+      newvec <- newVector siz
+      copy (GMVec.slice 0 sublen newvec) lovec
+      copy (GMVec.slice sublen (siz - sublen) newvec) hivec
+      return newvec
+
+copyRegionChk
+  :: (GMVec.MVector vec elem,
+      MonadEditVec (vec RealWorld elem) m
+     )
+  => Absolute Int -> Relative Int -> m (vec RealWorld elem)
+copyRegionChk i0@(Absolute i) count0@(Relative count) =
+  countElems >>= \ siz -> let sum = i + count in
+  if i < 0 || i >= siz then throwIndexErr i
+  else if sum < 0 || i > sum then throwCountErr count
+  else copyRegion i0 count0
 
 -- Write an element to a vector index, overwriting whatever was there before. __WARNING__: there is
 -- no bounds checking.
