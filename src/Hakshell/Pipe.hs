@@ -148,6 +148,10 @@ instance (Applicative m, Monoid a) => Monoid (Pipe m a) where
   mempty = pure mempty
   mappend a b = mappend <$> a <*> b
 
+-- | A pure function to construct a 'Pipe' from a list.
+pipe :: Monad m => [a] -> Pipe m a
+pipe = foldr ((. pure) . PipeNext) PipeStop
+
 -- | Yield a single value and then end.
 push :: Applicative m => a -> m (Pipe m a)
 push = pure . flip PipeNext (pure PipeStop)
@@ -169,17 +173,30 @@ pipeEach ax f = case ax of
 mapToPipe :: Applicative m => (a -> m b) -> [a] -> m (Pipe m b)
 mapToPipe = flip pipeEach
 
+-- | Perform a single step on the next element of a 'Pipe'. This function automatically handles
+-- errors and halting conditions, and serves as a drop-in replacement for any expression that uses a
+-- @case@ statement to inspect a 'Pipe'.
+--
+-- The type signature is the most general form and can be used anywhere a @case@ statement can be
+-- used, but most of the time you will use the 'step' function as though it's type signature were:
+--
+-- @
+-- Monad m => (a -> m (Pipe m a) -> f (Pipe m b)) -> Pipe m a -> m (Pipe m b)
+-- @
+step :: Applicative f => (a -> m1 (Pipe m1 a) -> f (Pipe m2 b)) -> Pipe m1 a -> f (Pipe m2 b)
+step f = \ case
+  PipeStop        -> pure PipeStop
+  PipeFail msg    -> pure $ PipeFail msg
+  PipeNext a next -> f a next
+
 -- | Like 'pipeEach' but essentially maps a function to each element in the pipe using the ('<*>')
 -- operator.
 foreach :: Applicative m => Pipe m a -> (a -> m b) -> m (Pipe m b)
-foreach ax f = case ax of
-  PipeStop        -> pure PipeStop
-  PipeFail msg    -> pure $ PipeFail msg
-  PipeNext a next -> PipeNext <$> f a <*> (flip foreach f <$> next)
+foreach = flip pmap
 
 -- | Same as 'foreach' but with the parameters flipped.
 pmap :: Applicative m => (a -> m b) -> Pipe m a -> m (Pipe m b)
-pmap = flip foreach
+pmap f = step $ \ a next -> PipeNext <$> f a <*> (flip foreach f <$> next)
 
 -- | Pull values from the 'Pipe', apply each value to the given continuation. The value returned by
 -- continuation is ignored, this function is only for evaluating on functions that produce
@@ -237,13 +254,10 @@ instance Monad m => Alternative (Engine st input m) where
 instance Monad m => Monad (Engine st input m) where
   return = Engine . return . return
   (Engine a) >>= f = Engine $ do
-    let loop = \ case
-          PipeStop         -> return $ PipeStop
-          PipeFail msg     -> return $ PipeFail msg
-          PipeNext a nextA -> unwrapEngine $ mplus
-            (Engine $ unwrapEngine $ f a)
-            (Engine $ join <$> unwrapEngine nextA >>= loop)
-    a >>= loop
+    let loop = step $ \ a nextA -> unwrapEngine $ mplus
+          (Engine $ unwrapEngine $ f a)
+          (Engine $ join <$> unwrapEngine nextA >>= loop)
+    a >>= loop 
 
 instance Monad m => MonadPlus (Engine st input m) where
   mzero = Engine $ return mzero
@@ -265,6 +279,9 @@ instance Monad m => MonadError ErrMsg (Engine st input m) where
 
 instance Monad m => MonadFail (Engine st input m) where
   fail = throwError . pack
+
+instance MonadIO m => MonadIO (Engine st input m) where
+  liftIO = Engine . fmap pure . liftIO
 
 instance (Monad m, Semigroup a) => Semigroup (Engine st input m a) where
   a <> b = (<>) <$> a <*> b
@@ -310,10 +327,8 @@ runEngine
   => Engine st input m output -> EngineState st input m
   -> m (Pipe m (output, EngineState st input m))
 runEngine f init = loop init f where
-  loop st f = runStateT (unwrapEngine f) st >>= \ (a, st) -> return $ case a of
-    PipeStop        -> PipeStop
-    PipeFail msg    -> PipeFail msg
-    PipeNext a next -> (PipeNext (a, st) $ loop st $ Engine $ fmap join $ unwrapEngine next)
+  loop st f = runStateT (unwrapEngine f) st >>= \ (a, st) -> flip step a $ \ a next ->
+    pure (PipeNext (a, st) $ loop st $ Engine $ fmap join $ unwrapEngine next)
 
 -- | Like 'runEngine' but discards the 'EngineState', leaving a 'Pipe' with only the values of type
 -- @output@. Use this function when the intermediate state values of type @st@ are not important,
@@ -332,10 +347,8 @@ execEngine f = fmap (fmap (theEngineStateValue . snd)) . runEngine f
 -- take a single value of type @input@ from the input stream that is piped to every 'Engine'
 -- function when it is evaluated by 'evalEngine'.
 input :: Monad m => Engine st input m input
-input = Engine $ use engineInputPipe >>= lift >>= \ case
-  PipeStop            -> return PipeStop
-  PipeFail msg        -> return $ PipeFail msg
-  PipeNext input next -> engineInputPipe .= next >> return (pure input)
+input = Engine $ use engineInputPipe >>= lift >>=
+  step (\ input next -> engineInputPipe .= next >> return (pure input))
 
 -- | This function is similar to 'pushList', but is specifically designed to evaluate within a
 -- function of type 'Engine'. As the name implies, this function is a counterpart to the 'input'
@@ -346,22 +359,30 @@ input = Engine $ use engineInputPipe >>= lift >>= \ case
 output :: Monad m => [output] -> Engine st input m output
 output = pushList >=> Engine . return
 
--- | This function serves as a form of 'Data.List.unfold'ing function. It works by evaluating a
--- given 'Engine' function repeatedly in a recursive loop while collecting the @output@ from
--- evaluation. The loop continues until 'empty' or 'mzero' is evaluated (which are identical
--- functions in standard Haskell). The 'Data.List.unfold'ing comes from the fact that you can use
--- the 'get', 'put', 'modify', and 'state' functions from the "Control.Monad.State" module to
--- repeatedly update a stateful value from which your next @output@ value will derive.
+-- | This function serves as a form of 'Data.List.unfold'ing function, it is a little similar to the
+-- UNIX "@yes@" function. It works by evaluating a given 'Engine' function repeatedly in an
+-- infinitely recursive loop while collecting the @output@ from evaluation. The loop continues until
+-- 'empty' or 'mzero' is evaluated (which are identical functions in standard Haskell). Note that
+-- evaluating the 'input' function to obtain an input will evaluate to 'empty' as well, if the
+-- 'Engine' you pass to 'pump' evaluates 'input' every time, the 'pump' will keep looping until all
+-- input is consumed -- this is how the 'mapInput' function is defined.
+--
+-- The 'Data.List.unfold'ing comes from the fact that you can use the 'get', 'put', 'modify', and
+-- 'state' functions from the "Control.Monad.State" module to repeatedly update a stateful value
+-- from which your next @output@ value will derive.
 --
 -- Note that the given 'Engine' function which is to be looped must be evaluated at least one time
 -- so that the @output@ value can be inspected and a decision can be made as to whether the loop
 -- should continue, however if the first evaluation of 'while' is 'empty' then no 'output' is ever
 -- produced, so that first evaluation may not have any meaningful side-effects.
-while :: Monad m => Engine st input m output -> Engine st input m output
-while (Engine f) = Engine $ f >>= \ case
-  PipeStop        -> return PipeStop
-  PipeFail msg    -> return $ PipeFail msg
-  next@PipeNext{} -> unwrapEngine $ Engine (pure next) <|> while (Engine f)
+pump :: Monad m => Engine st input m output -> Engine st input m output
+pump (Engine f) = Engine $ f >>=
+  step (\ input next -> unwrapEngine $ Engine (pure $ PipeNext input next) <|> pump (Engine f))
+
+-- | This function is similar to 'pump', except the 'input' function is evaluated on each iteration,
+-- and the result of the input is fed into the given 'Engine' function.
+mapInput :: Monad m => (input -> Engine st input m output) -> Engine st input m output
+mapInput = pump . (input >>=)
 
 -- | You should never need to use this function.
 --
