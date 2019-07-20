@@ -3,7 +3,11 @@
 -- piped into it, and the content of each directory is dumped into an output pipe. You can then bind
 -- the result additional filters that accept or reject each entry.
 module Hakshell.Find
-  ( -- * The 'FPath' datatype
+  ( -- * Executing a Filesystem Query
+
+    search, fastSearch, lsr,
+
+    -- * The 'FPath' datatype
     --
     -- A string-like data type for representing filesystem path values.
 
@@ -75,9 +79,6 @@ module Hakshell.Find
     theCurrentSearchDepth, SearchDepth(..),
     theCurrentSearchPath, theCurrentUserState,
 
-    -- * Executing a Filesystem Query
-
-    search, fastSearch,
   ) where
 
 import           Hakshell.Pipe
@@ -473,3 +474,7 @@ fastSearch
   :: MonadIO m
   => Engine (FSearchState ()) FPath m FSNode
 fastSearch = error "TODO: fastSearch"
+
+-- | "List recursive," similar to invoking @ls -r@ on the command line.
+lsr :: [FPath] -> IO (Pipe IO FSNode)
+lsr = fmap join . pmap (search ([] ?-> match) ()) . pipe
