@@ -215,6 +215,12 @@ pullList f = loop id where
     PipeFail   msg  -> Control.Monad.Except.fail $ BStr.unpack msg
     PipeNext a next -> f a >>= \ b -> next >>= loop (stack . (b :))
 
+-- | Lift the monadic type @inner@ of a 'Pipe' into another monad @m@
+liftInnerPipe
+  :: (Monad inner, Monad m)
+  => (forall b . inner b -> m b) -> Pipe inner a -> m (Pipe m a)
+liftInnerPipe lift = step $ \ a next -> return $ PipeNext a $ lift next >>= liftInnerPipe lift
+
 ----------------------------------------------------------------------------------------------------
 
 -- | Functions like 'push', 'foreach', and 'pull' are good for simple @IO@ processes. But when your
