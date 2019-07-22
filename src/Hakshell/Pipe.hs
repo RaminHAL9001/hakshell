@@ -95,7 +95,7 @@ instance Functor m => Functor (Pipe m) where
   fmap f = \ case
     PipeStop        -> PipeStop
     PipeFail   msg  -> PipeFail msg
-    PipeNext a next -> PipeNext (f a) $ fmap (fmap f) next
+    PipeNext a next -> PipeNext (f a) $ fmap f <$> next
 
 instance Applicative m => Applicative (Pipe m) where
   pure = flip PipeNext (pure PipeStop)
@@ -105,7 +105,8 @@ instance Applicative m => Applicative (Pipe m) where
     PipeNext f nextF -> \ case
       PipeStop         -> PipeStop
       PipeFail msg     -> PipeFail msg
-      PipeNext a nextA -> PipeNext (f a) $ (<*>) <$> nextF <*> pure (PipeNext a nextA)
+      PipeNext a nextA -> PipeNext (f a) $ (<|>) <$> (fmap f <$> nextA) <*>
+        ((<*> (PipeNext a nextA)) <$> nextF)
 
 instance Applicative m => Alternative (Pipe m) where
   empty = PipeStop
@@ -123,6 +124,8 @@ instance Monad m => Monad (Pipe m) where
       PipeStop         -> PipeStop
       PipeFail msg     -> PipeFail msg
       PipeNext b nextB -> PipeNext b $ mplus <$> ((>>= m) <$> nextA) <*> nextB
+      -- TODO: bug fix required here, output of (do{a< pipe[1,2,3];b<-pipe[4,5,6];return(a,b);})
+      -- should be identical to ((,)<$>pipe[1,2,3]<*>pipe[4,5,6]), but this code does not do so.
 
 instance Monad m => MonadPlus (Pipe m) where
   mzero = PipeStop
@@ -196,7 +199,7 @@ foreach = flip pmap
 
 -- | Same as 'foreach' but with the parameters flipped.
 pmap :: Applicative m => (a -> m b) -> Pipe m a -> m (Pipe m b)
-pmap f = step $ \ a next -> PipeNext <$> f a <*> (flip foreach f <$> next)
+pmap f = step $ \ a next -> PipeNext <$> f a <*> (pmap f <$> next)
 
 -- | Pull values from the 'Pipe', apply each value to the given continuation. The value returned by
 -- continuation is ignored, this function is only for evaluating on functions that produce
