@@ -123,9 +123,7 @@ instance Monad m => Monad (Pipe m) where
     PipeNext a nextA -> \ m -> case m a of
       PipeStop         -> PipeStop
       PipeFail msg     -> PipeFail msg
-      PipeNext b nextB -> PipeNext b $ mplus <$> ((>>= m) <$> nextA) <*> nextB
-      -- TODO: bug fix required here, output of (do{a< pipe[1,2,3];b<-pipe[4,5,6];return(a,b);})
-      -- should be identical to ((,)<$>pipe[1,2,3]<*>pipe[4,5,6]), but this code does not do so.
+      PipeNext b nextB -> PipeNext b $ mplus <$> nextB <*> ((>>= m) <$> nextA)
 
 instance Monad m => MonadPlus (Pipe m) where
   mzero = PipeStop
