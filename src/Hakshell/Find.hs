@@ -100,6 +100,7 @@ import           System.Directory
                  ( getCurrentDirectory
                  , getDirectoryContents
                  )
+import           System.FilePath( (</>) )
 import           System.Posix.Directory
                  ( openDirStream, readDirStream, closeDirStream
                  )
@@ -170,6 +171,8 @@ instance Eq FSNode where
 
 instance Ord FSNode where
   compare a b = compare (nn a) (nn b) <> compare (ns a) (ns b)
+
+instance Show FSNode where { show = unpack . nn; }
 
 nn :: FSNode -> FPath
 nn = fsNodeName
@@ -413,12 +416,19 @@ infixr 1 ?->
 -- | Inspect a 'FPath', and if the 'FPath' is a directory, iterate over every 'FSNode's element that
 -- exists in the directory as an element of a 'Pipe'. If the given 'FPath' is not a directory, yield
 -- a single 'FSNode' in the output 'Pipe'.
+--
+-- __WARNING:__ The file descriptor to the directory is not closed until the last item in the 'Pipe'
+-- is evaluated. This can lead to resource leaks if you do not fully evaluate the directory stream
+-- at least once.
+--
+-- TODO: remove this function from the public API.
 listFSNodes :: FPath -> IO (Pipe IO FSNode)
-listFSNodes path = bracket (openDirStream $ unpack path) closeDirStream loop where
+listFSNodes path@(FPath pathstr) = openDirStream (unpack path) >>= loop where
   loop stream = do
-    name <- readDirStream stream
-    if null name then pure PipeStop else do
-      node <- fsNode $ pack name
+    name <- catch (readDirStream stream) $ \ e ->
+      closeDirStream stream >> throwIO (e :: SomeException)
+    if null name then closeDirStream stream >> pure PipeStop else do
+      node <- fsNode $ pack $ unpack pathstr </> name
       return $ PipeNext node (loop stream)
 
 -- | Like 'find' but allows you to construct a stateful value as the file search proceeds.
@@ -477,4 +487,4 @@ fastSearch = error "TODO: fastSearch"
 
 -- | "List recursive," similar to invoking @ls -r@ on the command line.
 lsr :: [FPath] -> IO (Pipe IO FSNode)
-lsr = fmap join . pmap (search ([] ?-> match) ()) . pipe
+lsr = fmap join . pmap (search ([mempty] ?-> match) ()) . pipe
