@@ -30,9 +30,7 @@ import qualified Data.ByteString.UTF8  as UTF8
 
 type ErrMsg = UTF8.ByteString
 
--- | /"Ceci n'est pas un pipe."/
---
---   -- Rene Magrite
+-- | /"Ceci n'est pas un pipe."/  -- Rene Magrite
 --
 -- 'Pipe' is a data type used to approximate the behavior of UNIX pipes.
 --
@@ -52,10 +50,11 @@ type ErrMsg = UTF8.ByteString
 --   ocurred, and no result was returned either.
 --
 -- Construct a 'Pipe' using functions like 'push' and 'foreach'. Pipe is also a functor, so you can
--- modify the type of @a@ by evaluating a function on it with 'fmap'. 'Pipe' is not an 'Applicative'
--- or a 'Monad', which makes it unlike a list. However like list, it does instantiate 'Alternative'
--- and 'MonadPlus', so if you want to sequence items evaluated by 'pull' within a 'Pipe' you can use
--- the ('<|>') operator to append more items onto the content stored within the 'Pipe'. For example:
+-- modify the type of @a@ by evaluating a function on it with 'fmap'. 'Pipe' is not a 'Monad', so it
+-- is unlike a list 'Control.Monad.List.ListT' data type. However a 'Pipe' is an instance of the
+-- 'Applicative' and 'Alternative' typeclasses, so if you want to sequence items evaluated by 'pull'
+-- within a 'Pipe' you can use the ('<|>') operator to append more items onto the content stored
+-- within the 'Pipe'. For example:
 --
 -- @
 -- return ('push' 1 <|> 'push' 2 <|> 'push' 3) >>= pull (print . (+ 3))
@@ -63,10 +62,16 @@ type ErrMsg = UTF8.ByteString
 --
 -- The above will, for each 'push'ed element, add 3 and then print the result.
 --
--- Monoid/Semigroup appending is simply lifts the 'mappend' or @('<>')@ operator into 'Pipe'
--- constructor using 'Applicative'. As a consequence, performing 'mappend' om pipes with more than
--- one element doesn't actually append, but computes the multiplicative of the elements. For actual
--- list-like concatenation of the contents of pipes, use '<|>' instead. For example:
+-- To use 'Pipe's in a monadic context, use the 'EngineT' function type, which uses 'Pipe's as a
+-- control mechanism but also instantiates 'Monad', 'MonadPlus', 'MonadState' (for an arbitrary
+-- state value), 'MonadFail' and 'MonadError' (for throwing and catching 'PipeFail' values),
+-- 'MonadTrans', and 'MonadIO'.
+--
+-- Monoid/Semigroup appending for both 'Pipe' and 'EngineT' is simply to lift the 'mappend' or
+-- @('<>')@ operator into 'Pipe' constructor using 'Applicative'. As a consequence, performing
+-- 'mappend' om pipes with more than one element doesn't actually append, but computes the
+-- multiplicative of the elements. For actual list-like concatenation of the contents of pipes, use
+-- '<|>' instead. For example:
 --
 -- @
 -- ('push' "A" '<|>' 'push' "B" '<|>' 'push' "C") '<>' ('push' "X" <|> 'push' "Y" <|> 'push' "Z")
@@ -115,33 +120,6 @@ instance Applicative m => Alternative (Pipe m) where
     PipeFail msg    -> const $ PipeFail msg
     PipeNext a next -> PipeNext a . (<$> next) . flip (<|>)
 
-instance Monad m => Monad (Pipe m) where
-  return = flip PipeNext (return PipeStop)
-  (>>=) = \ case
-    PipeStop         -> const PipeStop
-    PipeFail msg     -> const $ PipeFail msg
-    PipeNext a nextA -> \ m -> case m a of
-      PipeStop         -> PipeStop
-      PipeFail msg     -> PipeFail msg
-      PipeNext b nextB -> PipeNext b $ mplus <$> nextB <*> ((>>= m) <$> nextA)
-
-instance Monad m => MonadPlus (Pipe m) where
-  mzero = PipeStop
-  mplus = \ case
-    PipeStop     -> id
-    PipeFail msg -> const $ PipeFail msg
-    PipeNext a next -> PipeNext a . (<$> next) . flip mplus
-
-instance Monad m => MonadError ErrMsg (Pipe m) where
-  throwError = PipeFail
-  catchError try catch = case try of
-    PipeStop      -> PipeStop
-    PipeFail  msg -> catch msg
-    ok@PipeNext{} -> ok
-
-instance Monad m => MonadFail (Pipe m) where
-  fail = PipeFail . pack
-
 instance (Applicative m, Semigroup a) => Semigroup (Pipe m a) where
   a <> b = (<>) <$> a <*> b
 
@@ -182,7 +160,7 @@ mapToPipe = flip pipeEach
 -- used, but most of the time you will use the 'step' function as though it's type signature were:
 --
 -- @
--- Monad m => (a -> m (Pipe m a) -> f (Pipe m b)) -> Pipe m a -> m (Pipe m b)
+-- Monad m => (a -> m (Pipe m a) -> m (Pipe m b)) -> Pipe m a -> m (Pipe m b)
 -- @
 step :: Applicative f => (a -> m1 (Pipe m1 a) -> f (Pipe m2 b)) -> Pipe m1 a -> f (Pipe m2 b)
 step f = \ case
@@ -226,21 +204,24 @@ liftInnerPipe lift = step $ \ a next -> return $ PipeNext a $ lift next >>= lift
 
 -- | Functions like 'push', 'foreach', and 'pull' are good for simple @IO@ processes. But when your
 -- process becomes a little more complicated, it is better to define your @IO@ process in terms of
--- an 'Engine', which manages input, output, an optional state, behind the scenes, allowing you to
--- keep your function definitions clean and compact.
+-- an 'EngineT', which manages input, output, an optional state, behind the scenes, allowing you to
+-- keep your function definitions clean and compact. You would also use 'EngineT' in the case that
+-- you need monadic behavior from a 'Pipe', which can't be done with 'Pipe' alone since 'Pipe' is
+-- not a monad (although it is an 'Applicative' 'Functor').
 --
--- You define an 'Engine' using the engine combinators such as 'input', 'while', 'collect', and
--- 'output'. You can also use the usual Monad Transformer Library combinators like 'get' and 'put'
--- to update state, the state lenses like 'use' and @('=.')@, error control like 'throwError',
--- 'catchError', and 'Alternative' combinators like @('<|>')@ and 'empty'.
+-- You define an 'EngineT' using the 'EngineT' combinators such as 'input', 'while', 'collect', and
+-- 'output'. You can convert an ordinary 'Pipe' to an 'EngineT' by evaluating the 'Pipe' with the
+-- 'EngineT' function. You can also use the usual Monad Transformer Library combinators like 'get'
+-- and 'put' to update state, the state lenses like 'use' and @('=.')@, error control like
+-- 'throwError', 'catchError', and 'Alternative' combinators like @('<|>')@ and 'empty'.
 --
--- The name 'Engine' was chosen because it serves as a metaphor for what functions of this type
+-- The name 'EngineT' was chosen because it serves as a metaphor for what functions of this type
 -- should do: they should take input from a 'Pipe', and produce output to another 'Pipe', typcially
 -- performing some work on the content of the input 'Pipe' to produce the output.
-newtype Engine st input m a
-  = Engine
-    { unwrapEngine ::
-        StateT (EngineState st input m) m (Pipe (Engine st input m) a)
+newtype EngineT st input m a
+  = EngineT
+    { unwrapEngineT ::
+        StateT (EngineState st input m) m (Pipe (EngineT st input m) a)
     }
   deriving (Functor)
 
@@ -250,50 +231,46 @@ data EngineState st input m
     , theEngineInputPipe  :: (m (Pipe m input))
     }
 
-instance Monad m => Applicative (Engine st input m) where
-  pure = Engine . pure . flip PipeNext (Engine $ pure PipeStop)
-  (Engine f) <*> (Engine a) = Engine $ (<*>) <$> f <*> a
+instance Monad m => Applicative (EngineT st input m) where
+  pure = EngineT . pure . flip PipeNext (EngineT $ pure PipeStop)
+  (EngineT f) <*> (EngineT a) = EngineT $ (<*>) <$> f <*> a
 
-instance Monad m => Alternative (Engine st input m) where
-  empty = Engine $ pure empty
-  (Engine a) <|> (Engine b) = Engine $ (<|>) <$> a <*> b
+instance Monad m => Alternative (EngineT st input m) where
+  empty = EngineT $ pure empty
+  (EngineT a) <|> (EngineT b) = EngineT $ (<|>) <$> a <*> b
 
-instance Monad m => Monad (Engine st input m) where
-  return = Engine . return . return
-  (Engine a) >>= f = Engine $ do
-    let loop = step $ \ a nextA -> unwrapEngine $ mplus
-          (Engine $ unwrapEngine $ f a)
-          (Engine $ join <$> unwrapEngine nextA >>= loop)
-    a >>= loop 
+instance Monad m => Monad (EngineT st input m) where
+  return = EngineT . return . pure
+  (EngineT a) >>= f = EngineT $
+    let loop = step $ \ a next ->
+          (<|>) <$> unwrapEngineT (f a) <*> unwrapEngineT (next >>= EngineT . loop)
+    in  a >>= loop
 
-instance Monad m => MonadPlus (Engine st input m) where
-  mzero = Engine $ return mzero
-  mplus (Engine a) (Engine b) = Engine $
-    a >>= \ a -> b >>= \ b -> return (mplus a b)
+instance Monad m => MonadPlus (EngineT st input m) where { mzero = empty; mplus = (<|>); }
 
-instance Monad m => MonadState (EngineState st input m) (Engine st input m) where
-  state f = Engine $ state $ \ st0 -> let (a, st) = f st0 in (pure a, st)
+instance Monad m => MonadState (EngineState st input m) (EngineT st input m) where
+  state f = EngineT $ state $ \ st0 -> let (a, st) = f st0 in (pure a, st)
 
-instance MonadTrans (Engine st input) where
-  lift = Engine . lift . fmap return
+instance MonadTrans (EngineT st input) where
+  lift = EngineT . lift . fmap pure
 
-instance Monad m => MonadError ErrMsg (Engine st input m) where
-  throwError = Engine . return . PipeFail
-  catchError (Engine try) catch = Engine $ try >>= \ case
+instance Monad m => MonadError ErrMsg (EngineT st input m) where
+  throwError = EngineT . return . PipeFail
+  catchError (EngineT try) catch = EngineT $ try >>= \ case
     PipeStop      -> return PipeStop
-    PipeFail  msg -> unwrapEngine $ catch msg
+    PipeFail  msg -> unwrapEngineT $ catch msg
     ok@PipeNext{} -> return ok
 
-instance Monad m => MonadFail (Engine st input m) where
+instance Monad m => MonadFail (EngineT st input m) where
   fail = throwError . pack
 
-instance MonadIO m => MonadIO (Engine st input m) where
-  liftIO = Engine . fmap pure . liftIO
+instance MonadIO m => MonadIO (EngineT st input m) where
+  liftIO = EngineT . fmap pure . liftIO
 
-instance (Monad m, Semigroup a) => Semigroup (Engine st input m a) where
+instance (Monad m, Semigroup a) => Semigroup (EngineT st input m a) where
   a <> b = (<>) <$> a <*> b
 
-instance (Monad m, Monoid a) => Monoid (Engine st input m a) where
+instance (Monad m, Monoid a) => Monoid (EngineT st input m a) where
   mappend a b = mappend <$> a <*> b
   mempty      = return mempty
 
@@ -322,39 +299,49 @@ instance (Monad m, Monoid a) => Monoid (Engine st input m a) where
 -- or as few pipe elements from the input as the algorithm you are writing requires.
 --
 -- The output of this function is a pipe that produces a result of type @output@ paired with the
--- 'EngineState'. The engine state may safely be discarded if it is not needed, and so there is also
+-- 'EngineState'. The EngineT state may safely be discarded if it is not needed, and so there is also
 -- an 'evalEngine' which does discard the resultant 'EngineState'.
 --
 -- There is also an 'execEngine' function which returns a pipe containing only the state value of
 -- type @st@. This can be useful if the 'Engine' function you have written is to behave as an
 -- 'unfold'-like function for which the type @output@ is unit @()@ but the state value @st@.
-runEngine
+runEngineT
   :: forall st input m output
    . Monad m
-  => Engine st input m output -> EngineState st input m
+  => EngineT st input m output -> EngineState st input m
   -> m (Pipe m (output, EngineState st input m))
-runEngine f init = loop init f where
-  loop st f = runStateT (unwrapEngine f) st >>= \ (a, st) -> flip step a $ \ a next ->
-    pure (PipeNext (a, st) $ loop st $ Engine $ fmap join $ unwrapEngine next)
+runEngineT f = fmap
+  ( \ (a, st) -> case a of
+    PipeStop        -> PipeStop
+    PipeFail err    -> PipeFail err
+    PipeNext a next -> PipeNext (a, st) $ runEngineT (next >>= EngineT . pure) st
+  ) . runStateT (unwrapEngineT f)
 
 -- | Like 'runEngine' but discards the 'EngineState', leaving a 'Pipe' with only the values of type
 -- @output@. Use this function when the intermediate state values of type @st@ are not important,
 -- and only the 'Pipe'ed @output@ is important.
-evalEngine :: Monad m => Engine st input m output -> EngineState st input m -> m (Pipe m output)
-evalEngine f = fmap (fmap fst) . runEngine f
+evalEngineT :: Monad m => EngineT st input m output -> EngineState st input m -> m (Pipe m output)
+evalEngineT f = fmap (fmap fst) . runEngineT f
 
 -- | Like 'runEngine' but discards the values of type @output@, returning a 'Pipe' containing every
 -- intermediate state value of type @st@. This can be useful if the 'Engine' function you have
 -- written is to behave as an 'unfold'-like function for which the type @output@ is unit @()@ but
 -- the state value @st@.
-execEngine :: Monad m => Engine st input m output -> EngineState st input m -> m (Pipe m st)
-execEngine f = fmap (fmap (theEngineStateValue . snd)) . runEngine f
+execEngineT :: Monad m => EngineT st input m output -> EngineState st input m -> m (Pipe m st)
+execEngineT f = fmap (fmap (theEngineStateValue . snd)) . runEngineT f
+
+-- | Convert a plain 'Pipe' into an 'EngineT'.
+engine :: Monad m => Pipe m a -> EngineT st input m a
+engine = \ case
+  PipeStop        -> empty
+  PipeFail err    -> throwError err
+  PipeNext a next -> EngineT $ ((pure a) <|>) <$> (lift next >>= unwrapEngineT . engine)
 
 -- | This is a combinator to define a function of type 'Engine'. When this function is evaluated, it
 -- take a single value of type @input@ from the input stream that is piped to every 'Engine'
 -- function when it is evaluated by 'evalEngine'.
-input :: Monad m => Engine st input m input
-input = Engine $ use engineInputPipe >>= lift >>=
+input :: Monad m => EngineT st input m input
+input = EngineT $ use engineInputPipe >>= lift >>=
   step (\ input next -> engineInputPipe .= next >> return (pure input))
 
 -- | This function is similar to 'pushList', but is specifically designed to evaluate within a
@@ -363,8 +350,8 @@ input = Engine $ use engineInputPipe >>= lift >>=
 -- 'output' can be /piped/ to the 'input' of another function evaluated by 'evalEngine' using the
 -- monadic bind operator @'>>='@ as the piping operator, and whatever is 'ouput' by this function
 -- can be received on the other end by the 'input' function.
-output :: Monad m => [output] -> Engine st input m output
-output = pushList >=> Engine . return
+output :: Monad m => [output] -> EngineT st input m output
+output = pushList >=> EngineT . return
 
 -- | This function serves as a form of 'Data.List.unfold'ing function, it is a little similar to the
 -- UNIX "@yes@" function. It works by evaluating a given 'Engine' function repeatedly in an
@@ -382,13 +369,13 @@ output = pushList >=> Engine . return
 -- so that the @output@ value can be inspected and a decision can be made as to whether the loop
 -- should continue, however if the first evaluation of 'while' is 'empty' then no 'output' is ever
 -- produced, so that first evaluation may not have any meaningful side-effects.
-pump :: Monad m => Engine st input m output -> Engine st input m output
-pump (Engine f) = Engine $ f >>=
-  step (\ input next -> unwrapEngine $ Engine (pure $ PipeNext input next) <|> pump (Engine f))
+pump :: Monad m => EngineT st input m output -> EngineT st input m output
+pump (EngineT f) = EngineT $ f >>=
+  step (\ input next -> unwrapEngineT $ EngineT (pure $ PipeNext input next) <|> pump (EngineT f))
 
 -- | This function is similar to 'pump', except the 'input' function is evaluated on each iteration,
 -- and the result of the input is fed into the given 'Engine' function.
-mapInput :: Monad m => (input -> Engine st input m output) -> Engine st input m output
+mapInput :: Monad m => (input -> EngineT st input m output) -> EngineT st input m output
 mapInput = pump . (input >>=)
 
 -- | You should never need to use this function.
@@ -409,8 +396,8 @@ engineInputPipe = lens theEngineInputPipe $ \ a b -> a{ theEngineInputPipe = b }
 -- for the 'Engine' function type.
 --
 -- @
--- 'put' = 'Engine' '.' 'assign' 'engineStateValue'
--- 'get' = Engine '$' 'use' 'engineStateValue'
+-- 'put' = 'EngineT' '.' 'assign' 'engineStateValue'
+-- 'get' = EngineT '$' 'use' 'engineStateValue'
 -- @
 engineStateValue :: Lens' (EngineState st input m) st
 engineStateValue = lens theEngineStateValue $ \ a b -> a{ theEngineStateValue = b }
