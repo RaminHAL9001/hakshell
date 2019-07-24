@@ -225,6 +225,8 @@ newtype EngineT st input m a
     }
   deriving (Functor)
 
+type Engine st input = EngineT st input Identity
+
 data EngineState st input m
   = EngineState
     { theEngineStateValue :: !st
@@ -306,8 +308,7 @@ instance (Monad m, Monoid a) => Monoid (EngineT st input m a) where
 -- type @st@. This can be useful if the 'Engine' function you have written is to behave as an
 -- 'unfold'-like function for which the type @output@ is unit @()@ but the state value @st@.
 runEngineT
-  :: forall st input m output
-   . Monad m
+  :: Monad m
   => EngineT st input m output -> EngineState st input m
   -> m (Pipe m (output, EngineState st input m))
 runEngineT f = fmap
@@ -317,11 +318,22 @@ runEngineT f = fmap
     PipeNext a next -> PipeNext (a, st) $ runEngineT (next >>= EngineT . pure) st
   ) . runStateT (unwrapEngineT f)
 
+-- | The pure version of 'runEngineT'.
+runEngine
+  :: Engine st input output
+  -> EngineState st input Identity
+  -> Pipe Identity (output, EngineState st input Identity)
+runEngine f = runIdentity . runEngineT f
+
 -- | Like 'runEngine' but discards the 'EngineState', leaving a 'Pipe' with only the values of type
 -- @output@. Use this function when the intermediate state values of type @st@ are not important,
 -- and only the 'Pipe'ed @output@ is important.
 evalEngineT :: Monad m => EngineT st input m output -> EngineState st input m -> m (Pipe m output)
 evalEngineT f = fmap (fmap fst) . runEngineT f
+
+-- | The pure version of 'evalEngineT'.
+evalEngine :: Engine st input output -> EngineState st input Identity -> Pipe Identity output
+evalEngine f = runIdentity . evalEngineT f
 
 -- | Like 'runEngine' but discards the values of type @output@, returning a 'Pipe' containing every
 -- intermediate state value of type @st@. This can be useful if the 'Engine' function you have
@@ -329,6 +341,9 @@ evalEngineT f = fmap (fmap fst) . runEngineT f
 -- the state value @st@.
 execEngineT :: Monad m => EngineT st input m output -> EngineState st input m -> m (Pipe m st)
 execEngineT f = fmap (fmap (theEngineStateValue . snd)) . runEngineT f
+
+execEngine :: Engine st input output -> EngineState st input Identity -> Pipe Identity st
+execEngine f = runIdentity . execEngineT f
 
 -- | Convert a plain 'Pipe' into an 'EngineT'.
 engine :: Monad m => Pipe m a -> EngineT st input m a
