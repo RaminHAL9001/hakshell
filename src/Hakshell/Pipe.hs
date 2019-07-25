@@ -220,11 +220,12 @@ liftInnerPipe lift = step $ \ a next -> return $ PipeNext a $ lift next >>= lift
 -- you need monadic behavior from a 'Pipe', which can't be done with 'Pipe' alone since 'Pipe' is
 -- not a monad (although it is an 'Applicative' 'Functor').
 --
--- You define an 'EngineT' using the 'EngineT' combinators such as 'input', 'pump', 'collect', and
--- 'output'. You can convert an ordinary 'Pipe' to an 'EngineT' by evaluating the 'Pipe' with the
--- 'EngineT' function. You can also use the usual Monad Transformer Library combinators like 'get'
--- and 'put' to update state, the state lenses like 'use' and @('=.')@, error control like
--- 'throwError', 'catchError', and 'Alternative' combinators like @('<|>')@ and 'empty'.
+-- You define an 'EngineT' using the 'EngineT' combinators such as 'input', 'pump', 'while',
+-- 'collect', and 'output'. You can convert an ordinary 'Pipe' to an 'EngineT' by evaluating the
+-- 'Pipe' with the 'EngineT' function. You can also use the usual Monad Transformer Library
+-- combinators like 'get' and 'put' to update state, the state lenses like 'use' and @('=.')@, error
+-- control like 'throwError', 'catchError', and 'Alternative' combinators like @('<|>')@ and
+-- 'empty'.
 --
 -- The name 'EngineT' was chosen because it serves as a metaphor for what functions of this type
 -- should do: they should take input from a 'Pipe', and produce output to another 'Pipe', typcially
@@ -395,13 +396,13 @@ input = EngineT $ use engineInputPipe >>= lift >>=
 output :: Monad m => [output] -> EngineT st input m output
 output = pushList >=> EngineT . return
 
--- | This function serves as a form of 'Data.List.unfold'ing function, it is a little similar to the
--- UNIX "@yes@" function. It works by evaluating a given 'Engine' function repeatedly in an
--- infinitely recursive loop while collecting the @output@ from evaluation. The loop continues until
--- 'empty' or 'mzero' is evaluated (which are identical functions in standard Haskell). Note that
--- evaluating the 'input' function to obtain an input will evaluate to 'empty' as well, if the
--- 'Engine' you pass to 'pump' evaluates 'input' every time, the 'pump' will keep looping until all
--- input is consumed -- this is how the 'mapInput' function is defined.
+-- | This is a looping function that performs what could be called an 'Data.List.unfold'ing on a
+-- stateful value @st@ in order to produce a 'Pipe'. It works by evaluating a given 'Engine'
+-- function repeatedly in an infinitely recursive loop while collecting the @output@ from
+-- evaluation. The loop continues until 'empty' or 'mzero' is evaluated, or if 'guard' is given a
+-- 'False' value. Note that evaluating the 'input' function to obtain an input will evaluate to
+-- 'empty' as well, if the 'Engine' you pass to 'pump' evaluates 'input' every time, the 'pump' will
+-- keep looping until all input is consumed -- this is how the 'mapInput' function is defined.
 --
 -- The 'Data.List.unfold'ing comes from the fact that you can use the 'get', 'put', 'modify', and
 -- 'state' functions from the "Control.Monad.State" module to repeatedly update a stateful value
@@ -414,6 +415,16 @@ output = pushList >=> EngineT . return
 pump :: Monad m => EngineT st input m output -> EngineT st input m output
 pump (EngineT f) = EngineT $ f >>=
   step (\ input next -> unwrapEngineT $ EngineT (pure $ PipeNext input next) <|> pump (EngineT f))
+
+-- | This function performs what you could call a 'map'ping function on a 'Pipe'. This function
+-- loops infinitely on a procedural function of type @'Engine' st inp m outp@, calling 'input' for
+-- you at the start of each each loop iteration and passing that input to the given
+-- procedure. Iteration continues until all 'input's have been consumed, even if the procedure
+-- evaluates to 'empty'. If the 'procedure' evaluates to 'empty' (or equivalently 'guard' is given a
+-- 'False' value), then no output is produced for that iteration, and the loop begins again with the
+-- next iteration if there are 'input's remaining.
+while :: Monad m => (input -> EngineT st input m output) -> EngineT st input m output
+while f = input >>= (<|> (while f)) . f
 
 -- | This function is similar to 'pump', except the 'input' function is evaluated on each iteration,
 -- and the result of the input is fed into the given 'Engine' function.
