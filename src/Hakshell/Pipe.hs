@@ -194,6 +194,17 @@ pullList f = loop id where
     PipeFail   msg  -> Control.Monad.Except.fail $ BStr.unpack msg
     PipeNext a next -> f a >>= \ b -> next >>= loop (stack . (b :))
 
+-- | Concatenate all 'Pipe's within a containing 'Pipe'. This does require some potentially
+-- side-effectful code to be evaluated on the pipeline (hence it is necessary for the result to be
+-- 'return'ed to the controlling monadic context @m@, although the it is not necessary to perform an
+-- evaluation of any of the elements within the 'Pipe' itself, so it is reasonable to expect that
+-- this function will not perform side effects.
+pconcat :: Monad m => Pipe m (Pipe m a) -> m (Pipe m a)
+pconcat = \ case
+  PipeStop        -> pure PipeStop
+  PipeFail err    -> pure $ PipeFail err
+  PipeNext a next -> (a <|>) <$> (next >>= pconcat)
+
 -- | Lift the monadic type @inner@ of a 'Pipe' into another monad @m@
 liftInnerPipe
   :: (Monad inner, Monad m)

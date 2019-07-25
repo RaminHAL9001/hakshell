@@ -437,7 +437,7 @@ search
    . FileMatcher st (FileMatchResult a)
   -> st -> FPath -> IO (Pipe IO a)
 search pat st = listFSNodes >=> step init where
-  init node next = evalEngine (loop node) EngineState
+  init node next = evalEngineT (loop node) EngineState
     { theEngineInputPipe  = next
     , theEngineStateValue = FSearchState
         { theCurrentFSNode      = node
@@ -482,9 +482,9 @@ search pat st = listFSNodes >=> step init where
 -- conditions if other processes are updating the filesystem within the subtree being searched.
 fastSearch
   :: MonadIO m
-  => Engine (FSearchState ()) FPath m FSNode
+  => EngineT (FSearchState ()) FPath m FSNode
 fastSearch = error "TODO: fastSearch"
 
 -- | "List recursive," similar to invoking @ls -r@ on the command line.
 lsr :: [FPath] -> IO (Pipe IO FSNode)
-lsr = fmap join . pmap (search ([mempty] ?-> match) ()) . pipe
+lsr = pmap (search ([mempty] ?-> match) ()) . pipe >=> pconcat
