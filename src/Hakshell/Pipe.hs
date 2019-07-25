@@ -244,6 +244,22 @@ data EngineState st input m
     , theEngineInputPipe  :: (m (Pipe m input))
     }
 
+instance (Applicative m, Semigroup st) => Semigroup (EngineState st input m) where
+  a <> b = EngineState
+    { theEngineStateValue = theEngineStateValue a <> theEngineStateValue b
+    , theEngineInputPipe  = (<|>) <$> theEngineInputPipe a <*> theEngineInputPipe  b
+    }
+
+instance (Applicative m, Monoid st) => Monoid (EngineState st input m) where
+  mempty = EngineState
+    { theEngineStateValue = mempty
+    , theEngineInputPipe  = pure PipeStop
+    }
+  mappend a b = EngineState
+    { theEngineStateValue = mappend (theEngineStateValue a) (theEngineStateValue b)
+    , theEngineInputPipe  = (<|>) <$> theEngineInputPipe a <*> theEngineInputPipe b
+    }
+
 instance Monad m => Applicative (EngineT st input m) where
   pure = EngineT . pure . flip PipeNext (EngineT $ pure PipeStop)
   (EngineT f) <*> (EngineT a) = EngineT $ (<*>) <$> f <*> a
