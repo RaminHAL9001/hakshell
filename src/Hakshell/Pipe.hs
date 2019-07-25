@@ -220,7 +220,7 @@ liftInnerPipe lift = step $ \ a next -> return $ PipeNext a $ lift next >>= lift
 -- you need monadic behavior from a 'Pipe', which can't be done with 'Pipe' alone since 'Pipe' is
 -- not a monad (although it is an 'Applicative' 'Functor').
 --
--- You define an 'EngineT' using the 'EngineT' combinators such as 'input', 'while', 'collect', and
+-- You define an 'EngineT' using the 'EngineT' combinators such as 'input', 'pump', 'collect', and
 -- 'output'. You can convert an ordinary 'Pipe' to an 'EngineT' by evaluating the 'Pipe' with the
 -- 'EngineT' function. You can also use the usual Monad Transformer Library combinators like 'get'
 -- and 'put' to update state, the state lenses like 'use' and @('=.')@, error control like
@@ -409,7 +409,7 @@ output = pushList >=> EngineT . return
 --
 -- Note that the given 'Engine' function which is to be looped must be evaluated at least one time
 -- so that the @output@ value can be inspected and a decision can be made as to whether the loop
--- should continue, however if the first evaluation of 'while' is 'empty' then no 'output' is ever
+-- should continue, however if the first evaluation of 'pump' is 'empty' then no 'output' is ever
 -- produced, so that first evaluation may not have any meaningful side-effects.
 pump :: Monad m => EngineT st input m output -> EngineT st input m output
 pump (EngineT f) = EngineT $ f >>=
@@ -428,7 +428,7 @@ mapInput = pump . (input >>=)
 -- you wrap these expressions in the 'Engine' constructor first. For example the 'putBackInput'
 -- function is defined as: @\\ elem -> 'Engine' ('engineInputPipe' '%=' 'PipeNext' elem . 'return')@
 --
--- Again, just use the input combinators like 'input', 'collect', 'while', and 'putBackInput'.
+-- Again, just use the input combinators like 'input', 'collect', 'pump', and 'putBackInput'.
 engineInputPipe :: Lens' (EngineState st input m) (m (Pipe m input))
 engineInputPipe = lens theEngineInputPipe $ \ a b -> a{ theEngineInputPipe = b }
 
