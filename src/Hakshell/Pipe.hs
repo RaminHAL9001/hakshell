@@ -396,26 +396,6 @@ input = EngineT $ use engineInputPipe >>= lift >>=
 output :: Monad m => [output] -> EngineT st input m output
 output = pushList >=> EngineT . return
 
--- | This is a looping function that performs what could be called an 'Data.List.unfold'ing on a
--- stateful value @st@ in order to produce a 'Pipe'. It works by evaluating a given 'Engine'
--- function repeatedly in an infinitely recursive loop while collecting the @output@ from
--- evaluation. The loop continues until 'empty' or 'mzero' is evaluated, or if 'guard' is given a
--- 'False' value. Note that evaluating the 'input' function to obtain an input will evaluate to
--- 'empty' as well, if the 'Engine' you pass to 'pump' evaluates 'input' every time, the 'pump' will
--- keep looping until all input is consumed -- this is how the 'mapInput' function is defined.
---
--- The 'Data.List.unfold'ing comes from the fact that you can use the 'get', 'put', 'modify', and
--- 'state' functions from the "Control.Monad.State" module to repeatedly update a stateful value
--- from which your next @output@ value will derive.
---
--- Note that the given 'Engine' function which is to be looped must be evaluated at least one time
--- so that the @output@ value can be inspected and a decision can be made as to whether the loop
--- should continue, however if the first evaluation of 'pump' is 'empty' then no 'output' is ever
--- produced, so that first evaluation may not have any meaningful side-effects.
-pump :: Monad m => EngineT st input m output -> EngineT st input m output
-pump (EngineT f) = EngineT $ f >>=
-  step (\ input next -> unwrapEngineT $ EngineT (pure $ PipeNext input next) <|> pump (EngineT f))
-
 -- | This function performs what you could call a 'map'ping function on a 'Pipe'. This function
 -- loops infinitely on a procedural function of type @'Engine' st inp m outp@, calling 'input' for
 -- you at the start of each each loop iteration and passing that input to the given
@@ -425,11 +405,6 @@ pump (EngineT f) = EngineT $ f >>=
 -- next iteration if there are 'input's remaining.
 while :: Monad m => (input -> EngineT st input m output) -> EngineT st input m output
 while f = input >>= (<|> (while f)) . f
-
--- | This function is similar to 'pump', except the 'input' function is evaluated on each iteration,
--- and the result of the input is fed into the given 'Engine' function.
-mapInput :: Monad m => (input -> EngineT st input m output) -> EngineT st input m output
-mapInput = pump . (input >>=)
 
 -- | You should never need to use this function.
 --
