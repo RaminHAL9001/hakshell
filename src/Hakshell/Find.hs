@@ -162,17 +162,21 @@ pwdPathList = pwd >>= fPathList
 -- link, socket, etc.), modification time, owner ID, group ID, and permission bits.
 data FSNode
   = FSNode
-    { fsNodeName :: !FPath
-    , fsNodeStat :: !FileStatus
+    { fsNodeParent :: !FPath
+    , fsNodeName   :: !FPath
+    , fsNodeStat   :: !FileStatus
     }
 
 instance Eq FSNode where
   a == b = nn a == nn b && ns a == ns b
 
 instance Ord FSNode where
-  compare a b = compare (nn a) (nn b) <> compare (ns a) (ns b)
+  compare a b = compare (np a) (np b) <> compare (nn a) (nn b) <> compare (ns a) (ns b)
 
-instance Show FSNode where { show = unpack . nn; }
+instance Show FSNode where { show n = unpack (np n) </> unpack (nn n); }
+
+np :: FSNode -> FPath
+np = fsNodeParent
 
 nn :: FSNode -> FPath
 nn = fsNodeName
@@ -180,9 +184,16 @@ nn = fsNodeName
 ns :: FSNode -> FileID
 ns = fileID . fsNodeStat
 
--- | Lookup 'FSNode' information for a given 'FPath'.
-fsNode :: FPath -> IO FSNode
-fsNode path = FSNode path <$> getFileStatus (unpack path)
+-- | Lookup 'FSNode' information for a given file 'FPath' within a given directory 'FPath'. The
+-- directory and file are concatenated with a directory separator @('</>')@ and this concatenated
+-- path is used to query the operating system for the 'FileStatus'.
+fsNode :: FPath -> FPath -> IO FSNode
+fsNode parent file = FSNode parent file <$> getFileStatus (unpack parent </> unpack file)
+
+-- | Get the full path for an 'FSNode', which includes the 'fsNodeParent' concatenated with the
+-- 'fsNodeName' using the path concatenation operator @('</>')@.
+fsNodePath :: FSNode -> FPath
+fsNodePath p = pack $ unpack (np p) </> unpack (nn p)
 
 ----------------------------------------------------------------------------------------------------
 
@@ -199,12 +210,12 @@ data FSNodeList
 
 -- | Get all 'FSNode's for the given 'FPath', which is usually a directory containing many files.
 fsNodeList :: FPath -> IO FSNodeList
-fsNodeList fpath@(FPath path) = do
+fsNodeList dir = do
   start   <- getCurrentTime
-  listing <- getDirectoryContents (unpack path) >>= mapM (fsNode . FPath . pack)
+  listing <- getDirectoryContents (unpack dir) >>= mapM (fsNode dir . FPath . pack)
   return FSNodeList
     { fsNodeListTime   = start
-    , fsNodeListSource = fpath
+    , fsNodeListSource = dir
     , fsNodeListNodes  = listing
     }
 
@@ -423,12 +434,12 @@ infixr 1 ?->
 --
 -- TODO: remove this function from the public API.
 listFSNodes :: FPath -> IO (Pipe IO FSNode)
-listFSNodes path@(FPath pathstr) = openDirStream (unpack path) >>= loop where
+listFSNodes dir = openDirStream (unpack dir) >>= loop where
   loop stream = do
     name <- catch (readDirStream stream) $ \ e ->
       closeDirStream stream >> throwIO (e :: SomeException)
     if null name then closeDirStream stream >> pure PipeStop else do
-      node <- fsNode $ pack $ unpack pathstr </> name
+      node <- fsNode dir $ pack name
       return $ PipeNext node (loop stream)
 
 -- | Like 'find' but allows you to construct a stateful value as the file search proceeds.
@@ -446,7 +457,7 @@ search pat st = listFSNodes >=> step init where
         , theCurrentUserState   = st
         }
     }
-  next = input >>= loop
+  next = input >>= \ file -> loop file
   loop node = let name = fsNodeName node in if name == ".." || name == "." then next else do
     engineStateValue . currentFSNode .= node
     (result, st) <- runFileMatcher pat <$> gets theEngineStateValue >>= liftIO
@@ -454,17 +465,17 @@ search pat st = listFSNodes >=> step init where
     result <- maybe noMatch pure result
     -- The '<|>' operator combines the outputs of each of the search steps, similar to how '<|>'
     -- works for lists data types.
-    output (theFileMatchYield result) <|> enterSubdir result node name <|> next
-  enterSubdir result node name = do
+    output (theFileMatchYield result) <|> enterSubdir result node <|> next
+  enterSubdir result node = do
     -- First check if this is a directory into which we should recursively search.
     guard $ theFileMatchStepInto result && isDirectory (fsNodeStat node)
     -- Save the old state
     oldstream <- use engineInputPipe
     -- Set the new state using the directory into which we will search recursively.
-    engineInputPipe .= listFSNodes name
+    engineInputPipe .= listFSNodes (fsNodePath node)
     engineStateValue %=
       ( currentSearchDepth +~ 1 ) .
-      ( currentSearchPath  %~ (name :) )
+      ( currentSearchPath  %~ ((fsNodeName node) :) )
     -- Evaluate the next depth recursive step of the search.
     result <- next
     -- Restore the old state.
