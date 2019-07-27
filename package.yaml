@@ -77,6 +77,8 @@ library:
   - Hakshell.Struct
   - Hakshell.TextEditor
   - Hakshell.UTFUnit
+  - Hakshell.Pipe
+  - Hakshell.Find
 
 tests:
   HakshellTests:
