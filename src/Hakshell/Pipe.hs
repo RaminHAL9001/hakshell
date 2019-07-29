@@ -171,6 +171,12 @@ step f (Pipe a) = case a of
 
 ----------------------------------------------------------------------------------------------------
 
+-- | A class of monads that can yield multiple values from a 'Pipe' without having to deconstruct it
+-- to a list and then reconstruct it using @('msum' . 'fmap' 'pure')@.
+class Monad m => MonadPipe m where { yield :: Pipe a -> m a; }
+
+----------------------------------------------------------------------------------------------------
+
 -- | Functions like 'push', 'foreach', and 'pull' are good for simple @IO@ processes. But when your
 -- process becomes a little more complicated, it is better to define your @IO@ process in terms of
 -- an 'EngineT', which manages input, output, an optional state, behind the scenes, allowing you to
@@ -331,9 +337,8 @@ execEngineT = fmap (fmap snd) . runEngineT
 execEngine :: Engine st input output -> EngineState st input -> EngineState st input
 execEngine = (.) runIdentity . execEngineT
 
--- | Convert a plain 'Pipe' into an 'EngineT'.
-engine :: Monad m => Pipe a -> EngineT st input m a
-engine = EngineT . pure
+instance Monad m => MonadPipe (EngineT st input m) where
+  yield = EngineT . pure
 
 -- | Throw an 'IOException' in the 'EngineT' monad.
 engineIOError :: MonadIO m => IOException -> EngineT st input m void
