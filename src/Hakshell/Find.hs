@@ -5,7 +5,7 @@
 module Hakshell.Find
   ( -- * Executing a Filesystem Query
 
-    search, fastSearch, lsr,
+    FSFoldMapT, runFSFoldMapT, mapDir, mapDirErr,
 
     -- * The 'FPath' datatype
     --
@@ -33,7 +33,7 @@ module Hakshell.Find
     -- memory in a single operation.
 
     FSNodeList, fsNodeList, fsNodeListTime, fsNodeListSource,
-    listFSNodes, pwdListFSNode,
+    pwdListFSNode,
 
     -- * Predicates on 'FSNode' values
 
@@ -88,6 +88,7 @@ import           Control.Applicative
 import           Control.Arrow
 import           Control.Exception
 import           Control.Lens
+import           Control.Monad.Cont
 import           Control.Monad.Reader
 import           Control.Monad.State
 import           Control.Monad.Trans.Maybe
@@ -101,6 +102,7 @@ import           System.Directory
                  , getDirectoryContents
                  )
 import           System.FilePath( (</>) )
+import           System.IO
 import           System.Posix.Directory
                  ( openDirStream, readDirStream, closeDirStream
                  )
@@ -319,30 +321,30 @@ data FileMatchResult a
       -- to step into this directory (depth first), set this value to tell 'search' whether or not
       -- to do so. Setting this value to 'False' will prune the directory under scrutiny from
       -- recursively being 'search'ed.
-    , theFileMatchYield    :: [a]
+    , theFileMatchYield    :: Pipe a
       -- ^ A file match result may yield zero or more values.
     }
-  deriving (Eq, Functor)
+  deriving Functor
 
 -- | This function is used within a 'FileMatcher' function. Do not output a value, do not step into
 -- this subdirectory if the current match is scrutinizing a subdirectory,
 prune :: Applicative m => m (FileMatchResult a)
-prune = pure $ FileMatchResult False []
+prune = pure $ FileMatchResult False empty
 
 -- | This function is used within a 'FileMatcher' function. Do not output any value, but do step
 -- into this subdirectory if the current match is scrutinizing a subdirectory. This is the default
 -- behavior for the 'ftest' function.
 noMatch :: Applicative m => m (FileMatchResult a)
-noMatch = pure $ FileMatchResult True []
+noMatch = pure $ FileMatchResult True empty
 
 -- | Output the file being scrutinized, but do not step into this subdirectory if the current match
 -- is scrutinizing a subdirectory.
-matchPrune :: FileMatcher st (FileMatchResult FSNode)
+matchPrune :: Monad m => FileMatcher st m (FileMatchResult FSNode)
 matchPrune = FileMatchResult False . pure <$> asks theCurrentFSNode
 
 -- | Output the file being scrutinized, and do step into this subdirectory if the current match is
 -- scrutinizing a subdirectory.
-match :: FileMatcher st (FileMatchResult FSNode)
+match :: Monad m => FileMatcher st m (FileMatchResult FSNode)
 match = FileMatchResult True . pure <$> asks theCurrentFSNode
 
 -- | If this file match is scrutinizing a directory, the 'search' function must decide whether to
@@ -352,28 +354,28 @@ match = FileMatchResult True . pure <$> asks theCurrentFSNode
 fileMatchStepInto :: Lens' (FileMatchResult a) Bool
 fileMatchStepInto = lens theFileMatchStepInto $ \ a b -> a{ theFileMatchStepInto = b }
 
-fileMatchYield :: Lens' (FileMatchResult a) [a]
+fileMatchYield :: Lens' (FileMatchResult a) (Pipe a)
 fileMatchYield = lens theFileMatchYield $ \ a b -> a{ theFileMatchYield = b }
 
 -- | Construct a default 'FileMatch' value, the default behavior is to set the 'fileMatchStepInto'
 -- value to 'True'.
-fileMatchResult :: [a] -> FileMatchResult a
+fileMatchResult :: Pipe a -> FileMatchResult a
 fileMatchResult = FileMatchResult True
 
 ----------------------------------------------------------------------------------------------------
 
 -- | Functions of this type scrutinize an 'FSNode', evaluating to 'empty' if the 'FSNode' should not
 -- be selected. Functions of this type are evaluated by 'find'.
-newtype FileMatcher st a
-  = FileMatcher (MaybeT (StateT (FSearchState st) IO) a)
+newtype FileMatcher st m a
+  = FileMatcher (MaybeT (StateT (FSearchState st) m) a)
   deriving (Functor, Applicative, Alternative, Monad, MonadPlus, MonadIO)
 
-instance MonadState st (FileMatcher st) where
+instance Monad m => MonadState st (FileMatcher st m) where
   state f = FileMatcher $ state $ \ st ->
     let (a, ust) = f $ st ^. currentUserState
     in  (a, st & currentUserState .~ ust)
 
-instance MonadReader (FSearchState st) (FileMatcher st) where
+instance Monad m => MonadReader (FSearchState st) (FileMatcher st m) where
   ask = FileMatcher $ lift get
   local step (FileMatcher f) = FileMatcher $ (>>= (maybe empty pure)) $ lift $ do
     oldst <- state $ fmap (const ()) &&& step
@@ -402,100 +404,91 @@ currentUserState :: Lens' (FSearchState st) st
 currentUserState = lens theCurrentUserState $ \ a b -> a{ theCurrentUserState = b }
 
 -- not for export
-runFileMatcher :: FileMatcher st a -> FSearchState st -> IO (Maybe a, FSearchState st)
+runFileMatcher
+  :: Monad m => FileMatcher st m a -> FSearchState st -> m (Maybe a, FSearchState st)
 runFileMatcher (FileMatcher f) = runStateT (runMaybeT f)
 
 -- | Evaluate a 'FSNodeTest' on the current 'FSearchState' (the value returned by 'ask') in the
 -- contest of a 'FileMatcher' function, if the 'FSNodeTest' succeeds, evaluate the given
 -- 'FileMatcher' action. The '?->' infix operator is identical to this function.
 ftest
-  :: [FSNodeTest st] -> FileMatcher st (FileMatchResult a)
-  -> FileMatcher st (FileMatchResult a)
+  :: Monad m
+  => [FSNodeTest st] -> FileMatcher st m (FileMatchResult a)
+  -> FileMatcher st m (FileMatchResult a)
 ftest preds action = do
   result <- runFSNodeTest (anyFSNodeTest preds) <$> ask
   if result then action else noMatch
 infixr 1 `ftest`
 
 (?->)
-  :: [FSNodeTest st] -> FileMatcher st (FileMatchResult a)
-  -> FileMatcher st (FileMatchResult a)
+  :: Monad m => [FSNodeTest st] -> FileMatcher st m (FileMatchResult a)
+  -> FileMatcher st m (FileMatchResult a)
 (?->) = ftest
 infixr 1 ?->
 
 ----------------------------------------------------------------------------------------------------
 
--- | Inspect a 'FPath', and if the 'FPath' is a directory, iterate over every 'FSNode's element that
--- exists in the directory as an element of a 'Pipe'. If the given 'FPath' is not a directory, yield
--- a single 'FSNode' in the output 'Pipe'.
---
--- __WARNING:__ The file descriptor to the directory is not closed until the last item in the 'Pipe'
--- is evaluated. This can lead to resource leaks if you do not fully evaluate the directory stream
--- at least once.
---
--- TODO: remove this function from the public API.
-listFSNodes :: FPath -> IO (Pipe IO FSNode)
-listFSNodes dir = openDirStream (unpack dir) >>= loop where
-  loop stream = do
-    name <- catch (readDirStream stream) $ \ e ->
-      closeDirStream stream >> throwIO (e :: SomeException)
-    if null name then closeDirStream stream >> pure PipeStop else do
-      node <- fsNode dir $ pack name
-      return $ PipeNext node (loop stream)
+-- | This function type is used to evaluate a mapping over the files in a file system, performing a
+-- fold as it goes. It lifts the 'ContT' monad transformer so that you can make use of 'callCC', the
+-- return type @cr@ is determined by the 'runFSFoldMap' function evaluation.
+newtype FSFoldMapT cr st m a = FSFoldMapT{ unwrapFSFoldMapT :: ContT cr (StateT st m) (Pipe a) }
+  deriving Functor
 
--- | Like 'find' but allows you to construct a stateful value as the file search proceeds.
-search
-  :: forall st a
-   . FileMatcher st (FileMatchResult a)
-  -> st -> FPath -> IO (Pipe IO a)
-search pat st = listFSNodes >=> step init where
-  init node next = evalEngineT (loop node) EngineState
-    { theEngineInputPipe  = next
-    , theEngineStateValue = FSearchState
-        { theCurrentFSNode      = node
-        , theCurrentSearchPath  = [fsNodeName node]
-        , theCurrentSearchDepth = 0
-        , theCurrentUserState   = st
-        }
-    }
-  next = input >>= \ file -> loop file
-  loop node = let name = fsNodeName node in if name == ".." || name == "." then next else do
-    engineStateValue . currentFSNode .= node
-    (result, st) <- runFileMatcher pat <$> gets theEngineStateValue >>= liftIO
-    engineStateValue .= st
-    result <- maybe noMatch pure result
-    -- The '<|>' operator combines the outputs of each of the search steps, similar to how '<|>'
-    -- works for lists data types.
-    output (theFileMatchYield result) <|> enterSubdir result node <|> next
-  enterSubdir result node = do
-    -- First check if this is a directory into which we should recursively search.
-    guard $ theFileMatchStepInto result && isDirectory (fsNodeStat node)
-    -- Save the old state
-    oldstream <- use engineInputPipe
-    -- Set the new state using the directory into which we will search recursively.
-    engineInputPipe .= listFSNodes (fsNodePath node)
-    engineStateValue %=
-      ( currentSearchDepth +~ 1 ) .
-      ( currentSearchPath  %~ ((fsNodeName node) :) )
-    -- Evaluate the next depth recursive step of the search.
-    result <- next
-    -- Restore the old state.
-    engineInputPipe .= oldstream
-    engineStateValue %=
-      ( currentSearchDepth -~ 1 ) .
-      ( currentSearchPath  %~ \ case
-          []     -> error "foldDir: stack underflow"
-          _:tail -> tail
-      )
-    -- Push the results of the laste depth recursive search step to the output
-    return result
+instance Monad m => Applicative (FSFoldMapT cr st m) where
+  pure = FSFoldMapT . pure . pure
+  (FSFoldMapT f) <*> (FSFoldMapT a) = FSFoldMapT $ (<*>) <$> f <*> a
 
--- "Fast" means subdirectories are not kept open when recursively searching, which can lead to race
--- conditions if other processes are updating the filesystem within the subtree being searched.
-fastSearch
-  :: MonadIO m
-  => EngineT (FSearchState ()) FPath m FSNode
-fastSearch = error "TODO: fastSearch"
+instance Monad m => Alternative (FSFoldMapT cr st m) where
+  empty = FSFoldMapT $ return empty
+  (FSFoldMapT a) <|> (FSFoldMapT b) = FSFoldMapT $ (<|>) <$> a <*> b
 
--- | "List recursive," similar to invoking @ls -r@ on the command line.
-lsr :: [FPath] -> IO (Pipe IO FSNode)
-lsr = pmap (search ([mempty] ?-> match) ()) . pipe >=> pconcat
+instance Monad m => Monad (FSFoldMapT cr st m) where
+  return = FSFoldMapT . return . pure
+  (FSFoldMapT a) >>= f = FSFoldMapT $ fmap (unwrapFSFoldMapT . f) <$> a >>= fmap join . sequence
+
+instance Monad m => MonadPlus (FSFoldMapT cr st m) where { mzero = empty; mplus = (<|>); }
+
+instance Monad m => MonadState st (FSFoldMapT cr st m) where
+  state = FSFoldMapT . fmap pure . state
+
+instance Monad m => MonadCont (FSFoldMapT cr st m) where
+  callCC a = FSFoldMapT $ callCC $ \ b -> unwrapFSFoldMapT $ a (FSFoldMapT . b . pure)
+
+instance MonadTrans (FSFoldMapT cr st) where
+  lift = FSFoldMapT . lift . lift . fmap pure
+
+instance MonadIO m => MonadIO (FSFoldMapT cr st m) where
+  liftIO = FSFoldMapT . liftIO . fmap pure
+
+instance Monad m => MonadPipe (FSFoldMapT cr st m) where
+  yield = FSFoldMapT . pure
+
+-- | Evaluate an 'FSFoldMapT' function, returning the final return value paired with the final state
+-- value.
+runFSFoldMapT :: Monad m => FSFoldMapT cr st m a -> (Pipe a -> StateT st m cr) -> st -> m (cr, st)
+runFSFoldMapT (FSFoldMapT f) = runStateT . runContT f
+
+----------------------------------------------------------------------------------------------------
+
+-- | Same as 'mapDirErr' except 'IOExceptions' that occur while reading the directory are printed to
+-- 'stderr' and then ignored.
+mapDir
+  :: (FPath -> FPath -> FSFoldMapT cr st IO a)
+  -> FPath -> FSFoldMapT cr st IO a
+mapDir = mapDirErr $ \ parent err ->
+  liftIO (hPutStrLn stderr $ show parent ++ ": " ++ show err) >> empty
+
+-- | Map a function to the contents of a directory, that is to say, the names of each of the files
+-- in the given target directory. First provide an error handling function in the event that a file
+-- could not be read, feel free to re-throw the exception, the directory file descriptor will be
+-- closed properly if you do.
+mapDirErr
+  :: (FPath -> IOException -> FSFoldMapT cr st IO a)
+  -> (FPath -> FPath -> FSFoldMapT cr st IO a) -> FPath -> FSFoldMapT cr st IO a
+mapDirErr catcher f dir = do
+  stream <- liftIO $ openDirStream $ unpack dir
+  let loop = liftIO (try $ readDirStream stream) >>= \ case
+        Right file -> if null file then empty else f dir (pack file) <|> loop
+        Left   err -> catcher dir err <|> loop
+  FSFoldMapT $ ContT $ \ next -> StateT $ \ st ->
+    runFSFoldMapT loop next st `finally` closeDirStream stream
