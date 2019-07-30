@@ -25,7 +25,7 @@ module Hakshell.Find
     -- Represents an entry in a filesystem, not just it's path. This includes information about the
     -- file type, it's owners, permission settings, and the size of the file.
 
-    FSNode, fsNode,
+    FSNode, fsNode, fsNodePath,
 
     -- ** 'FSNodeList'
     --
@@ -51,7 +51,7 @@ module Hakshell.Find
     -- These predicates simply take information from a 'FSearchState', allowing you to define your
     -- own predicates on the values in this data structure, if you really need to
 
-    fsNodePredicate, fNamePredicate,
+    fNamePredicate, fStatusPredicate,
 
     -- * Querying the Filesystem
 
@@ -65,7 +65,7 @@ module Hakshell.Find
     --
     -- Functionality for writing predicates on files that can be used during a filesystem search.
 
-    FileMatcher, ftest, (?->), 
+    FileMatcher, ftest, (?->), fileName, searchPath, fullPath, fileStatus, searchDepth,
 
     -- *** Low-level access to the state of a query
     --
@@ -75,7 +75,7 @@ module Hakshell.Find
     -- directly, rather you will evaluate some of the pre-defined predicates like 'file' or 'dir'
     -- using the 'ftest' function or the @('?->')@ operator.
 
-    FSearchState, theCurrentFSNode,
+    FSearchState, theCurrentFileName,
     theCurrentSearchDepth, SearchDepth(..),
     theCurrentSearchPath, theCurrentUserState,
 
@@ -84,7 +84,6 @@ module Hakshell.Find
 import           Hakshell.Pipe
 import           Hakshell.String
 
-import           Control.Applicative
 import           Control.Arrow
 import           Control.Exception
 import           Control.Lens
@@ -93,7 +92,6 @@ import           Control.Monad.Reader
 import           Control.Monad.State
 import           Control.Monad.Trans.Maybe
 
-import           Data.Semigroup
 import           Data.String
 import           Data.Time.Clock
 
@@ -236,73 +234,118 @@ pwdListFSNode = pwd >>= fsNodeList
 -- (<>) a b = FSNodeText (\\ file -> 'runFSNodeTest' a file 'Prelude.&&' 'runFSNodeTest' b file)
 -- @
 --
--- To perform a negation (logical NOT) use 'fnot'.
+-- In general, the 'Semigroup' every time a concatenation operator '<>' is applied to an
+-- 'FSNodeTest', the test should become more restrictive.
+--
+-- In order to perform a negation (logical NOT), simply use 'fnot'.
 --
 -- To perform a disjunction (logical OR) of 'FSNodeTest's, use 'eitherFSNodeTest' or
 -- 'anyFSNodeTest', however the 'FileMatcher' functions 'ftest' and the operator @'?->'@ takes a
 -- list of 'FSNodeTest' functions and performs a logical disjunction anyway, so usually the
 -- 'eitherFSNodeTest' function is not necessary, just construct a list of 'FSNodeTest's.
-newtype FSNodeTest st
+data FSNodeTest st
   = FSNodeTest
-    { runFSNodeTest :: FSearchState st -> Bool
-      -- ^ Evaluate an 'FSNodeTest' function on an 'FSearchState' value.
+    { theFSNodeTestMinDepth   :: Maybe (Max SearchDepth)
+      -- minDepth is wrapped in 'Max' so it increases with each concatenation
+    , theFSNodeTestMaxDepth   :: Maybe (Min SearchDepth)
+      -- maxDepth is wrapped in 'Min' so it decreases with each concatenation
+    , theFSNodeTestSearchPath :: Maybe ([FPath] -> All)
+    , theFSNodeTestFileName   :: Maybe (FPath -> All)
+    , theFSNodeTestStatus     :: Maybe (FileStatus -> All)
+    , theFSNodeTestState      :: Maybe (st -> All)
     }
 
 instance Semigroup (FSNodeTest st) where
-  a <> b = FSNodeTest $ \ file -> runFSNodeTest a file && runFSNodeTest b file
+  (FSNodeTest a1 a2 a3 a4 a5 a6) <> (FSNodeTest b1 b2 b3 b4 b5 b6) =
+    FSNodeTest (a1<>b1) (a2<>b2) (a3<>b3) (a4<>b4) (a5<>b5) (a6<>b6)  
 
-instance Monoid (FSNodeTest st) where
-  mempty = FSNodeTest $ const True
-  mappend = (<>)
+instance Monoid (FSNodeTest st) where { mempty = emptyFSNodeTest; mappend = (<>); }
 
+emptyFSNodeTest :: FSNodeTest st
+emptyFSNodeTest = let n = Nothing in FSNodeTest n n n n n n
+
+fsNodeTestMinDepth :: Lens' (FSNodeTest st) (Maybe (Max SearchDepth))
+fsNodeTestMinDepth = lens theFSNodeTestMinDepth $ \ a b -> a{ theFSNodeTestMinDepth = b }
+
+fsNodeTestMaxDepth :: Lens' (FSNodeTest st) (Maybe (Min SearchDepth))
+fsNodeTestMaxDepth = lens theFSNodeTestMaxDepth $ \ a b -> a{ theFSNodeTestMaxDepth = b }
+
+fsNodeTestSearchPath :: Lens' (FSNodeTest st) (Maybe ([FPath] -> All))
+fsNodeTestSearchPath = lens theFSNodeTestSearchPath $ \ a b -> a{ theFSNodeTestSearchPath = b }
+
+fsNodeTestFileName :: Lens' (FSNodeTest st) (Maybe (FPath -> All))
+fsNodeTestFileName = lens theFSNodeTestFileName $ \ a b -> a{ theFSNodeTestFileName = b }
+
+fsNodeTestStatus   :: Lens' (FSNodeTest st) (Maybe (FileStatus -> All))
+fsNodeTestStatus = lens theFSNodeTestStatus $ \ a b -> a{ theFSNodeTestStatus = b }
+
+fsNodeTestState    :: Lens' (FSNodeTest st) (Maybe (st -> All))
+fsNodeTestState = lens theFSNodeTestState $ \ a b -> a{ theFSNodeTestState = b }
+
+-- evaluate 'not' on the result of an 'All' predicate within a 'Maybe' constructor.
+mAllNot :: Maybe (n -> All) -> Maybe (n -> All)
+mAllNot = fmap (fmap (All . not . getAll))
+
+-- | Compute the logical inversion the 'FSNodeTest', i.e. if the test fails then the 'fnot' of the
+-- test passes. This inversion is not applied to 'fsNodeTestMinDepth' or 'fsNodeTestMaxDepth'.
 fnot :: FSNodeTest st -> FSNodeTest st
-fnot (FSNodeTest test) = FSNodeTest $ not . test
+fnot = (fsNodeTestSearchPath %~ mAllNot) . (fsNodeTestFileName %~ mAllNot) .
+       (fsNodeTestStatus     %~ mAllNot) . (fsNodeTestState    %~ mAllNot)
+
+-- logical disjunction of two conjunctive predicates wrapped in 'Maybe' data types.
+mAllOR :: Maybe (n -> All) -> Maybe (n -> All) -> Maybe (n -> All)
+mAllOR b a = (\ a b n -> All $ getAll (a n) || getAll (b n)) <$> a <*> b <|> a <|> b
+
+-- Use a lens to apply 'mAllOR' to a logical field within two 'FSNodeTests'.
+mAllORlens
+  :: Lens' (FSNodeTest st) (Maybe (n -> All))
+  -> FSNodeTest st -> State (FSNodeTest st) ()
+mAllORlens lens b = lens %= mAllOR (b ^. lens)
 
 -- | Perform a disjunction (logical OR) of 'FSNodeTest's, use 'eitherFSNodeTest' or
 -- 'anyFSNodeTest'. To perform a negation (logical NOT) use 'fnot'
 eitherFSNodeTest :: FSNodeTest st -> FSNodeTest st -> FSNodeTest st
-eitherFSNodeTest a b = FSNodeTest $ \ file -> runFSNodeTest a file || runFSNodeTest b file
+eitherFSNodeTest = flip $ \ b -> execState $ do
+  mAllORlens fsNodeTestSearchPath b
+  mAllORlens fsNodeTestFileName   b
+  mAllORlens fsNodeTestStatus     b
+  mAllORlens fsNodeTestState      b
 
 -- | Fold 'eitherFSNodeTest' on a list of 'FSNodeTest's, this is the 'FSNodeTest' analogue of the
 -- 'Prelude.or' function.
 anyFSNodeTest :: [FSNodeTest st] -> FSNodeTest st
-anyFSNodeTest = \ case { [] -> FSNodeTest $ const False; a:ax -> foldl eitherFSNodeTest a ax }
-
--- | This function evaluates any predicate on the 'theCurrentFSNode' while evaluating a
--- 'FileMatcher' function.
-fsNodePredicate :: (FSNode -> Bool) -> FSNodeTest st
-fsNodePredicate = FSNodeTest . (. theCurrentFSNode)
+anyFSNodeTest = foldl eitherFSNodeTest mempty
 
 -- | This function converts a predicate on a 'System.Posix.Files.FileStatus' value and converts it
 -- to a 'FSNodeTest' predicate. This means you pass a predicate function from the
 -- "System.Posix.Files" module, and produce a 'FSNodeTest' function that evaluates the predicate on
 -- the 'fsNodeStat' property of an 'FSNode' data type.
-fsPredicate :: (FileStatus -> Bool) -> FSNodeTest st
-fsPredicate = fsNodePredicate . (. fsNodeStat)
+fStatusPredicate :: (FileStatus -> Bool) -> FSNodeTest st
+fStatusPredicate f = emptyFSNodeTest{ theFSNodeTestStatus = Just $ All <$> f }
 
 -- | Matches directories
 dir :: FSNodeTest st
-dir = fsPredicate isDirectory
+dir = fStatusPredicate isDirectory
 
 -- | Matches regular files
 file :: FSNodeTest st
-file = fsPredicate isRegularFile
+file = fStatusPredicate isRegularFile
 
 -- | Matches UNIX sockets
 socket :: FSNodeTest st
-socket = fsPredicate isSocket
+socket = fStatusPredicate isSocket
 
 -- | Matches UNIX named pipes, also sometimes called "FIFOs".
 fifo :: FSNodeTest st
-fifo = fsPredicate isNamedPipe
+fifo = fStatusPredicate isNamedPipe
 
 -- | Matches symbolic links
 link :: FSNodeTest st
-link = fsPredicate isSymbolicLink
+link = fStatusPredicate isSymbolicLink
 
 -- | Evaluates a predicate on the 'fsNodeName' of an 'FSNode'.
 fNamePredicate :: (FPath -> Bool) -> FSNodeTest st
-fNamePredicate = fsNodePredicate . (. fsNodeName)
+fNamePredicate f = emptyFSNodeTest{ theFSNodeTestFileName = Just $ All <$> f }
 
 -- | File name (the basename) matches the exact string given:
 isNamed :: FPath -> FSNodeTest st
@@ -339,13 +382,13 @@ noMatch = pure $ FileMatchResult True empty
 
 -- | Output the file being scrutinized, but do not step into this subdirectory if the current match
 -- is scrutinizing a subdirectory.
-matchPrune :: Monad m => FileMatcher st m (FileMatchResult FSNode)
-matchPrune = FileMatchResult False . pure <$> asks theCurrentFSNode
+matchPrune :: Monad m => FileMatcher st m (FileMatchResult FPath)
+matchPrune = FileMatchResult False . pure <$> fullPath
 
 -- | Output the file being scrutinized, and do step into this subdirectory if the current match is
 -- scrutinizing a subdirectory.
-match :: Monad m => FileMatcher st m (FileMatchResult FSNode)
-match = FileMatchResult True . pure <$> asks theCurrentFSNode
+match :: MonadIO m => FileMatcher st m (FileMatchResult FSNode)
+match = FileMatchResult True . pure <$> fileNode
 
 -- | If this file match is scrutinizing a directory, the 'search' function must decide whether to
 -- step into this directory (depth first), set this value to tell 'search' whether or not to do
@@ -372,8 +415,8 @@ newtype FileMatcher st m a
 
 instance Monad m => MonadState st (FileMatcher st m) where
   state f = FileMatcher $ state $ \ st ->
-    let (a, ust) = f $ st ^. currentUserState
-    in  (a, st & currentUserState .~ ust)
+    let (a, ust) = f $ st ^. currentUserStateLens
+    in  (a, st & currentUserStateLens .~ ust)
 
 instance Monad m => MonadReader (FSearchState st) (FileMatcher st m) where
   ask = FileMatcher $ lift get
@@ -384,44 +427,114 @@ instance Monad m => MonadReader (FSearchState st) (FileMatcher st m) where
 -- | This function contains the current state of a 'search' operation.
 data FSearchState st
   = FSearchState
-    { theCurrentFSNode      :: FSNode
+    { theCurrentFileName    :: FPath
     , theCurrentSearchPath  :: [FPath]
+    , theCurrentFileStatus  :: Maybe FileStatus
+    , theCurrentFullPath    :: Maybe FPath
     , theCurrentSearchDepth :: SearchDepth
     , theCurrentUserState   :: st
     }
   deriving Functor
 
-currentFSNode :: Lens' (FSearchState st) FSNode
-currentFSNode = lens theCurrentFSNode $ \ a b -> a{ theCurrentFSNode = b }
+currentFileNameLens :: Lens' (FSearchState st) FPath
+currentFileNameLens = lens theCurrentFileName $ \ a b -> a{ theCurrentFileName = b }
 
-currentSearchPath :: Lens' (FSearchState st) [FPath]
-currentSearchPath = lens theCurrentSearchPath $ \ a b -> a{ theCurrentSearchPath = b }
+currentFileStatusLens :: Lens' (FSearchState st) (Maybe FileStatus)
+currentFileStatusLens = lens theCurrentFileStatus $ \ a b -> a{ theCurrentFileStatus = b }
 
-currentSearchDepth :: Lens' (FSearchState st) SearchDepth
-currentSearchDepth = lens theCurrentSearchDepth $ \ a b -> a{ theCurrentSearchDepth = b }
+currentFullPathLens :: Lens' (FSearchState st) (Maybe FPath)
+currentFullPathLens = lens theCurrentFullPath $ \ a b -> a{ theCurrentFullPath = b }
 
-currentUserState :: Lens' (FSearchState st) st
-currentUserState = lens theCurrentUserState $ \ a b -> a{ theCurrentUserState = b }
+currentSearchPathLens :: Lens' (FSearchState st) [FPath]
+currentSearchPathLens = lens theCurrentSearchPath $ \ a b -> a{ theCurrentSearchPath = b }
+
+currentSearchDepthLens :: Lens' (FSearchState st) SearchDepth
+currentSearchDepthLens = lens theCurrentSearchDepth $ \ a b -> a{ theCurrentSearchDepth = b }
+
+currentUserStateLens :: Lens' (FSearchState st) st
+currentUserStateLens = lens theCurrentUserState $ \ a b -> a{ theCurrentUserState = b }
+
+-- | Get the name of the current file being scrutinized.
+fileName :: Monad m => FileMatcher st m FPath
+fileName = view currentFileNameLens
+
+-- | Get the name of the path that has been walked up to the current file being scrutinized. The
+-- 'fileName' is not included, and the path is in 'reverse' order, meaning the first (top-most)
+-- subdirectory scanned is the final item in the list while the 'head' of the list is the latest
+-- (bottom-most) subdirectory to have been scanned.q
+searchPath :: Monad m => FileMatcher st m [FPath]
+searchPath = view currentSearchPathLens
+
+-- | Join 'fileName' and 'searchPath' together into a single long 'FPath' value using the @('</>')@
+-- operator.
+fullPath :: Monad m => FileMatcher st m FPath
+fullPath = view currentFullPathLens >>= flip maybe return
+  (do path <- pack <$> (foldr (</>) <$> (unpack <$> fileName) <*> (fmap unpack <$> searchPath))
+      FileMatcher $ currentFullPathLens .= Just path
+      return path
+  )
+
+-- | Obtain the 'FileStatus' of the current file being scrutinized. If the 'FileStatus' has not
+-- already been obtained from the filesystem, the 'getFileStatus' function is called.
+fileStatus :: MonadIO m => FileMatcher st m FileStatus
+fileStatus = view currentFileStatusLens >>= flip maybe return
+  (do stat <- fullPath >>= liftIO . getFileStatus . unpack
+      FileMatcher $ currentFileStatusLens .= Just stat
+      return stat
+  )
+
+-- | Obtain an 'FSNode' for the current file being scrutinized.
+fileNode :: MonadIO m => FileMatcher st m FSNode
+fileNode = FSNode
+  <$> (pack . foldr (</>) "" . fmap unpack <$> searchPath)
+  <*> fileName
+  <*> fileStatus
+
+-- | Return a number indicating how many levels deep into the filesystem tree that this search has
+-- traversed.
+searchDepth :: Monad m => FileMatcher st m SearchDepth
+searchDepth = view currentSearchDepthLens
 
 -- not for export
+--
+-- Evaluation requires an 'FSearchState' value, and it would be best if this data type is not
+-- exported or manipulated by the users in any way, the content needs to be set mechanically for it
+-- to be useful.
 runFileMatcher
   :: Monad m => FileMatcher st m a -> FSearchState st -> m (Maybe a, FSearchState st)
 runFileMatcher (FileMatcher f) = runStateT (runMaybeT f)
+
+iff :: Monad m => m a -> m a -> Bool -> m a
+iff yes no pass = if pass then yes else no
+
+evalFSNodeTest :: forall st m . MonadIO m => FSNodeTest st -> FileMatcher st m Bool
+evalFSNodeTest test =
+  eval theFSNodeTestState      get        $
+  eval theFSNodeTestFileName   fileName   $
+  eval theFSNodeTestSearchPath searchPath $
+  eval theFSNodeTestStatus     fileStatus $
+  return True where
+    eval :: (FSNodeTest st -> Maybe (a -> All))
+         -> FileMatcher st m a
+         -> FileMatcher st m Bool
+         -> FileMatcher st m Bool
+    eval take f next =
+      maybe (return True) ((<$> f) . fmap getAll) (take test) >>= iff next (return False)
 
 -- | Evaluate a 'FSNodeTest' on the current 'FSearchState' (the value returned by 'ask') in the
 -- contest of a 'FileMatcher' function, if the 'FSNodeTest' succeeds, evaluate the given
 -- 'FileMatcher' action. The '?->' infix operator is identical to this function.
 ftest
-  :: Monad m
+  :: MonadIO m
   => [FSNodeTest st] -> FileMatcher st m (FileMatchResult a)
   -> FileMatcher st m (FileMatchResult a)
-ftest preds action = do
-  result <- runFSNodeTest (anyFSNodeTest preds) <$> ask
-  if result then action else noMatch
+ftest = flip $ \ action -> fix $ \ loop -> \ case
+  []   -> empty
+  a:ax -> evalFSNodeTest a >>= iff action (loop ax)
 infixr 1 `ftest`
 
 (?->)
-  :: Monad m => [FSNodeTest st] -> FileMatcher st m (FileMatchResult a)
+  :: MonadIO m => [FSNodeTest st] -> FileMatcher st m (FileMatchResult a)
   -> FileMatcher st m (FileMatchResult a)
 (?->) = ftest
 infixr 1 ?->
@@ -430,7 +543,7 @@ infixr 1 ?->
 
 -- | This function type is used to evaluate a mapping over the files in a file system, performing a
 -- fold as it goes. It lifts the 'ContT' monad transformer so that you can make use of 'callCC', the
--- return type @cr@ is determined by the 'runFSFoldMap' function evaluation.
+-- continuation return type @cr@ is determined by the 'runFSFoldMap' function evaluation.
 newtype FSFoldMapT cr st m a = FSFoldMapT{ unwrapFSFoldMapT :: ContT cr (StateT st m) (Pipe a) }
   deriving Functor
 
