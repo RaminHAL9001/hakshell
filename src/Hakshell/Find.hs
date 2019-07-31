@@ -5,7 +5,7 @@
 module Hakshell.Find
   ( -- * Executing a Filesystem Query
 
-    FSFoldMapT, runFSFoldMapT, mapDir, mapDirErr,
+    FSFoldMap, runFSFoldMap, mapDir, mapDirErr,
 
     -- * The 'FPath' datatype
     --
@@ -544,64 +544,78 @@ infixr 1 ?->
 -- | This function type is used to evaluate a mapping over the files in a file system, performing a
 -- fold as it goes. It lifts the 'ContT' monad transformer so that you can make use of 'callCC', the
 -- continuation return type @cr@ is determined by the 'runFSFoldMap' function evaluation.
-newtype FSFoldMapT cr st m a = FSFoldMapT{ unwrapFSFoldMapT :: ContT cr (StateT st m) (Pipe a) }
+newtype FSFoldMap cr st a = FSFoldMap{ unwrapFSFoldMap :: ContT cr (StateT st IO) (Pipe a) }
   deriving Functor
 
-instance Monad m => Applicative (FSFoldMapT cr st m) where
-  pure = FSFoldMapT . pure . pure
-  (FSFoldMapT f) <*> (FSFoldMapT a) = FSFoldMapT $ (<*>) <$> f <*> a
+type FSFoldMapHalt cr st a = (forall void . a -> FSFoldMap cr st void)
 
-instance Monad m => Alternative (FSFoldMapT cr st m) where
-  empty = FSFoldMapT $ return empty
-  (FSFoldMapT a) <|> (FSFoldMapT b) = FSFoldMapT $ (<|>) <$> a <*> b
+instance Applicative (FSFoldMap cr st) where
+  pure = FSFoldMap . pure . pure
+  (FSFoldMap f) <*> (FSFoldMap a) = FSFoldMap $ (<*>) <$> f <*> a
 
-instance Monad m => Monad (FSFoldMapT cr st m) where
-  return = FSFoldMapT . return . pure
-  (FSFoldMapT a) >>= f = FSFoldMapT $ fmap (unwrapFSFoldMapT . f) <$> a >>= fmap join . sequence
+instance Alternative (FSFoldMap cr st) where
+  empty = FSFoldMap $ return empty
+  (FSFoldMap a) <|> (FSFoldMap b) = FSFoldMap $ (<|>) <$> a <*> b
 
-instance Monad m => MonadPlus (FSFoldMapT cr st m) where { mzero = empty; mplus = (<|>); }
+instance Monad (FSFoldMap cr st) where
+  return = FSFoldMap . return . pure
+  (FSFoldMap a) >>= f = FSFoldMap $ fmap (unwrapFSFoldMap . f) <$> a >>= fmap join . sequence
 
-instance Monad m => MonadState st (FSFoldMapT cr st m) where
-  state = FSFoldMapT . fmap pure . state
+instance MonadPlus (FSFoldMap cr st) where { mzero = empty; mplus = (<|>); }
 
-instance Monad m => MonadCont (FSFoldMapT cr st m) where
-  callCC a = FSFoldMapT $ callCC $ \ b -> unwrapFSFoldMapT $ a (FSFoldMapT . b . pure)
+instance MonadState st (FSFoldMap cr st) where
+  state = FSFoldMap . fmap pure . state
 
-instance MonadTrans (FSFoldMapT cr st) where
-  lift = FSFoldMapT . lift . lift . fmap pure
+instance MonadCont (FSFoldMap cr st) where
+  callCC a = FSFoldMap $ callCC $ \ b -> unwrapFSFoldMap $ a (FSFoldMap . b . pure)
 
-instance MonadIO m => MonadIO (FSFoldMapT cr st m) where
-  liftIO = FSFoldMapT . liftIO . fmap pure
+instance MonadIO (FSFoldMap cr st) where
+  liftIO = FSFoldMap . liftIO . fmap pure
 
-instance Monad m => MonadPipe (FSFoldMapT cr st m) where
-  yield = FSFoldMapT . pure
+instance MonadPipe (FSFoldMap cr st) where
+  yield = FSFoldMap . pure
 
--- | Evaluate an 'FSFoldMapT' function, returning the final return value paired with the final state
+-- | Evaluate an 'FSFoldMap' function, returning the final return value paired with the final state
 -- value.
-runFSFoldMapT :: Monad m => FSFoldMapT cr st m a -> (Pipe a -> StateT st m cr) -> st -> m (cr, st)
-runFSFoldMapT (FSFoldMapT f) = runStateT . runContT f
-
-----------------------------------------------------------------------------------------------------
+runFSFoldMap :: FSFoldMap cr st a -> (Pipe a -> StateT st IO cr) -> st -> IO (cr, st)
+runFSFoldMap (FSFoldMap f) = runStateT . runContT f
 
 -- | Same as 'mapDirErr' except 'IOExceptions' that occur while reading the directory are printed to
 -- 'stderr' and then ignored.
 mapDir
-  :: (FPath -> FPath -> FSFoldMapT cr st IO a)
-  -> FPath -> FSFoldMapT cr st IO a
+  :: (FPath -> FPath -> FSFoldMap cr st a)
+  -> FPath -> FSFoldMap cr st a
 mapDir = mapDirErr $ \ parent err ->
   liftIO (hPutStrLn stderr $ show parent ++ ": " ++ show err) >> empty
 
 -- | Map a function to the contents of a directory, that is to say, the names of each of the files
 -- in the given target directory. First provide an error handling function in the event that a file
--- could not be read, feel free to re-throw the exception, the directory file descriptor will be
+-- could not be read -- feel free to re-throw the exception, the directory file descriptor will be
 -- closed properly if you do.
 mapDirErr
-  :: (FPath -> IOException -> FSFoldMapT cr st IO a)
-  -> (FPath -> FPath -> FSFoldMapT cr st IO a) -> FPath -> FSFoldMapT cr st IO a
+  :: (FPath -> IOException -> FSFoldMap cr st a)
+  -> (FPath -> FPath -> FSFoldMap cr st a) -> FPath -> FSFoldMap cr st a
 mapDirErr catcher f dir = do
   stream <- liftIO $ openDirStream $ unpack dir
   let loop = liftIO (try $ readDirStream stream) >>= \ case
         Right file -> if null file then empty else f dir (pack file) <|> loop
         Left   err -> catcher dir err <|> loop
-  FSFoldMapT $ ContT $ \ next -> StateT $ \ st ->
-    runFSFoldMapT loop next st `finally` closeDirStream stream
+  FSFoldMap $ ContT $ \ next -> StateT $ \ st ->
+    runFSFoldMap loop next st `finally` closeDirStream stream
+
+search
+  :: PipeLike pipe
+  => (FileMatcher st (FSFoldMap cr st) (FileMatchResult a))
+  -> pipe FPath
+  -> FSFoldMap cr st (Pipe a)
+search f paths = callCC $ \ halt -> forM (pipe paths) $ \ path -> do
+  st <- get
+  (match, _) <- runFileMatcher f FSearchState
+    { theCurrentFileName    = path
+    , theCurrentSearchPath  = []
+    , theCurrentFileStatus  = Nothing
+    , theCurrentFullPath    = Nothing
+    , theCurrentSearchDepth = 0
+    , theCurrentUserState   = st
+    }
+  error "TODO: implementation of \"Hakshell.Find.search\" function"
