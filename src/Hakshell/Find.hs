@@ -5,7 +5,7 @@
 module Hakshell.Find
   ( -- * Executing a Filesystem Query
 
-    FSFoldMap, runFSFoldMap, mapDir, mapDirErr,
+    search, FSFoldMap, runFSFoldMap, mapDir, mapDirErr,
 
     -- * The 'FPath' datatype
     --
@@ -77,7 +77,7 @@ module Hakshell.Find
 
     FSearchState, theCurrentFileName,
     theCurrentSearchDepth, SearchDepth(..),
-    theCurrentSearchPath, theCurrentUserState,
+    theCurrentSearchPath,
 
   ) where
 
@@ -382,12 +382,12 @@ noMatch = pure $ FileMatchResult True empty
 
 -- | Output the file being scrutinized, but do not step into this subdirectory if the current match
 -- is scrutinizing a subdirectory.
-matchPrune :: Monad m => FileMatcher st m (FileMatchResult FPath)
+matchPrune :: Monad m => FileMatcher m (FileMatchResult FPath)
 matchPrune = FileMatchResult False . pure <$> fullPath
 
 -- | Output the file being scrutinized, and do step into this subdirectory if the current match is
 -- scrutinizing a subdirectory.
-match :: MonadIO m => FileMatcher st m (FileMatchResult FSNode)
+match :: MonadIO m => FileMatcher m (FileMatchResult FSNode)
 match = FileMatchResult True . pure <$> fileNode
 
 -- | If this file match is scrutinizing a directory, the 'search' function must decide whether to
@@ -407,67 +407,76 @@ fileMatchResult = FileMatchResult True
 
 ----------------------------------------------------------------------------------------------------
 
--- | Functions of this type scrutinize an 'FSNode', evaluating to 'empty' if the 'FSNode' should not
--- be selected. Functions of this type are evaluated by 'find'.
-newtype FileMatcher st m a
-  = FileMatcher (MaybeT (StateT (FSearchState st) m) a)
+-- | Functions of this type scrutinize a file node in the file system. Evaluate functions of this
+-- type using the 'ftest' function, or equivalently, the @('?->')@ operator. The 'ftest' expression
+-- can then be passed as an argument to the 'search' or 'find' functions. For example:
+--
+-- @
+-- 'find' [".\/subdirA", ".\/subdirB"] $
+--     ['file' '<>' 'isNamed' "index.html", 'file' '<>' 'isNamed' "robots.txt"] '?->' 'match' '<|>'
+--     ['dir' '<>' 'isNamed' "pics"] '?->' 'prune'
+-- @
+--
+-- This function is a monad transformer (instantiates the 'MonadTrans' typeclass) for any monadic
+-- type @m@, however it should be understood that @m@ can really only ever be the 'FSFoldMap'
+-- function type. The only reason for 'FileMatcher' to be a monad transformer, rather than simply
+-- lifting 'FSFoldMap', is so that the 'lift' function can be used to lift a 'FSFoldMap' function
+-- into the 'FileMatcher'. It is easier to remember to use 'lift' rather than creating a special
+-- version of 'lift' just for the sake of lifting 'FSFoldMap'.
+newtype FileMatcher m a
+  = FileMatcher (MaybeT (StateT FSearchState m) a)
   deriving (Functor, Applicative, Alternative, Monad, MonadPlus, MonadIO)
 
-instance Monad m => MonadState st (FileMatcher st m) where
-  state f = FileMatcher $ state $ \ st ->
-    let (a, ust) = f $ st ^. currentUserStateLens
-    in  (a, st & currentUserStateLens .~ ust)
+instance MonadTrans FileMatcher where
+  lift = FileMatcher . lift . lift
 
-instance Monad m => MonadReader (FSearchState st) (FileMatcher st m) where
+instance MonadState st (m st) => MonadState st (FileMatcher (m st)) where
+  state = lift . state
+
+instance Monad m => MonadReader FSearchState (FileMatcher m) where
   ask = FileMatcher $ lift get
-  local step (FileMatcher f) = FileMatcher $ (>>= (maybe empty pure)) $ lift $ do
-    oldst <- state $ fmap (const ()) &&& step
-    runMaybeT f <* modify (\ newst -> const (theCurrentUserState newst) <$> oldst)
+  local step (FileMatcher f) = FileMatcher $
+    lift (state $ id &&& step) >>= \ st -> f <* lift (put st)
 
 -- | This function contains the current state of a 'search' operation.
-data FSearchState st
+data FSearchState
   = FSearchState
     { theCurrentFileName    :: FPath
     , theCurrentSearchPath  :: [FPath]
     , theCurrentFileStatus  :: Maybe FileStatus
     , theCurrentFullPath    :: Maybe FPath
     , theCurrentSearchDepth :: SearchDepth
-    , theCurrentUserState   :: st
     }
-  deriving Functor
 
-currentFileNameLens :: Lens' (FSearchState st) FPath
+currentFileNameLens :: Lens' FSearchState FPath
 currentFileNameLens = lens theCurrentFileName $ \ a b -> a{ theCurrentFileName = b }
 
-currentFileStatusLens :: Lens' (FSearchState st) (Maybe FileStatus)
+currentFileStatusLens :: Lens' FSearchState (Maybe FileStatus)
 currentFileStatusLens = lens theCurrentFileStatus $ \ a b -> a{ theCurrentFileStatus = b }
 
-currentFullPathLens :: Lens' (FSearchState st) (Maybe FPath)
+currentFullPathLens :: Lens' FSearchState (Maybe FPath)
 currentFullPathLens = lens theCurrentFullPath $ \ a b -> a{ theCurrentFullPath = b }
 
-currentSearchPathLens :: Lens' (FSearchState st) [FPath]
+currentSearchPathLens :: Lens' FSearchState [FPath]
 currentSearchPathLens = lens theCurrentSearchPath $ \ a b -> a{ theCurrentSearchPath = b }
 
-currentSearchDepthLens :: Lens' (FSearchState st) SearchDepth
+currentSearchDepthLens :: Lens' FSearchState SearchDepth
 currentSearchDepthLens = lens theCurrentSearchDepth $ \ a b -> a{ theCurrentSearchDepth = b }
 
-currentUserStateLens :: Lens' (FSearchState st) st
-currentUserStateLens = lens theCurrentUserState $ \ a b -> a{ theCurrentUserState = b }
-
 -- | Get the name of the current file being scrutinized.
-fileName :: Monad m => FileMatcher st m FPath
+fileName :: Monad m => FileMatcher m FPath
 fileName = view currentFileNameLens
 
 -- | Get the name of the path that has been walked up to the current file being scrutinized. The
 -- 'fileName' is not included, and the path is in 'reverse' order, meaning the first (top-most)
 -- subdirectory scanned is the final item in the list while the 'head' of the list is the latest
 -- (bottom-most) subdirectory to have been scanned.q
-searchPath :: Monad m => FileMatcher st m [FPath]
+searchPath :: Monad m => FileMatcher m [FPath]
 searchPath = view currentSearchPathLens
 
 -- | Join 'fileName' and 'searchPath' together into a single long 'FPath' value using the @('</>')@
 -- operator.
-fullPath :: Monad m => FileMatcher st m FPath
+fullPath :: Monad m => FileMatcher m FPath
 fullPath = view currentFullPathLens >>= flip maybe return
   (do path <- pack <$> (foldr (</>) <$> (unpack <$> fileName) <*> (fmap unpack <$> searchPath))
       FileMatcher $ currentFullPathLens .= Just path
@@ -476,7 +485,7 @@ fullPath = view currentFullPathLens >>= flip maybe return
 
 -- | Obtain the 'FileStatus' of the current file being scrutinized. If the 'FileStatus' has not
 -- already been obtained from the filesystem, the 'getFileStatus' function is called.
-fileStatus :: MonadIO m => FileMatcher st m FileStatus
+fileStatus :: MonadIO m => FileMatcher m FileStatus
 fileStatus = view currentFileStatusLens >>= flip maybe return
   (do stat <- fullPath >>= liftIO . getFileStatus . unpack
       FileMatcher $ currentFileStatusLens .= Just stat
@@ -484,7 +493,7 @@ fileStatus = view currentFileStatusLens >>= flip maybe return
   )
 
 -- | Obtain an 'FSNode' for the current file being scrutinized.
-fileNode :: MonadIO m => FileMatcher st m FSNode
+fileNode :: MonadIO m => FileMatcher m FSNode
 fileNode = FSNode
   <$> (pack . foldr (</>) "" . fmap unpack <$> searchPath)
   <*> fileName
@@ -492,7 +501,7 @@ fileNode = FSNode
 
 -- | Return a number indicating how many levels deep into the filesystem tree that this search has
 -- traversed.
-searchDepth :: Monad m => FileMatcher st m SearchDepth
+searchDepth :: Monad m => FileMatcher m SearchDepth
 searchDepth = view currentSearchDepthLens
 
 -- not for export
@@ -501,13 +510,15 @@ searchDepth = view currentSearchDepthLens
 -- exported or manipulated by the users in any way, the content needs to be set mechanically for it
 -- to be useful.
 runFileMatcher
-  :: Monad m => FileMatcher st m a -> FSearchState st -> m (Maybe a, FSearchState st)
+  :: Monad m => FileMatcher m a -> FSearchState -> m (Maybe a, FSearchState)
 runFileMatcher (FileMatcher f) = runStateT (runMaybeT f)
 
 iff :: Monad m => m a -> m a -> Bool -> m a
 iff yes no pass = if pass then yes else no
 
-evalFSNodeTest :: forall st m . MonadIO m => FSNodeTest st -> FileMatcher st m Bool
+evalFSNodeTest
+  :: forall st m . (MonadIO m, MonadState st (FileMatcher m))
+  => FSNodeTest st -> FileMatcher m Bool
 evalFSNodeTest test =
   eval theFSNodeTestState      get        $
   eval theFSNodeTestFileName   fileName   $
@@ -515,9 +526,9 @@ evalFSNodeTest test =
   eval theFSNodeTestStatus     fileStatus $
   return True where
     eval :: (FSNodeTest st -> Maybe (a -> All))
-         -> FileMatcher st m a
-         -> FileMatcher st m Bool
-         -> FileMatcher st m Bool
+         -> FileMatcher m a
+         -> FileMatcher m Bool
+         -> FileMatcher m Bool
     eval take f next =
       maybe (return True) ((<$> f) . fmap getAll) (take test) >>= iff next (return False)
 
@@ -525,19 +536,20 @@ evalFSNodeTest test =
 -- contest of a 'FileMatcher' function, if the 'FSNodeTest' succeeds, evaluate the given
 -- 'FileMatcher' action. The '?->' infix operator is identical to this function.
 ftest
-  :: MonadIO m
-  => [FSNodeTest st] -> FileMatcher st m (FileMatchResult a)
-  -> FileMatcher st m (FileMatchResult a)
+  :: (MonadIO m, MonadState st (FileMatcher m))
+  => [FSNodeTest st] -> FileMatcher m (FileMatchResult a)
+  -> FileMatcher m (FileMatchResult a)
 ftest = flip $ \ action -> fix $ \ loop -> \ case
   []   -> empty
   a:ax -> evalFSNodeTest a >>= iff action (loop ax)
-infixr 1 `ftest`
+infixl 4 `ftest`
 
 (?->)
-  :: MonadIO m => [FSNodeTest st] -> FileMatcher st m (FileMatchResult a)
-  -> FileMatcher st m (FileMatchResult a)
+  :: (MonadIO m, MonadState st (FileMatcher m))
+  => [FSNodeTest st] -> FileMatcher m (FileMatchResult a)
+  -> FileMatcher m (FileMatchResult a)
 (?->) = ftest
-infixr 1 ?->
+infixl 4 ?->
 
 ----------------------------------------------------------------------------------------------------
 
@@ -605,17 +617,15 @@ mapDirErr catcher f dir = do
 
 search
   :: PipeLike pipe
-  => (FileMatcher st (FSFoldMap cr st) (FileMatchResult a))
+  => (FileMatcher (FSFoldMap cr st) (FileMatchResult a))
   -> pipe FPath
   -> FSFoldMap cr st (Pipe a)
 search f paths = callCC $ \ halt -> forM (pipe paths) $ \ path -> do
-  st <- get
   (match, _) <- runFileMatcher f FSearchState
     { theCurrentFileName    = path
     , theCurrentSearchPath  = []
     , theCurrentFileStatus  = Nothing
     , theCurrentFullPath    = Nothing
     , theCurrentSearchDepth = 0
-    , theCurrentUserState   = st
     }
   error "TODO: implementation of \"Hakshell.Find.search\" function"
