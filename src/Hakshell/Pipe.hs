@@ -131,9 +131,10 @@ instance Monoid a => Monoid (Pipe a) where
   mempty = empty
   mappend a b = mappend <$> a <*> b
 
--- | A pure function to construct a 'Pipe' from a list.
-pipe :: [a] -> Pipe a
-pipe = Pipe . Seq.fromList
+class PipeLike thing where { pipe :: thing a -> Pipe a; }
+instance PipeLike [] where { pipe = Pipe . Seq.fromList; }
+instance PipeLike Seq.Seq where { pipe = Pipe; }
+instance PipeLike Pipe where { pipe = id; }
 
 -- | Return a 'Pipe' containing a single value.
 push :: Applicative m => a -> m (Pipe a)
