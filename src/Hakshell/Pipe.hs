@@ -55,29 +55,29 @@ import qualified Data.ByteString.UTF8  as UTF8
 --   $ 'printC' $ 'Hakshell.Grep.grep' "Haskell"
 --   $ 'printC' 'empty'
 -- @
-type PipeLink m a = Pipe a -> m ()
+type CPS m a = Pipe a -> m ()
 
 -- | This function allows you to bind each input value coming from the input pipeline to a variable
 -- name (hence this function is called 'var'), and evaluate an applicative function with that bound
--- value before the next stage of the 'PipeLink' receives that input value.
+-- value before the next stage of the 'CPS' receives that input value.
 --
 -- An example of how you would use this function:
 --
 -- @
 --
 -- @
-var :: Applicative m => (a -> m ()) -> PipeLink m a -> PipeLink m a
+var :: Applicative m => (a -> m ()) -> CPS m a -> CPS m a
 var f next = traverse_ $ \ a -> f a *> next (pure a)
 
 -- | Similar to the @tee@ program used in command line environments in various UNIX and Linux
 -- systems. This functino uses 'var' to bind an input to a variable, then this variable is copied to
 -- the input of a list of several functions.
-tee :: Applicative m => [a -> m ()] -> PipeLink m a -> PipeLink m a
+tee :: Applicative m => [a -> m ()] -> CPS m a -> CPS m a
 tee targets = var $ \ a -> traverse_ ($ a) targets
 
 -- | Makes use of the 'var' function to print to 'System.IO.stdout' each item before passing it to
--- the next 'PipeLink'.
-printC :: (MonadIO m, Show a) => PipeLink m a -> PipeLink m a
+-- the next 'CPS'.
+printC :: (MonadIO m, Show a) => CPS m a -> CPS m a
 printC = var $ liftIO . print
 
 ----------------------------------------------------------------------------------------------------
