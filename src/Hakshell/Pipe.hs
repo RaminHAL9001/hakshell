@@ -66,19 +66,19 @@ type CPS m a = Pipe a -> m ()
 -- @
 --
 -- @
-var :: Applicative m => (a -> m ()) -> CPS m a -> CPS m a
-var f next = traverse_ $ \ a -> f a *> next (pure a)
+var :: Applicative m => (a -> CPS m a) -> CPS m a
+var f = traverse_ $ \ a -> f a $ pure a
 
 -- | Similar to the @tee@ program used in command line environments in various UNIX and Linux
 -- systems. This functino uses 'var' to bind an input to a variable, then this variable is copied to
 -- the input of a list of several functions.
-tee :: Applicative m => [a -> m ()] -> CPS m a -> CPS m a
-tee targets = var $ \ a -> traverse_ ($ a) targets
+tee :: Applicative m => [a -> CPS m a] -> CPS m a
+tee targets = var $ \ a next -> traverse_ (\ f -> f a next) targets
 
 -- | Makes use of the 'var' function to print to 'System.IO.stdout' each item before passing it to
 -- the next 'CPS'.
 printC :: (MonadIO m, Show a) => CPS m a -> CPS m a
-printC = var $ liftIO . print
+printC cont = var $ \ a next -> liftIO (print a) >> cont next
 
 ----------------------------------------------------------------------------------------------------
 
