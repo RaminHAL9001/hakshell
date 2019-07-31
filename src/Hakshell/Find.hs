@@ -5,7 +5,7 @@
 module Hakshell.Find
   ( -- * Executing a Filesystem Query
 
-    search, FSFoldMap, runFSFoldMap, mapDir, mapDirErr,
+    search, foldMapFS, FSFoldMap, runFSFoldMap, mapDir, mapDirErr,
 
     -- * The 'FPath' datatype
     --
@@ -615,8 +615,8 @@ infixl 4 ?->
 -- contest of a 'FileMatcher' function, if the 'FSNodeTest' succeeds, evaluate the given
 -- 'FileMatcher' action. 
 runFTest
-  :: FTest st a -> FSearchState st
-  -> (FSearchState st -> FileMatchResult a -> FSFoldMap cr st a)
+  :: FTest st file -> FSearchState st
+  -> (FSearchState st -> FileMatchResult file -> FSFoldMap cr st a)
   -> FSFoldMap cr st a
 runFTest test st action = case fTestPredicate test of
   []   -> empty
@@ -653,18 +653,45 @@ mapDirErr catcher f dir = do
   FSFoldMap $ ContT $ \ next -> StateT $ \ st ->
     runFSFoldMap loop next st `finally` closeDirStream stream
 
-searchLoop :: FTest st a -> FSFoldMapHalt cr st a -> FSearchState st -> FSFoldMap cr st a
-searchLoop f halt st = runFTest f st $ \ st result -> yield (theFileMatchYield result) <|> do
-  guard $ theFileMatchStepInto result
-  maybeGetFileStatus st >>= guard . isDirectory
-  flip mapDir (st ^. currentFileNameLens) $ \ _parent path -> searchLoop f halt $
-    st{ theCurrentFileName    = path
-      , theCurrentSearchPath  = theCurrentFileName st : theCurrentSearchPath st
-      , theCurrentFileStatus  = Nothing
-      , theCurrentFullPath    = Nothing
-      , theCurrentSearchDepth = 1 + theCurrentSearchDepth st
-      }
+-- not for export -- too complicated to be useful
+searchLoop
+  :: FTest st file -> FSFoldMapHalt cr st a -> FSearchState st
+  -> (file -> FSFoldMap cr st a)
+  -> FSFoldMap cr st a
+searchLoop test halt st cont =
+  runFTest test st $ \ st result -> (yield (theFileMatchYield result) >>= cont) <|> do
+    guard $ theFileMatchStepInto result
+    maybeGetFileStatus st >>= guard . isDirectory
+    flip mapDir (st ^. currentFileNameLens) $ \ _parent path -> flip (searchLoop test halt) cont $
+      st{ theCurrentFileName    = path
+        , theCurrentSearchPath  = theCurrentFileName st : theCurrentSearchPath st
+        , theCurrentFileStatus  = Nothing
+        , theCurrentFullPath    = Nothing
+        , theCurrentSearchDepth = 1 + theCurrentSearchDepth st
+        }
 
-search :: PipeLike pipe => pipe FPath -> FTest st a -> FSFoldMap cr st a
-search paths test = callCC $ \ halt -> forM (pipe paths)
-  (\ path -> get >>= searchLoop test (FSFoldMapHalt halt) . initFSearchState path) >>= yield
+-- | This function works somewhat similar to how the @find@ program works in a command line
+-- environment on a typical UNIX or Linux system. The 'FTest' is used to determine which files are
+-- selected, and on each selected file a function of type 'FSFoldMap' can be evaluated. A slightly
+-- more complex version of this function, 'foldMapFS' allows you to pass a stateful value that can
+-- be updated on each found @file@.
+search
+  :: FTest () file
+  -> (file -> FSFoldMap (Pipe a) () a)
+  -> (Pipe FPath -> IO ())
+search test = foldMapFS test () (const . pure)
+
+-- | Like 'search', but provide a state value to fold values into as the 'search' operation
+-- proceeds. Also it is necessary to provide a final evaluator
+foldMapFS
+  :: FTest st file -- ^ the file selection rules
+  -> st -- ^ the initial state
+  -> (st -> Pipe a -> IO ()) -- ^ the final action to evaluate, after 'search' completes
+  -> (file -> FSFoldMap (Pipe a) st a) -- ^ the action to evaluate on each file found.
+  -> (Pipe FPath -> IO ())
+foldMapFS test st final cont paths = runFSFoldMap
+  ( callCC $ \ halt ->
+      ( forM paths $ \ path ->
+          get >>= flip (searchLoop test (FSFoldMapHalt halt)) cont . initFSearchState path
+      ) >>= yield
+  ) return st >>= uncurry (flip final)
