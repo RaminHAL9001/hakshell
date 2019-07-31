@@ -262,12 +262,6 @@ instance Monoid (FSNodeTest st) where { mempty = emptyFSNodeTest; mappend = (<>)
 emptyFSNodeTest :: FSNodeTest st
 emptyFSNodeTest = let n = Nothing in FSNodeTest n n n n n n
 
-fsNodeTestMinDepth :: Lens' (FSNodeTest st) (Maybe (Max SearchDepth))
-fsNodeTestMinDepth = lens theFSNodeTestMinDepth $ \ a b -> a{ theFSNodeTestMinDepth = b }
-
-fsNodeTestMaxDepth :: Lens' (FSNodeTest st) (Maybe (Min SearchDepth))
-fsNodeTestMaxDepth = lens theFSNodeTestMaxDepth $ \ a b -> a{ theFSNodeTestMaxDepth = b }
-
 fsNodeTestSearchPath :: Lens' (FSNodeTest st) (Maybe ([FPath] -> All))
 fsNodeTestSearchPath = lens theFSNodeTestSearchPath $ \ a b -> a{ theFSNodeTestSearchPath = b }
 
@@ -362,6 +356,7 @@ data FileMatchResult a
       -- to step into this directory (depth first), set this value to tell 'search' whether or not
       -- to do so. Setting this value to 'False' will prune the directory under scrutiny from
       -- recursively being 'search'ed.
+    , theFileMatchMaxDepth :: Maybe SearchDepth
     , theFileMatchYield    :: Pipe a
       -- ^ A file match result may yield zero or more values.
     }
@@ -370,23 +365,23 @@ data FileMatchResult a
 -- | This function is used within a 'FileMatcher' function. Do not output a value, do not step into
 -- this subdirectory if the current match is scrutinizing a subdirectory,
 prune :: Applicative m => m (FileMatchResult a)
-prune = pure $ FileMatchResult False empty
+prune = pure $ FileMatchResult False Nothing empty
 
 -- | This function is used within a 'FileMatcher' function. Do not output any value, but do step
 -- into this subdirectory if the current match is scrutinizing a subdirectory. This is the default
 -- behavior for the 'ftest' function.
 noMatch :: Applicative m => m (FileMatchResult a)
-noMatch = pure $ FileMatchResult True empty
+noMatch = pure $ FileMatchResult True Nothing empty
 
 -- | Output the file being scrutinized, but do not step into this subdirectory if the current match
 -- is scrutinizing a subdirectory.
 matchPrune :: FileMatcher st (FileMatchResult FPath)
-matchPrune = FileMatchResult False . pure <$> fullPath
+matchPrune = FileMatchResult False Nothing . pure <$> fullPath
 
 -- | Output the file being scrutinized, and do step into this subdirectory if the current match is
 -- scrutinizing a subdirectory.
 match :: FileMatcher st (FileMatchResult FSNode)
-match = FileMatchResult True . pure <$> fileNode
+match = FileMatchResult True Nothing . pure <$> fileNode
 
 -- | If this file match is scrutinizing a directory, the 'search' function must decide whether to
 -- step into this directory (depth first), set this value to tell 'search' whether or not to do
@@ -398,10 +393,13 @@ fileMatchStepInto = lens theFileMatchStepInto $ \ a b -> a{ theFileMatchStepInto
 fileMatchYield :: Lens' (FileMatchResult a) (Pipe a)
 fileMatchYield = lens theFileMatchYield $ \ a b -> a{ theFileMatchYield = b }
 
+fileMatchMaxDepth :: Lens' (FileMatchResult a) (Maybe SearchDepth)
+fileMatchMaxDepth = lens theFileMatchMaxDepth $ \ a b -> a{ theFileMatchMaxDepth = b }
+
 -- | Construct a default 'FileMatch' value, the default behavior is to set the 'fileMatchStepInto'
 -- value to 'True'.
 fileMatchResult :: Pipe a -> FileMatchResult a
-fileMatchResult = FileMatchResult True
+fileMatchResult = FileMatchResult True Nothing
 
 ----------------------------------------------------------------------------------------------------
 
@@ -543,6 +541,7 @@ iff yes no pass = if pass then yes else no
 
 evalFSNodeTest :: forall st . FSNodeTest st -> FileMatcher st Bool
 evalFSNodeTest test =
+  eval (fmap (fmap All . (<=) . getMax) . theFSNodeTestMinDepth) searchDepth $
   eval theFSNodeTestState      searchState $
   eval theFSNodeTestFileName   fileName    $
   eval theFSNodeTestSearchPath searchPath  $
@@ -621,7 +620,10 @@ runFTest test st action = case fTestPredicate test of
   p:px -> do
     (decision, st) <- liftIO $ flip runFileMatcher st $
       evalFSNodeTest p >>= iff (fTestDecision test) empty
-    maybe (runFTest (test{ fTestPredicate = px }) st action) (action st) decision
+    maybe
+      (runFTest (test{ fTestPredicate = px }) st action)
+      (action st . (fileMatchMaxDepth .~ (getMin <$> theFSNodeTestMaxDepth p)))
+      decision
 
 -- | Evaluate an 'FSFoldMap' function, returning the final return value paired with the final state
 -- value.
@@ -659,13 +661,14 @@ searchLoop
 searchLoop test halt st cont =
   runFTest test st $ \ st result -> (yield (theFileMatchYield result) >>= cont) <|> do
     guard $ theFileMatchStepInto result
+    guard $ maybe True ((theSearchDepth st) <=) (theFileMatchMaxDepth result)
     maybeGetFileStatus st >>= guard . isDirectory
     flip mapDir (st ^. searchFileNameLens) $ \ _parent path -> flip (searchLoop test halt) cont $
-      st{ theSearchFileName    = path
+      st{ theSearchFileName   = path
         , theSearchDirectory  = theSearchFileName st : theSearchDirectory st
-        , theSearchFileStatus  = Nothing
-        , theSearchFullPath    = Nothing
-        , theSearchDepth = 1 + theSearchDepth st
+        , theSearchFileStatus = Nothing
+        , theSearchFullPath   = Nothing
+        , theSearchDepth      = 1 + theSearchDepth st
         }
 
 -- | This function works somewhat similar to how the @find@ program works in a command line
