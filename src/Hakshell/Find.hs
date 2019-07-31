@@ -678,7 +678,7 @@ searchLoop test halt st cont =
 search
   :: FTest () file
   -> (file -> FSFoldMap (Pipe a) () a)
-  -> (Pipe FPath -> IO ())
+  -> PipeLink IO FPath
 search test = foldMapFS test () (const . pure)
 
 -- | Like 'search', but provide a state value to fold values into as the 'search' operation
@@ -686,9 +686,9 @@ search test = foldMapFS test () (const . pure)
 foldMapFS
   :: FTest st file -- ^ the file selection rules
   -> st -- ^ the initial state
-  -> (st -> Pipe a -> IO ()) -- ^ the final action to evaluate, after 'search' completes
+  -> (st -> PipeLink IO a) -- ^ the final action to evaluate, after 'search' completes
   -> (file -> FSFoldMap (Pipe a) st a) -- ^ the action to evaluate on each file found.
-  -> (Pipe FPath -> IO ())
+  -> PipeLink IO FPath
 foldMapFS test st final cont paths = runFSFoldMap
   ( callCC $ \ halt ->
       ( forM paths $ \ path ->

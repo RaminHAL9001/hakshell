@@ -44,6 +44,32 @@ import qualified Data.ByteString.UTF8  as UTF8
 
 ----------------------------------------------------------------------------------------------------
 
+-- | Most functions in the @hakshell@ library are defined to written in the Continuation Passing
+-- Style (CPS), because CPS allows to more easily compose functions in a way similar to how typical
+-- UNIX or Linux command line programs can be composed by using the pipe syntax. In the case of
+-- @hakshell@, composition is done with the dollar sign @('$')@ operator. For example:
+--
+-- @
+-- 'foreach' ["./src", "./tests"]
+--   $ 'Hakshell.Find.search' ['Hakshell.Find.file' 'Data.Semigroup.<>' 'Hakshell.Find.isNamed' "./notes.txt"]
+--   $ 'printC' $ 'Hakshell.Grep.grep' "Haskell"
+--   $ 'printC' 'empty'
+-- @
+type PipeLink m a = Pipe a -> m ()
+
+-- | This function allows you to bind each input value coming from the input pipeline to a variable
+-- name (hence this function is called 'var'), and evaluate an applicative function with that bound
+-- value before the next stage of the 'PipeLink' receives that input value.
+var :: Applicative m => (a -> m ()) -> PipeLink m a -> PipeLink m a
+var f next = traverse_ $ \ a -> f a *> next (pure a)
+
+-- | Makes use of the 'var' function to print to 'System.IO.stdout' each item before passing it to
+-- the next 'PipeLink'.
+printC :: (MonadIO m, Show a) => PipeLink m a -> PipeLink m a
+printC = var $ liftIO . print
+
+----------------------------------------------------------------------------------------------------
+
 -- | /"Ceci n'est pas un pipe."/  -- Rene Magrite
 --
 -- 'Pipe' is a data type used to approximate the behavior of UNIX pipes.
@@ -146,14 +172,12 @@ pushList = pure . Pipe . Seq.fromList
 
 -- | Similar to 'forM', but evaluates a function on each element of a list, and each item is
 -- 'yield'ed in turn.
-pipeEach :: Applicative m => [a] -> (a -> m b) -> m (Pipe b)
-pipeEach = flip mapToPipe
+foreach :: (Applicative m, PipeLike pipe) => pipe a -> (a -> m b) -> m (Pipe b)
+foreach = flip mapToPipe
 
 -- | Same as 'foreach' but with the parameters flipped.
-mapToPipe :: Applicative m => (a -> m b) -> [a] -> m (Pipe b)
-mapToPipe f = \ case
-  []   -> pure empty
-  a:ax -> Pipe <$> ((Seq.<|) <$> f a <*> (unwrapPipe <$> mapToPipe f ax))
+mapToPipe :: (Applicative m, PipeLike pipe) => (a -> m b) -> pipe a -> m (Pipe b)
+mapToPipe f = traverse f . pipe
 
 -- | Perform a single step on the next element of a 'Pipe'. This function automatically handles
 -- errors and halting conditions, and serves as a drop-in replacement for any expression that uses a
