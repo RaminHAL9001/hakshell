@@ -76,9 +76,7 @@ module Hakshell.Find
     -- directly, rather you will evaluate some of the pre-defined predicates like 'file' or 'dir'
     -- using the 'ftest' function or the @('?->')@ operator.
 
-    FSearchState, theCurrentFileName,
-    theCurrentSearchDepth, SearchDepth(..),
-    theCurrentSearchPath,
+    SearchDepth(..),
 
   ) where
 
@@ -423,27 +421,27 @@ newtype FileMatcher st a
 
 instance MonadState st (FileMatcher st) where
   state f = FileMatcher $ lift $ state $ \ st0 ->
-    let (a, st) = f (st0 ^. currentUserStateLens) in (a, st0 & currentUserStateLens .~ st)
+    let (a, st) = f (st0 ^. searchUserStateLens) in (a, st0 & searchUserStateLens .~ st)
 
 -- | This function contains the current state of a 'search' operation.
 data FSearchState st
   = FSearchState
-    { theCurrentFileName    :: FPath
-    , theCurrentSearchPath  :: [FPath]
-    , theCurrentFileStatus  :: Maybe FileStatus
-    , theCurrentFullPath    :: Maybe FPath
-    , theCurrentSearchDepth :: !SearchDepth
-    , theCurrentUserState   :: st
+    { theSearchFileName   :: FPath
+    , theSearchDirectory  :: [FPath]
+    , theSearchFileStatus :: Maybe FileStatus
+    , theSearchFullPath   :: Maybe FPath
+    , theSearchDepth      :: !SearchDepth
+    , theSearchUserState  :: st
     }
 
 initFSearchState :: FPath -> st -> FSearchState st
 initFSearchState path st = FSearchState
-  { theCurrentFileName    = path
-  , theCurrentSearchPath  = []
-  , theCurrentFileStatus  = Nothing
-  , theCurrentFullPath    = Nothing
-  , theCurrentSearchDepth = 0
-  , theCurrentUserState   = st
+  { theSearchFileName   = path
+  , theSearchDirectory  = []
+  , theSearchFileStatus = Nothing
+  , theSearchFullPath   = Nothing
+  , theSearchDepth      = 0
+  , theSearchUserState  = st
   }
 
 askSearchEnv :: FileMatcher st (FSearchState st)
@@ -455,64 +453,64 @@ asksSearchEnv = (<$> askSearchEnv)
 viewSearchEnv :: Lens' (FSearchState st) a -> FileMatcher st a
 viewSearchEnv = asksSearchEnv . view
 
-currentFileNameLens :: Lens' (FSearchState st) FPath
-currentFileNameLens = lens theCurrentFileName $ \ a b -> a{ theCurrentFileName = b }
+searchFileNameLens :: Lens' (FSearchState st) FPath
+searchFileNameLens = lens theSearchFileName $ \ a b -> a{ theSearchFileName = b }
 
-currentFileStatusLens :: Lens' (FSearchState st) (Maybe FileStatus)
-currentFileStatusLens = lens theCurrentFileStatus $ \ a b -> a{ theCurrentFileStatus = b }
+searchFileStatusLens :: Lens' (FSearchState st) (Maybe FileStatus)
+searchFileStatusLens = lens theSearchFileStatus $ \ a b -> a{ theSearchFileStatus = b }
 
-currentFullPathLens :: Lens' (FSearchState st) (Maybe FPath)
-currentFullPathLens = lens theCurrentFullPath $ \ a b -> a{ theCurrentFullPath = b }
+searchFullPathLens :: Lens' (FSearchState st) (Maybe FPath)
+searchFullPathLens = lens theSearchFullPath $ \ a b -> a{ theSearchFullPath = b }
 
-currentSearchPathLens :: Lens' (FSearchState st) [FPath]
-currentSearchPathLens = lens theCurrentSearchPath $ \ a b -> a{ theCurrentSearchPath = b }
+searchDirectoryLens :: Lens' (FSearchState st) [FPath]
+searchDirectoryLens = lens theSearchDirectory $ \ a b -> a{ theSearchDirectory = b }
 
-currentSearchDepthLens :: Lens' (FSearchState st) SearchDepth
-currentSearchDepthLens = lens theCurrentSearchDepth $ \ a b -> a{ theCurrentSearchDepth = b }
+searchDepthLens :: Lens' (FSearchState st) SearchDepth
+searchDepthLens = lens theSearchDepth $ \ a b -> a{ theSearchDepth = b }
 
-currentUserStateLens :: Lens' (FSearchState st) st
-currentUserStateLens = lens theCurrentUserState $ \ a b -> a{ theCurrentUserState = b }
+searchUserStateLens :: Lens' (FSearchState st) st
+searchUserStateLens = lens theSearchUserState $ \ a b -> a{ theSearchUserState = b }
 
 -- | Get the name of the current file being scrutinized.
 fileName :: FileMatcher st FPath
-fileName = viewSearchEnv currentFileNameLens
+fileName = viewSearchEnv searchFileNameLens
 
 -- | Get the name of the path that has been walked up to the current file being scrutinized. The
 -- 'fileName' is not included, and the path is in 'reverse' order, meaning the first (top-most)
 -- subdirectory scanned is the final item in the list while the 'head' of the list is the latest
 -- (bottom-most) subdirectory to have been scanned.q
 searchPath :: FileMatcher st [FPath]
-searchPath = viewSearchEnv currentSearchPathLens
+searchPath = viewSearchEnv searchDirectoryLens
 
 -- not for export
 maybeGetFullPath :: FSearchState st -> FPath
-maybeGetFullPath st = case st ^. currentFullPathLens of
+maybeGetFullPath st = case st ^. searchFullPathLens of
   Just path -> path
   Nothing   -> pack $ foldr (</>)
-    (unpack $ st ^. currentFileNameLens)
-    (unpack <$> (st ^. currentSearchPathLens))
+    (unpack $ st ^. searchFileNameLens)
+    (unpack <$> (st ^. searchDirectoryLens))
 
 -- | Join 'fileName' and 'searchPath' together into a single long 'FPath' value using the @('</>')@
 -- operator.
 fullPath :: FileMatcher st FPath
-fullPath = viewSearchEnv currentFullPathLens >>= flip maybe return
+fullPath = viewSearchEnv searchFullPathLens >>= flip maybe return
   (do path <- asksSearchEnv maybeGetFullPath
-      FileMatcher $ currentFullPathLens .= Just path
+      FileMatcher $ searchFullPathLens .= Just path
       return path
   )
 
 -- not for export
 maybeGetFileStatus :: MonadIO m => FSearchState st -> m FileStatus
-maybeGetFileStatus st = case st ^. currentFileStatusLens of
+maybeGetFileStatus st = case st ^. searchFileStatusLens of
   Nothing   -> liftIO $ getFileStatus $ unpack $ maybeGetFullPath st
   Just stat -> return stat
 
 -- | Obtain the 'FileStatus' of the current file being scrutinized. If the 'FileStatus' has not
 -- already been obtained from the filesystem, the 'getFileStatus' function is called.
 fileStatus :: FileMatcher st FileStatus
-fileStatus = viewSearchEnv currentFileStatusLens >>= flip maybe return
+fileStatus = viewSearchEnv searchFileStatusLens >>= flip maybe return
   (do stat <- askSearchEnv >>= maybeGetFileStatus
-      FileMatcher $ currentFileStatusLens .= Just stat
+      FileMatcher $ searchFileStatusLens .= Just stat
       return stat
   )
 
@@ -526,11 +524,11 @@ fileNode = FSNode
 -- | Return a number indicating how many levels deep into the filesystem tree that this search has
 -- traversed.
 searchDepth :: FileMatcher st SearchDepth
-searchDepth = viewSearchEnv currentSearchDepthLens
+searchDepth = viewSearchEnv searchDepthLens
 
 -- | Return the user-defined state value
 searchState :: FileMatcher st st
-searchState = viewSearchEnv currentUserStateLens
+searchState = viewSearchEnv searchUserStateLens
 
 -- not for export
 --
@@ -662,12 +660,12 @@ searchLoop test halt st cont =
   runFTest test st $ \ st result -> (yield (theFileMatchYield result) >>= cont) <|> do
     guard $ theFileMatchStepInto result
     maybeGetFileStatus st >>= guard . isDirectory
-    flip mapDir (st ^. currentFileNameLens) $ \ _parent path -> flip (searchLoop test halt) cont $
-      st{ theCurrentFileName    = path
-        , theCurrentSearchPath  = theCurrentFileName st : theCurrentSearchPath st
-        , theCurrentFileStatus  = Nothing
-        , theCurrentFullPath    = Nothing
-        , theCurrentSearchDepth = 1 + theCurrentSearchDepth st
+    flip mapDir (st ^. searchFileNameLens) $ \ _parent path -> flip (searchLoop test halt) cont $
+      st{ theSearchFileName    = path
+        , theSearchDirectory  = theSearchFileName st : theSearchDirectory st
+        , theSearchFileStatus  = Nothing
+        , theSearchFullPath    = Nothing
+        , theSearchDepth = 1 + theSearchDepth st
         }
 
 -- | This function works somewhat similar to how the @find@ program works in a command line
