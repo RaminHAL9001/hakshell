@@ -108,6 +108,8 @@ import           System.Posix.Files
                  )
 import           System.Posix.Types     (FileID)
 
+import Debug.Trace
+
 ----------------------------------------------------------------------------------------------------
 
 -- | There are a few objects which can be used as a path to a file, 'FPath', 'FSNode', and
@@ -121,7 +123,7 @@ instance PathToFile FilePath where { toFPath = pack; }
 
 -- | This is an integer value used to indicate the current search depth.
 newtype SearchDepth = SearchDepth{ unwrapSearchDepth :: Int }
-  deriving (Eq, Ord, Enum, Num, Bounded)
+  deriving (Eq, Ord, Enum, Num, Bounded, Show)
 
 ----------------------------------------------------------------------------------------------------
 
@@ -259,6 +261,25 @@ instance Semigroup (FSNodeTest st) where
 
 instance Monoid (FSNodeTest st) where { mempty = emptyFSNodeTest; mappend = (<>); }
 
+showFSNodeTest :: forall st . FSNodeTest st -> String --DEBUG
+showFSNodeTest st = --DEBUG
+  "FSNodeTest ("++(if null str then "const True" else str)++")" where --DEBUG
+    str = case filter (not . null) strs of --DEBUG
+      []   -> "" --DEBUG
+      a:ax -> foldl (\ a b -> a ++ " . " ++ b) a ax --DEBUG
+    strs = --DEBUG
+      [ lbl (\ (Max a) -> "(>= "++show a++")") theFSNodeTestMinDepth --DEBUG
+      , lbl (\ (Min a) -> "(<= "++show a++")") theFSNodeTestMaxDepth --DEBUG
+      , c "testSearchPath" theFSNodeTestSearchPath --DEBUG
+      , c "testFileName"   theFSNodeTestFileName --DEBUG
+      , c "testStatus"     theFSNodeTestStatus --DEBUG
+      , c "testState"      theFSNodeTestState --DEBUG
+      ] --DEBUG
+    lbl :: (a -> String) -> (FSNodeTest st -> Maybe a) -> String --DEBUG
+    lbl show get = maybe "" show $ get st --DEBUG
+    c :: String -> (FSNodeTest st -> Maybe a) -> String --DEBUG
+    c name get = maybe "" (const name) $ get st --DEBUG
+
 emptyFSNodeTest :: FSNodeTest st
 emptyFSNodeTest = let n = Nothing in FSNodeTest n n n n n n
 
@@ -361,6 +382,12 @@ data FileMatchResult a
       -- ^ A file match result may yield zero or more values.
     }
   deriving Functor
+
+showFileMatchResult :: Maybe (FileMatchResult a) -> String --DEBUG
+showFileMatchResult = maybe "Nothing" $ \ mr ->  --DEBUG
+  "(FileMatchResult{ stepInto="++show (theFileMatchStepInto mr)++ --DEBUG
+    ", maxDepth="++show (theFileMatchMaxDepth mr)++ --DEBUG
+    " }" --DEBUG
 
 -- | This function is used within a 'FileMatcher' function. Do not output a value, do not step into
 -- this subdirectory if the current match is scrutinizing a subdirectory,
@@ -618,8 +645,11 @@ runFTest
 runFTest test st action = case fTestPredicate test of
   []   -> empty
   p:px -> do
+    let showtest = showFSNodeTest p --DEBUG
+    traceM $ "runFTest "++showtest++"..." --DEBUG
     (decision, st) <- liftIO $ flip runFileMatcher st $
       evalFSNodeTest p >>= iff (fTestDecision test) empty
+    traceM $ "runFTest "++showtest++" -> "++showFileMatchResult decision --DEBUG
     maybe
       (runFTest (test{ fTestPredicate = px }) st action)
       (action st . (fileMatchMaxDepth .~ (getMin <$> theFSNodeTestMaxDepth p)))
@@ -659,10 +689,22 @@ searchLoop
   -> (file -> FSFoldMap cr st a)
   -> FSFoldMap cr st a
 searchLoop test halt st cont =
+  trace ("searchLoop "++show --DEBUG
+         (foldr (</>) (unpack $ theSearchFileName st) (unpack <$> theSearchDirectory st))) $ --DEBUG
   runFTest test st $ \ st result -> (yield (theFileMatchYield result) >>= cont) <|> do
-    guard $ theFileMatchStepInto result
-    guard $ maybe True ((theSearchDepth st) <=) (theFileMatchMaxDepth result)
-    maybeGetFileStatus st >>= guard . isDirectory
+    guard $
+      (\ bool -> trace ("theFileMatchStepInto -> "++show bool) bool) $ --DEBUG
+      theFileMatchStepInto result
+    guard $
+      (\ bool -> trace --DEBUG
+          ("("++show (theSearchDepth st)++ --DEBUG
+           ") <= (theFileMatchMaxDepth="++show (theFileMatchMaxDepth result)++")" --DEBUG
+          ) bool --DEBUG
+      ) $ --DEBUG
+      maybe True ((theSearchDepth st) <=) (theFileMatchMaxDepth result)
+    maybeGetFileStatus st >>= guard .
+      (\ bool -> trace ("(isDirectory="++show bool++")") bool) . --DEBUG
+      isDirectory
     flip mapDir (st ^. searchFileNameLens) $ \ _parent path -> flip (searchLoop test halt) cont $
       st{ theSearchFileName   = path
         , theSearchDirectory  = theSearchFileName st : theSearchDirectory st
