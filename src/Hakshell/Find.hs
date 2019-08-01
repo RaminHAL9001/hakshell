@@ -677,22 +677,24 @@ searchLoop test halt st cont =
 -- more complex version of this function, 'foldMapFS' allows you to pass a stateful value that can
 -- be updated on each found @file@.
 search
-  :: FTest () file
+  :: PipeLike pipe
+  => FTest () file
   -> (file -> FSFoldMap (Pipe a) () a)
-  -> CPS IO FPath
+  -> pipe FPath -> IO (Pipe a)
 search test = foldMapFS test () (const . pure)
 
 -- | Like 'search', but provide a state value to fold values into as the 'search' operation
 -- proceeds. Also it is necessary to provide a final evaluator
 foldMapFS
-  :: FTest st file -- ^ the file selection rules
+  :: PipeLike pipe
+  => FTest st file -- ^ the file selection rules
   -> st -- ^ the initial state
-  -> (st -> CPS IO a) -- ^ the final action to evaluate, after 'search' completes
+  -> (Pipe a -> st -> IO b) -- ^ the final action to evaluate, after 'search' completes
   -> (file -> FSFoldMap (Pipe a) st a) -- ^ the action to evaluate on each file found.
-  -> CPS IO FPath
+  -> pipe FPath -> IO b
 foldMapFS test st final cont paths = runFSFoldMap
   ( callCC $ \ halt ->
-      ( forM paths $ \ path ->
+      ( forM (pipe paths) $ \ path ->
           get >>= flip (searchLoop test (FSFoldMapHalt halt)) cont . initFSearchState path
       ) >>= yield
-  ) return st >>= uncurry (flip final)
+  ) return st >>= uncurry final
