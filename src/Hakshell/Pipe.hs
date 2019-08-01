@@ -44,6 +44,45 @@ import qualified Data.ByteString.UTF8  as UTF8
 
 ----------------------------------------------------------------------------------------------------
 
+-- | When writing pipelines using Continuation Passing Style (CPS), you sometimes want to start with
+-- a pure argument value, for example the 'search' function takes a list of directories to search as
+-- it's final argument, and a predicate and action as it's first two arguments:
+--
+-- @
+-- 'values' [".\/here", ".\/there"] $ 'Hakshell.Find.search' (['Hakshell.Find.file' 'Data.Semigroup.<>' 'Hakshell.Find.isNamed' "index.html"] ?-> 'Hakshell.Find.matchPrune') 'Control.Applicative.pure'
+-- @
+--
+-- would be equivalent to writing:
+--
+-- @
+-- 'Hakshell.Find.search' (['Hakshell.Find.file' 'Data.Semigroup.<>' 'Hakshell.Find.isNamed' "index.html"] ?-> 'Hakshell.Find.matchPrune') 'Control.Applicative.pure' [".\/here", ".\/there"]
+-- @
+--
+-- This seems useless at first, until you decide you want to replace the 'Control.Applicative.pure'
+-- function with an inline/anonymous filter function:
+--
+-- @
+-- 'Hakshell.Find.search' (['Hakshell.Find.file' 'Data.Semigroup.<>' 'Hakshell.Find.isNamed' "index.html"] ?-> 'Hakshell.Find.matchPrune') (some >=> complicated >=> filtering >=> criteria)
+--     [".\/here", ".\/there"]
+-- @
+--
+-- In this case, it is a little more convenient to use 'values', which allows you to treat functions
+-- between the 'Prelude.$' operators more like pipes in a pipeline.
+--
+-- @
+-- 'values' [".\/here", ".\/there"]
+--   $ 'Hakshell.Find.search' (['Hakshell.Find.file' 'Data.Semigroup.<>' 'Hakshell.Find.isNamed' "index.html"] ?-> 'Hakshell.Find.matchPrune')
+--   $ some >=> complicated >=> filtering >=> criteria
+-- @
+--
+-- Writing the code this way allows you to start with your values, then "pipe" these values to the
+-- 'search' function, then "pipe" the files to some filtering criteria, all using the 'Prelude.$'
+-- operator.
+values :: a -> (a -> b) -> b
+values = flip ($)
+
+----------------------------------------------------------------------------------------------------
+
 -- | /"Ceci n'est pas un pipe."/  -- Rene Magrite
 --
 -- 'Pipe' is a data type used to approximate the behavior of UNIX pipes.
