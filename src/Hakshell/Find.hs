@@ -387,7 +387,7 @@ showFileMatchResult :: Maybe (FileMatchResult a) -> String --DEBUG
 showFileMatchResult = maybe "Nothing" $ \ mr ->  --DEBUG
   "(FileMatchResult{ stepInto="++show (theFileMatchStepInto mr)++ --DEBUG
     ", maxDepth="++show (theFileMatchMaxDepth mr)++ --DEBUG
-    " }" --DEBUG
+    " })" --DEBUG
 
 -- | This function is used within a 'FileMatcher' function. Do not output a value, do not step into
 -- this subdirectory if the current match is scrutinizing a subdirectory,
@@ -640,19 +640,16 @@ infixl 4 ?->
 -- 'FileMatcher' action. 
 runFTest
   :: FTest st file -> FSearchState st
-  -> (FSearchState st -> FileMatchResult file -> FSFoldMap cr st a)
-  -> FSFoldMap cr st a
-runFTest test st action = case fTestPredicate test of
+  -> FSFoldMap cr st (Maybe (FileMatchResult file))
+runFTest test st = case fTestPredicate test of
   []   -> empty
   p:px -> do
-    let showtest = showFSNodeTest p --DEBUG
-    traceM $ "runFTest "++showtest++"..." --DEBUG
+    traceM $ "runFTest "++showFSNodeTest p++"..." --DEBUG
     (decision, st) <- liftIO $ flip runFileMatcher st $
       evalFSNodeTest p >>= iff (fTestDecision test) empty
-    traceM $ "runFTest "++showtest++" -> "++showFileMatchResult decision --DEBUG
     maybe
-      (runFTest (test{ fTestPredicate = px }) st action)
-      (action st . (fileMatchMaxDepth .~ (getMin <$> theFSNodeTestMaxDepth p)))
+      (runFTest (test{ fTestPredicate = px }) st)
+      (pure . Just . (fileMatchMaxDepth .~ (getMin <$> theFSNodeTestMaxDepth p)))
       decision
 
 -- | Evaluate an 'FSFoldMap' function, returning the final return value paired with the final state
@@ -688,23 +685,16 @@ searchLoop
   :: FTest st file -> FSFoldMapHalt cr st a -> FSearchState st
   -> (file -> FSFoldMap cr st a)
   -> FSFoldMap cr st a
-searchLoop test halt st cont =
-  trace ("searchLoop "++show --DEBUG
-         (foldr (</>) (unpack $ theSearchFileName st) (unpack <$> theSearchDirectory st))) $ --DEBUG
-  runFTest test st $ \ st result -> (yield (theFileMatchYield result) >>= cont) <|> do
-    guard $
-      (\ bool -> trace ("theFileMatchStepInto -> "++show bool) bool) $ --DEBUG
-      theFileMatchStepInto result
-    guard $
-      (\ bool -> trace --DEBUG
-          ("("++show (theSearchDepth st)++ --DEBUG
-           ") <= (theFileMatchMaxDepth="++show (theFileMatchMaxDepth result)++")" --DEBUG
-          ) bool --DEBUG
-      ) $ --DEBUG
-      maybe True ((theSearchDepth st) <=) (theFileMatchMaxDepth result)
-    maybeGetFileStatus st >>= guard .
-      (\ bool -> trace ("(isDirectory="++show bool++")") bool) . --DEBUG
-      isDirectory
+searchLoop test halt st cont = do
+  traceM ("searchLoop "++show --DEBUG
+         (foldr (</>) (unpack $ theSearchFileName st) (unpack <$> theSearchDirectory st))) --DEBUG
+  decision <- runFTest test st
+  traceM $ "runFTest: "++showFileMatchResult decision --DEBUG
+  (maybe empty (yield . theFileMatchYield >=> cont) decision) <|> do
+    guard $ flip (maybe True) decision $ \ decision ->
+      theFileMatchStepInto decision &&
+      maybe True ((theSearchDepth st) <=) (decision ^. fileMatchMaxDepth)
+    maybeGetFileStatus st >>= guard . isDirectory
     flip mapDir (st ^. searchFileNameLens) $ \ _parent path -> flip (searchLoop test halt) cont $
       st{ theSearchFileName   = path
         , theSearchDirectory  = theSearchFileName st : theSearchDirectory st
