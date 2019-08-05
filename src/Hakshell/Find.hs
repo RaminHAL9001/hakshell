@@ -66,7 +66,7 @@ module Hakshell.Find
     -- Functionality for writing predicates on files that can be used during a filesystem search.
 
     FileMatcher, FTest(..), (?->),
-    fileName, searchPath, fullPath, fileStatus, searchDepth, runFTest,
+    fileName, searchPath, fullPath, fileStatus, searchDepth,
 
     -- *** Low-level access to the state of a query
     --
@@ -83,6 +83,7 @@ module Hakshell.Find
 import           Hakshell.Pipe
 import           Hakshell.String
 
+import           Control.Arrow
 import           Control.Exception
 import           Control.Lens
 import           Control.Monad.Cont
@@ -107,8 +108,6 @@ import           System.Posix.Files
                  , isDirectory, isNamedPipe, isSocket, isSymbolicLink, isRegularFile,
                  )
 import           System.Posix.Types     (FileID)
-
-import Debug.Trace
 
 ----------------------------------------------------------------------------------------------------
 
@@ -261,25 +260,6 @@ instance Semigroup (FSNodeTest st) where
 
 instance Monoid (FSNodeTest st) where { mempty = emptyFSNodeTest; mappend = (<>); }
 
-showFSNodeTest :: forall st . FSNodeTest st -> String --DEBUG
-showFSNodeTest st = --DEBUG
-  "FSNodeTest ("++(if null str then "const True" else str)++")" where --DEBUG
-    str = case filter (not . null) strs of --DEBUG
-      []   -> "" --DEBUG
-      a:ax -> foldl (\ a b -> a ++ " . " ++ b) a ax --DEBUG
-    strs = --DEBUG
-      [ lbl (\ (Max a) -> "(>= "++show a++")") theFSNodeTestMinDepth --DEBUG
-      , lbl (\ (Min a) -> "(<= "++show a++")") theFSNodeTestMaxDepth --DEBUG
-      , c "testSearchPath" theFSNodeTestSearchPath --DEBUG
-      , c "testFileName"   theFSNodeTestFileName --DEBUG
-      , c "testStatus"     theFSNodeTestStatus --DEBUG
-      , c "testState"      theFSNodeTestState --DEBUG
-      ] --DEBUG
-    lbl :: (a -> String) -> (FSNodeTest st -> Maybe a) -> String --DEBUG
-    lbl show get = maybe "" show $ get st --DEBUG
-    c :: String -> (FSNodeTest st -> Maybe a) -> String --DEBUG
-    c name get = maybe "" (const name) $ get st --DEBUG
-
 emptyFSNodeTest :: FSNodeTest st
 emptyFSNodeTest = let n = Nothing in FSNodeTest n n n n n n
 
@@ -382,12 +362,6 @@ data FileMatchResult a
       -- ^ A file match result may yield zero or more values.
     }
   deriving Functor
-
-showFileMatchResult :: Maybe (FileMatchResult a) -> String --DEBUG
-showFileMatchResult = maybe "Nothing" $ \ mr ->  --DEBUG
-  "(FileMatchResult{ stepInto="++show (theFileMatchStepInto mr)++ --DEBUG
-    ", maxDepth="++show (theFileMatchMaxDepth mr)++ --DEBUG
-    " })" --DEBUG
 
 -- | This function is used within a 'FileMatcher' function. Do not output a value, do not step into
 -- this subdirectory if the current match is scrutinizing a subdirectory,
@@ -511,7 +485,7 @@ searchPath = viewSearchEnv searchDirectoryLens
 maybeGetFullPath :: FSearchState st -> FPath
 maybeGetFullPath st = case st ^. searchFullPathLens of
   Just path -> path
-  Nothing   -> pack $ foldr (</>)
+  Nothing   -> pack $ foldl (flip (</>))
     (unpack $ st ^. searchFileNameLens)
     (unpack <$> (st ^. searchDirectoryLens))
 
@@ -635,22 +609,20 @@ infixl 4 `FTest`
 (?->) = FTest
 infixl 4 ?->
 
--- | Evaluate a 'FSNodeTest' on the current 'FSearchState' (the value returned by 'ask') in the
--- contest of a 'FileMatcher' function, if the 'FSNodeTest' succeeds, evaluate the given
--- 'FileMatcher' action. 
+-- not for export -- requires initializing 'FSearchState', which must be done mechanically to avoid
+-- mistakes.
+--
+-- This function evaluate a 'FSNodeTest' on the current 'FSearchState' in the contest of a
+-- 'FileMatcher' function, if the 'FSNodeTest' succeeds, evaluate the given 'FileMatcher' action.
 runFTest
   :: FTest st file -> FSearchState st
-  -> FSFoldMap cr st (Maybe (FileMatchResult file))
-runFTest test st = case fTestPredicate test of
-  []   -> empty
-  p:px -> do
-    traceM $ "runFTest "++showFSNodeTest p++"..." --DEBUG
-    (decision, st) <- liftIO $ flip runFileMatcher st $
-      evalFSNodeTest p >>= iff (fTestDecision test) empty
-    maybe
-      (runFTest (test{ fTestPredicate = px }) st)
-      (pure . Just . (fileMatchMaxDepth .~ (getMin <$> theFSNodeTestMaxDepth p)))
-      decision
+  -> FSFoldMap cr st (Maybe (FileMatchResult file), FSearchState st)
+runFTest test st = liftIO $ flip runFileMatcher st $ foldr
+  (\ p next ->
+    ( evalFSNodeTest p >>= flip iff empty
+      ((fileMatchMaxDepth .~ (getMin <$> theFSNodeTestMaxDepth p)) <$> fTestDecision test)
+    ) <|> next
+  ) empty (fTestPredicate test)
 
 -- | Evaluate an 'FSFoldMap' function, returning the final return value paired with the final state
 -- value.
@@ -686,16 +658,15 @@ searchLoop
   -> (file -> FSFoldMap cr st a)
   -> FSFoldMap cr st a
 searchLoop test halt st cont = do
-  traceM ("searchLoop "++show --DEBUG
-         (foldr (</>) (unpack $ theSearchFileName st) (unpack <$> theSearchDirectory st))) --DEBUG
-  decision <- runFTest test st
-  traceM $ "runFTest: "++showFileMatchResult decision --DEBUG
+  (decision, st) <- runFTest test st
   (maybe empty (yield . theFileMatchYield >=> cont) decision) <|> do
+    guard $ uncurry (&&) $ ((/= ".") &&& (/= "..")) (theSearchFileName st)
     guard $ flip (maybe True) decision $ \ decision ->
       theFileMatchStepInto decision &&
       maybe True ((theSearchDepth st) <=) (decision ^. fileMatchMaxDepth)
     maybeGetFileStatus st >>= guard . isDirectory
-    flip mapDir (st ^. searchFileNameLens) $ \ _parent path -> flip (searchLoop test halt) cont $
+    --traceM $ "searchLoop: runFTest result -> "++showFSearchState (const "unknown") st --DEBUG
+    flip mapDir (maybeGetFullPath st) $ \ _parent path -> flip (searchLoop test halt) cont $
       st{ theSearchFileName   = path
         , theSearchDirectory  = theSearchFileName st : theSearchDirectory st
         , theSearchFileStatus = Nothing
