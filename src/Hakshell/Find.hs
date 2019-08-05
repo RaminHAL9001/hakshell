@@ -537,8 +537,8 @@ searchState = viewSearchEnv searchUserStateLens
 runFileMatcher :: FileMatcher st a -> FSearchState st -> IO (Maybe a, FSearchState st)
 runFileMatcher (FileMatcher f) = runStateT (runMaybeT f)
 
-iff :: Monad m => m a -> m a -> Bool -> m a
-iff yes no pass = if pass then yes else no
+ifM :: Monad m => m a -> m a -> Bool -> m a
+ifM yes no pass = if pass then yes else no
 
 evalFSNodeTest :: forall st . FSNodeTest st -> FileMatcher st Bool
 evalFSNodeTest test =
@@ -553,7 +553,7 @@ evalFSNodeTest test =
          -> FileMatcher m Bool
          -> FileMatcher m Bool
     eval take f next =
-      maybe (return True) ((<$> f) . fmap getAll) (take test) >>= iff next (return False)
+      maybe (return True) ((<$> f) . fmap getAll) (take test) >>= ifM next (return False)
 
 ----------------------------------------------------------------------------------------------------
 
@@ -619,7 +619,7 @@ runFTest
   -> FSFoldMap cr st (Maybe (FileMatchResult file), FSearchState st)
 runFTest test st = liftIO $ flip runFileMatcher st $ foldr
   (\ p next ->
-    ( evalFSNodeTest p >>= flip iff empty
+    ( evalFSNodeTest p >>= flip ifM empty
       ((fileMatchMaxDepth .~ (getMin <$> theFSNodeTestMaxDepth p)) <$> fTestDecision test)
     ) <|> next
   ) empty (fTestPredicate test)
