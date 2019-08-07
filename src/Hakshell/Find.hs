@@ -6,6 +6,9 @@ module Hakshell.Find
   ( -- * Executing a Filesystem Query
 
     search, foldMapFS, FSFoldMap, runFSFoldMap,
+    MapDirErr, MapDir,
+    fast, safe, fastErr, safeErr,
+    MapDirErrHandler, defaultMapDirErrHandler,
 
     -- * The 'FPath' datatype
     --
@@ -629,26 +632,41 @@ runFTest test st = liftIO $ flip runFileMatcher st $ foldr
 runFSFoldMap :: FSFoldMap cr st a -> (Pipe a -> StateT st IO cr) -> st -> IO (cr, st)
 runFSFoldMap (FSFoldMap f) = runStateT . runContT f
 
--- This is an interface method used internally by the 'foldMapFS' function. Functions of this type
+-- | This is an interface method used internally by the 'foldMapFS' function. Functions of this type
 -- provide a list of files over which the fold-map operation should evaluate. There are two
 -- different methods of providing files: keeping the directory open as the fold-map evaluates (this
--- is done by 'mapDirErr'), and buffering the contents of the directory so it is not kept open as
--- the fold-map evaluates (this is done by 'mapDirListErr').
+-- is done by 'safeErr'), and buffering the contents of the directory so it is not kept open as
+-- the fold-map evaluates (this is done by 'fastErr').
 type MapDirErr cr st a = MapDirErrHandler cr st a -> MapDir cr st a
+
+-- | Takes a function which is mapped to every directory, which may also (in a way) perform a fold
+-- on any value of a type that you provide for @st@ by way of the "Control.Monad.State" functions
+-- 'get', 'put', 'modify', and 'state'.
 type MapDir cr st a = (FPath -> FPath -> FSFoldMap cr st a) -> FPath -> FSFoldMap cr st a
+
+-- | This function responds to 'IOException's thrown when the operating system indicates a file or
+-- directory cannot be inspected by the 'search' or 'foldMapFS' functions.
 type MapDirErrHandler cr st a = FPath -> IOException -> FSFoldMap cr st a
 
+-- | This is a default 'MapDirErrHandler' which you can pass as an argument to a pre-defined
+-- 'MapDirErr' function in order to construct a 'MapDir' function that can be passed as an argument
+-- to 'search' or 'foldMapFS'. This is the error handler used by 'safe' and 'mapListDir'.
 defaultMapDirErrHandler :: MapDirErrHandler cr st a
 defaultMapDirErrHandler parent err =
   liftIO (hPutStrLn stderr $ show parent ++ ": " ++ show err) >> empty
 
--- Open a directory, obtain the name of each file in that directory, map the given 'FSFoldMap'
--- function to each file name. Then, after all file names have been mapped, close the directory. The
--- first function provided must be an error handling function in the event that a file could not be
--- read -- feel free to re-throw the exception, the directory file descriptor will be closed
+-- | By applying a function of type 'MapDirErrHandler' to this function, you can construct a
+-- 'MapDir' function that can be used to evaluate the 'search' and 'foldMapFS' functions.
+--
+-- This function opens a directory, obtains the name of each file in that directory, and maps the
+-- given 'FSFoldMap' function to each file name. Then, after all file names have been mapped, this
+-- function closes the directory.
+--
+-- The first function provided must be an error handling function in the event that a file could not
+-- be read -- feel free to re-throw the exception, the directory file descriptor will be closed
 -- properly if you do.
-mapDirErr :: MapDirErr cr st a
-mapDirErr catcher f dir = do
+safeErr :: MapDirErr cr st a
+safeErr catcher f dir = do
   stream <- liftIO $ openDirStream $ unpack dir
   let loop = liftIO (try $ readDirStream stream) >>= \ case
         Right file ->
@@ -659,18 +677,24 @@ mapDirErr catcher f dir = do
   FSFoldMap $ ContT $ \ next -> StateT $ \ st ->
     runFSFoldMap loop next st `finally` closeDirStream stream
 
--- Same as 'mapDirErr' except 'IOExceptions' that occur while reading the directory are printed to
--- 'stderr' and then ignored.
-mapDir :: MapDir cr st a
-mapDir = mapDirErr defaultMapDirErrHandler
+-- | Same as 'safeErr' except 'IOExceptions' that occur while reading the directory are printed to
+-- 'stderr' and then ignored. This function is simply 'safeErr' with 'defaultMapDirErrHandler'
+-- applied as the first argument to that function.
+safe :: MapDir cr st a
+safe = safeErr defaultMapDirErrHandler
 
--- Open a directory, copy the names of all files in that directory into a buffer, close the
--- directory. Then, after closing the directory, map the given 'FSFoldMap' function to each file
--- name in the buffer. The first function provided must be an error handling function in the event
--- that a file could not be read -- feel free to re-throw the exception, the directory file
--- descriptor will be closed properly if you do.
-mapDirListErr :: MapDirErr cr st a
-mapDirListErr catcher f dir = do
+-- | By applying a function of type 'MapDirErrHandler' to this function, you can construct a
+-- 'MapDir' function that can be used to evaluate the 'search' and 'foldMapFS' functions.
+--
+-- This function opens a directory, copies the names of all files in that directory into a buffer,
+-- and closes the directory. Then, after closing the directory, this function maps the given
+-- 'FSFoldMap' function to each file name in the buffer.
+--
+-- The first function provided must be an error handling function in the event that a file could not
+-- be read -- feel free to re-throw the exception, the directory file descriptor will be closed
+-- properly if you do.
+fastErr :: MapDirErr cr st a
+fastErr catcher f dir = do
   stream <- liftIO $ openDirStream $ unpack dir
   let buffer results stack = liftIO (try $ readDirStream stream) >>= \ case
         Left   err -> catcher dir err >>= \ a -> buffer (results <|> pure a) stack
@@ -684,17 +708,19 @@ mapDirListErr catcher f dir = do
     runFSFoldMap (buffer empty []) next st `finally` closeDirStream stream
   loop stack <|> yield results
 
--- Same as 'mapDirErr' except 'IOExceptions' that occur while reading the directory are printed to
--- 'stderr' and then ignored.
-mapDirList :: MapDir cr st a
-mapDirList = mapDirListErr defaultMapDirErrHandler
+-- | Same as 'safeErr' except 'IOExceptions' that occur while reading the directory are printed to
+-- 'stderr' and then ignored. This function is simply 'safeErr' with 'defaultMapDirErrHandler'
+-- applied as the first argument to that function.
+fast :: MapDir cr st a
+fast = fastErr defaultMapDirErrHandler
 
 -- not for export -- too complicated to be useful
 searchLoop
-  :: FTest st file -> FSFoldMapHalt cr st a -> FSearchState st
+  :: MapDir cr st a
+  -> FTest st file -> FSFoldMapHalt cr st a -> FSearchState st
   -> (file -> FSFoldMap cr st a)
   -> FSFoldMap cr st a
-searchLoop test halt st cont = do
+searchLoop mapDir test halt st cont = do
   (decision, st) <- runFTest test st
   (maybe empty (yield . theFileMatchYield >=> cont) decision) <|> do
     guard $ uncurry (&&) $ ((/= ".") &&& (/= "..")) (theSearchFileName st)
@@ -702,7 +728,7 @@ searchLoop test halt st cont = do
       theFileMatchStepInto decision &&
       maybe True ((theSearchDepth st) <=) (decision ^. fileMatchMaxDepth)
     maybeGetFileStatus st >>= guard . isDirectory
-    flip mapDir (maybeGetFullPath st) $ \ _parent path -> flip (searchLoop test halt) cont $
+    flip mapDir (maybeGetFullPath st) $ \ _parent path -> flip (searchLoop mapDir test halt) cont $
       st{ theSearchFileName   = path
         , theSearchDirectory  = theSearchFileName st : theSearchDirectory st
         , theSearchFileStatus = Nothing
@@ -715,25 +741,33 @@ searchLoop test halt st cont = do
 -- selected, and on each selected file a function of type 'FSFoldMap' can be evaluated. A slightly
 -- more complex version of this function, 'foldMapFS' allows you to pass a stateful value that can
 -- be updated on each found @file@.
+--
+-- The first argument to this function must be a function of type 'MapDir', two of which are most
+-- convenient: 'fast' and 'safe'. Thus, invoke this function as @'search' 'fast'@ or @'search'
+-- 'safe'@, then apply an 'FTest' pattern as the following argument. The 'search' 'fast' function
+-- emulates the default behavior of the @find@ command line program, whereas the 'search' 'safe'
+-- function emulates the behavior of the @find@ command when the @-execdir@ parameter is given.
 search
   :: PipeLike pipe
-  => FTest () file
+  => MapDir (Pipe a) () a
+  -> FTest () file
   -> (file -> FSFoldMap (Pipe a) () a)
   -> pipe FPath -> IO (Pipe a)
-search test = foldMapFS test () (const . pure)
+search mapDir test = foldMapFS mapDir test () (const . pure)
 
 -- | Like 'search', but provide a state value to fold values into as the 'search' operation
 -- proceeds. Also it is necessary to provide a final evaluator
 foldMapFS
   :: PipeLike pipe
-  => FTest st file -- ^ the file selection rules
+  => MapDir (Pipe a) st a
+  -> FTest st file -- ^ the file selection rules
   -> st -- ^ the initial state
   -> (Pipe a -> st -> IO b) -- ^ the final action to evaluate, after 'search' completes
   -> (file -> FSFoldMap (Pipe a) st a) -- ^ the action to evaluate on each file found.
   -> pipe FPath -> IO b
-foldMapFS test st final cont paths = runFSFoldMap
+foldMapFS mapDir test st final cont paths = runFSFoldMap
   ( callCC $ \ halt ->
       ( forM (pipe paths) $ \ path ->
-          get >>= flip (searchLoop test (FSFoldMapHalt halt)) cont . initFSearchState path
+          get >>= flip (searchLoop mapDir test (FSFoldMapHalt halt)) cont . initFSearchState path
       ) >>= yield
   ) return st >>= uncurry final
