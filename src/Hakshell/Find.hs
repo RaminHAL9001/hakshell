@@ -5,7 +5,7 @@
 module Hakshell.Find
   ( -- * Executing a Filesystem Query
 
-    search, foldMapFS, FSFoldMap, runFSFoldMap, mapDir, mapDirErr,
+    search, foldMapFS, FSFoldMap, runFSFoldMap,
 
     -- * The 'FPath' datatype
     --
@@ -629,28 +629,65 @@ runFTest test st = liftIO $ flip runFileMatcher st $ foldr
 runFSFoldMap :: FSFoldMap cr st a -> (Pipe a -> StateT st IO cr) -> st -> IO (cr, st)
 runFSFoldMap (FSFoldMap f) = runStateT . runContT f
 
--- | Same as 'mapDirErr' except 'IOExceptions' that occur while reading the directory are printed to
--- 'stderr' and then ignored.
-mapDir
-  :: (FPath -> FPath -> FSFoldMap cr st a)
-  -> FPath -> FSFoldMap cr st a
-mapDir = mapDirErr $ \ parent err ->
+-- This is an interface method used internally by the 'foldMapFS' function. Functions of this type
+-- provide a list of files over which the fold-map operation should evaluate. There are two
+-- different methods of providing files: keeping the directory open as the fold-map evaluates (this
+-- is done by 'mapDirErr'), and buffering the contents of the directory so it is not kept open as
+-- the fold-map evaluates (this is done by 'mapDirListErr').
+type MapDirErr cr st a = MapDirErrHandler cr st a -> MapDir cr st a
+type MapDir cr st a = (FPath -> FPath -> FSFoldMap cr st a) -> FPath -> FSFoldMap cr st a
+type MapDirErrHandler cr st a = FPath -> IOException -> FSFoldMap cr st a
+
+defaultMapDirErrHandler :: MapDirErrHandler cr st a
+defaultMapDirErrHandler parent err =
   liftIO (hPutStrLn stderr $ show parent ++ ": " ++ show err) >> empty
 
--- | Map a function to the contents of a directory, that is to say, the names of each of the files
--- in the given target directory. First provide an error handling function in the event that a file
--- could not be read -- feel free to re-throw the exception, the directory file descriptor will be
--- closed properly if you do.
-mapDirErr
-  :: (FPath -> IOException -> FSFoldMap cr st a)
-  -> (FPath -> FPath -> FSFoldMap cr st a) -> FPath -> FSFoldMap cr st a
+-- Open a directory, obtain the name of each file in that directory, map the given 'FSFoldMap'
+-- function to each file name. Then, after all file names have been mapped, close the directory. The
+-- first function provided must be an error handling function in the event that a file could not be
+-- read -- feel free to re-throw the exception, the directory file descriptor will be closed
+-- properly if you do.
+mapDirErr :: MapDirErr cr st a
 mapDirErr catcher f dir = do
   stream <- liftIO $ openDirStream $ unpack dir
   let loop = liftIO (try $ readDirStream stream) >>= \ case
-        Right file -> if null file then empty else f dir (pack file) <|> loop
+        Right file ->
+          if null file
+          then empty {- ERROR? closeDirStream not called? Test on "/usr/local/share" -}
+          else f dir (pack file) <|> loop
         Left   err -> catcher dir err <|> loop
   FSFoldMap $ ContT $ \ next -> StateT $ \ st ->
     runFSFoldMap loop next st `finally` closeDirStream stream
+
+-- Same as 'mapDirErr' except 'IOExceptions' that occur while reading the directory are printed to
+-- 'stderr' and then ignored.
+mapDir :: MapDir cr st a
+mapDir = mapDirErr defaultMapDirErrHandler
+
+-- Open a directory, copy the names of all files in that directory into a buffer, close the
+-- directory. Then, after closing the directory, map the given 'FSFoldMap' function to each file
+-- name in the buffer. The first function provided must be an error handling function in the event
+-- that a file could not be read -- feel free to re-throw the exception, the directory file
+-- descriptor will be closed properly if you do.
+mapDirListErr :: MapDirErr cr st a
+mapDirListErr catcher f dir = do
+  stream <- liftIO $ openDirStream $ unpack dir
+  let buffer results stack = liftIO (try $ readDirStream stream) >>= \ case
+        Left   err -> catcher dir err >>= \ a -> buffer (results <|> pure a) stack
+        Right file ->
+          if null file then return (results, stack) else buffer results (pack file : stack)
+                        -- TODO: consider using a Vector buffer instead of a list
+  let loop = \ case
+        []         -> empty
+        file:stack -> f dir file <|> loop stack
+  (results, stack) <- FSFoldMap $ ContT $ \ next -> StateT $ \ st ->
+    runFSFoldMap (buffer empty []) next st `finally` closeDirStream stream
+  loop stack <|> yield results
+
+-- Same as 'mapDirErr' except 'IOExceptions' that occur while reading the directory are printed to
+-- 'stderr' and then ignored.
+mapDirList :: MapDir cr st a
+mapDirList = mapDirListErr defaultMapDirErrHandler
 
 -- not for export -- too complicated to be useful
 searchLoop
@@ -665,7 +702,6 @@ searchLoop test halt st cont = do
       theFileMatchStepInto decision &&
       maybe True ((theSearchDepth st) <=) (decision ^. fileMatchMaxDepth)
     maybeGetFileStatus st >>= guard . isDirectory
-    --traceM $ "searchLoop: runFTest result -> "++showFSearchState (const "unknown") st --DEBUG
     flip mapDir (maybeGetFullPath st) $ \ _parent path -> flip (searchLoop test halt) cont $
       st{ theSearchFileName   = path
         , theSearchDirectory  = theSearchFileName st : theSearchDirectory st
