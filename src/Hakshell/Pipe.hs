@@ -9,26 +9,79 @@
 -- funcName :: [arguments] -> 'Pipe' IO input -> IO ('Pipe' IO output)
 -- @
 --
-module Hakshell.Pipe where
+module Hakshell.Pipe
+  ( module Hakshell.Pipe
+  , module Control.Applicative
+  , module Data.Foldable
+  , module Data.Semigroup
+  , module Data.Traversable
+  , Control.Monad.join
+  , Control.Monad.forever
+  , Control.Monad.mzero
+  , Control.Monad.mplus
+  , Control.Monad.guard
+  , Control.Monad.replicateM
+  ) where
 
 import           Prelude hiding (fail)
 
 import           Hakshell.String
 
 import           Control.Applicative
+import           Control.Exception
 import           Control.Lens
+import           Control.Monad       hiding (mapM, mapM_, forM, forM_)
 import           Control.Monad.Except
 import           Control.Monad.Fail
 import           Control.Monad.State hiding (fail)
 
+import           Data.Foldable
 import           Data.Semigroup
+import qualified Data.Sequence         as Seq
+import           Data.Traversable
 
-import qualified Data.ByteString.Char8 as BStr
 import qualified Data.ByteString.UTF8  as UTF8
 
 ----------------------------------------------------------------------------------------------------
 
-type ErrMsg = UTF8.ByteString
+-- | When writing pipelines using Continuation Passing Style (CPS), you sometimes want to start with
+-- a pure argument value, for example the 'search' function takes a list of directories to search as
+-- it's final argument, and a predicate and action as it's first two arguments:
+--
+-- @
+-- 'values' [".\/here", ".\/there"] $ 'Hakshell.Find.search' (['Hakshell.Find.file' 'Data.Semigroup.<>' 'Hakshell.Find.isNamed' "index.html"] ?-> 'Hakshell.Find.matchPrune') 'Control.Applicative.pure'
+-- @
+--
+-- would be equivalent to writing:
+--
+-- @
+-- 'Hakshell.Find.search' (['Hakshell.Find.file' 'Data.Semigroup.<>' 'Hakshell.Find.isNamed' "index.html"] ?-> 'Hakshell.Find.matchPrune') 'Control.Applicative.pure' [".\/here", ".\/there"]
+-- @
+--
+-- This seems useless at first, until you decide you want to replace the 'Control.Applicative.pure'
+-- function with an inline/anonymous filter function:
+--
+-- @
+-- 'Hakshell.Find.search' (['Hakshell.Find.file' 'Data.Semigroup.<>' 'Hakshell.Find.isNamed' "index.html"] ?-> 'Hakshell.Find.matchPrune') (some >=> complicated >=> filtering >=> criteria)
+--     [".\/here", ".\/there"]
+-- @
+--
+-- In this case, it is a little more convenient to use 'values', which allows you to treat functions
+-- between the 'Prelude.$' operators more like pipes in a pipeline.
+--
+-- @
+-- 'values' [".\/here", ".\/there"]
+--   $ 'Hakshell.Find.search' (['Hakshell.Find.file' 'Data.Semigroup.<>' 'Hakshell.Find.isNamed' "index.html"] ?-> 'Hakshell.Find.matchPrune')
+--   $ some >=> complicated >=> filtering >=> criteria
+-- @
+--
+-- Writing the code this way allows you to start with your values, then "pipe" these values to the
+-- 'search' function, then "pipe" the files to some filtering criteria, all using the 'Prelude.$'
+-- operator.
+values :: a -> (a -> b) -> b
+values = flip ($)
+
+----------------------------------------------------------------------------------------------------
 
 -- | /"Ceci n'est pas un pipe."/  -- Rene Magrite
 --
@@ -64,8 +117,7 @@ type ErrMsg = UTF8.ByteString
 --
 -- To use 'Pipe's in a monadic context, use the 'EngineT' function type, which uses 'Pipe's as a
 -- control mechanism but also instantiates 'Monad', 'MonadPlus', 'MonadState' (for an arbitrary
--- state value), 'MonadFail' and 'MonadError' (for throwing and catching 'PipeFail' values),
--- 'MonadTrans', and 'MonadIO'.
+-- state value), 'MonadTrans', and 'MonadIO'.
 --
 -- Monoid/Semigroup appending for both 'Pipe' and 'EngineT' is simply to lift the 'mappend' or
 -- @('<>')@ operator into 'Pipe' constructor using 'Applicative'. As a consequence, performing
@@ -85,72 +137,60 @@ type ErrMsg = UTF8.ByteString
 --
 -- Notice that 'Semigroup'/'Monoid' concatenation is similar to arithmetic in how you would compute
 -- the expression @(a + b + c) * (x + y + z)@ using the distributive property of multiplication.
-data Pipe m a
-  = PipeStop
-  | PipeFail !ErrMsg
-  | PipeNext !a (m (Pipe m a))
+newtype Pipe a = Pipe{ unwrapPipe :: Seq.Seq a }
+  deriving (Functor)
 
-instance Show (Pipe m a) where
-  show = \ case
-    PipeStop     -> ""
-    PipeFail msg -> "(ERROR "++show (unpack msg)++")"
-    PipeNext{}   -> "(OK)"
+instance Show (Pipe a) where
+  show = const "(OK)"
 
-instance Functor m => Functor (Pipe m) where
-  fmap f = \ case
-    PipeStop        -> PipeStop
-    PipeFail   msg  -> PipeFail msg
-    PipeNext a next -> PipeNext (f a) $ fmap f <$> next
+instance Applicative Pipe where
+  pure = Pipe . pure
+  (<*>) (Pipe f) (Pipe a) = Pipe $ f <*> a 
 
-instance Applicative m => Applicative (Pipe m) where
-  pure = flip PipeNext (pure PipeStop)
-  (<*>) = \ case
-    PipeStop         -> const PipeStop
-    PipeFail msg     -> const $ PipeFail msg
-    PipeNext f nextF -> \ case
-      PipeStop         -> PipeStop
-      PipeFail msg     -> PipeFail msg
-      PipeNext a nextA -> PipeNext (f a) $ (<|>) <$> (fmap f <$> nextA) <*>
-        ((<*> (PipeNext a nextA)) <$> nextF)
+instance Alternative Pipe where
+  empty = Pipe empty
+  (<|>) (Pipe a) (Pipe b) = Pipe $ a <|> b
 
-instance Applicative m => Alternative (Pipe m) where
-  empty = PipeStop
-  (<|>) = \ case
-    PipeStop        -> id
-    PipeFail msg    -> const $ PipeFail msg
-    PipeNext a next -> PipeNext a . (<$> next) . flip (<|>)
+instance Monad Pipe where
+  return = Pipe . return
+  (>>=) (Pipe a) f = Pipe $ a >>= (\ (Pipe f) -> f) . f
 
-instance (Applicative m, Semigroup a) => Semigroup (Pipe m a) where
+instance Foldable Pipe where
+  foldMap f (Pipe a) = foldMap f a
+  foldr f b (Pipe a) = foldr f b a
+
+instance Traversable Pipe where
+  traverse f (Pipe a) = Pipe <$> traverse f a
+  sequenceA (Pipe a) = Pipe <$> sequenceA a
+
+instance Semigroup a => Semigroup (Pipe a) where
   a <> b = (<>) <$> a <*> b
 
-instance (Applicative m, Monoid a) => Monoid (Pipe m a) where
-  mempty = pure mempty
+instance Monoid a => Monoid (Pipe a) where
+  mempty = empty
   mappend a b = mappend <$> a <*> b
 
--- | A pure function to construct a 'Pipe' from a list.
-pipe :: Monad m => [a] -> Pipe m a
-pipe = foldr ((. pure) . PipeNext) PipeStop
+class PipeLike thing where { pipe :: thing a -> Pipe a; }
+instance PipeLike [] where { pipe = Pipe . Seq.fromList; }
+instance PipeLike Seq.Seq where { pipe = Pipe; }
+instance PipeLike Pipe where { pipe = id; }
 
--- | Yield a single value and then end.
-push :: Applicative m => a -> m (Pipe m a)
-push = pure . flip PipeNext (pure PipeStop)
+-- | Return a 'Pipe' containing a single value.
+push :: Applicative m => a -> m (Pipe a)
+push = pure . pure
 
--- | Yield a pure list of items, each item being 'yield'ed in turn.
-pushList :: Applicative m => [a] -> m (Pipe m a)
-pushList = \ case
-  []   -> pure PipeStop
-  a:ax -> pure $ PipeNext a $ pushList ax
+-- | Return a 'Pipe' containing zero or more values.
+pushList :: Applicative m => [a] -> m (Pipe a)
+pushList = pure . Pipe . Seq.fromList
 
 -- | Similar to 'forM', but evaluates a function on each element of a list, and each item is
 -- 'yield'ed in turn.
-pipeEach :: Applicative m => [a] -> (a -> m b) -> m (Pipe m b)
-pipeEach ax f = case ax of
-  []   -> pure PipeStop
-  a:ax -> flip PipeNext (pipeEach ax f) <$> f a
+foreach :: (Applicative m, PipeLike pipe) => pipe a -> (a -> m b) -> m (Pipe b)
+foreach = flip mapToPipe
 
 -- | Same as 'foreach' but with the parameters flipped.
-mapToPipe :: Applicative m => (a -> m b) -> [a] -> m (Pipe m b)
-mapToPipe = flip pipeEach
+mapToPipe :: (Applicative m, PipeLike pipe) => (a -> m b) -> pipe a -> m (Pipe b)
+mapToPipe f = traverse f . pipe
 
 -- | Perform a single step on the next element of a 'Pipe'. This function automatically handles
 -- errors and halting conditions, and serves as a drop-in replacement for any expression that uses a
@@ -162,54 +202,16 @@ mapToPipe = flip pipeEach
 -- @
 -- Monad m => (a -> m (Pipe m a) -> m (Pipe m b)) -> Pipe m a -> m (Pipe m b)
 -- @
-step :: Applicative f => (a -> m1 (Pipe m1 a) -> f (Pipe m2 b)) -> Pipe m1 a -> f (Pipe m2 b)
-step f = \ case
-  PipeStop        -> pure PipeStop
-  PipeFail msg    -> pure $ PipeFail msg
-  PipeNext a next -> f a next
+step :: Applicative m => (a -> Pipe a -> m (Pipe b)) -> Pipe a -> m (Pipe b)
+step f (Pipe a) = case a of
+  Seq.Empty        -> pure empty
+  (a Seq.:<| next) -> f a $ Pipe next
 
--- | Like 'pipeEach' but essentially maps a function to each element in the pipe using the ('<*>')
--- operator.
-foreach :: Applicative m => Pipe m a -> (a -> m b) -> m (Pipe m b)
-foreach = flip pmap
+----------------------------------------------------------------------------------------------------
 
--- | Same as 'foreach' but with the parameters flipped.
-pmap :: Applicative m => (a -> m b) -> Pipe m a -> m (Pipe m b)
-pmap f = step $ \ a next -> PipeNext <$> f a <*> (pmap f <$> next)
-
--- | Pull values from the 'Pipe', apply each value to the given continuation. The value returned by
--- continuation is ignored, this function is only for evaluating on functions that produce
--- side-effects.
-pull :: (MonadIO m, MonadFail m) => (a -> m void) -> Pipe m a -> m ()
-pull f = \ case
-  PipeStop        -> return ()
-  PipeFail   msg  -> Control.Monad.Except.fail $ BStr.unpack msg
-  PipeNext a next -> f a >> next >>= pull f
-
--- | Pull all values from the 'Pipe' until the pipe finishes.
-pullList :: (Monad m, MonadFail m) => (a -> m b) -> Pipe m a -> m [b]
-pullList f = loop id where
-  loop stack = \ case
-    PipeStop        -> return $ stack []
-    PipeFail   msg  -> Control.Monad.Except.fail $ BStr.unpack msg
-    PipeNext a next -> f a >>= \ b -> next >>= loop (stack . (b :))
-
--- | Concatenate all 'Pipe's within a containing 'Pipe'. This does require some potentially
--- side-effectful code to be evaluated on the pipeline (hence it is necessary for the result to be
--- 'return'ed to the controlling monadic context @m@, although the it is not necessary to perform an
--- evaluation of any of the elements within the 'Pipe' itself, so it is reasonable to expect that
--- this function will not perform side effects.
-pconcat :: Monad m => Pipe m (Pipe m a) -> m (Pipe m a)
-pconcat = \ case
-  PipeStop        -> pure PipeStop
-  PipeFail err    -> pure $ PipeFail err
-  PipeNext a next -> (a <|>) <$> (next >>= pconcat)
-
--- | Lift the monadic type @inner@ of a 'Pipe' into another monad @m@
-liftInnerPipe
-  :: (Monad inner, Monad m)
-  => (forall b . inner b -> m b) -> Pipe inner a -> m (Pipe m a)
-liftInnerPipe lift = step $ \ a next -> return $ PipeNext a $ lift next >>= liftInnerPipe lift
+-- | A class of monads that can yield multiple values from a 'Pipe' without having to deconstruct it
+-- to a list and then reconstruct it using @('msum' . 'fmap' 'pure')@.
+class Monad m => MonadPipe m where { yield :: Pipe a -> m a; }
 
 ----------------------------------------------------------------------------------------------------
 
@@ -231,38 +233,43 @@ liftInnerPipe lift = step $ \ a next -> return $ PipeNext a $ lift next >>= lift
 -- should do: they should take input from a 'Pipe', and produce output to another 'Pipe', typcially
 -- performing some work on the content of the input 'Pipe' to produce the output.
 newtype EngineT st input m a
-  = EngineT
-    { unwrapEngineT ::
-        StateT (EngineState st input m) m (Pipe (EngineT st input m) a)
-    }
+  = EngineT{ unwrapEngineT :: ExceptT EngineError (StateT (EngineState st input) m) (Pipe a) }
   deriving (Functor)
 
 type Engine st input = EngineT st input Identity
 
-data EngineState st input m
+data EngineError
+  = EngineFail UTF8.ByteString
+  | EngineIOError IOException
+  deriving (Eq, Show)
+
+data EngineState st input
   = EngineState
     { theEngineStateValue :: !st
-    , theEngineInputPipe  :: (m (Pipe m input))
+    , theEngineInputPipe  :: Pipe input
     }
 
-instance (Applicative m, Semigroup st) => Semigroup (EngineState st input m) where
+instance Packable EngineError where
+  pack = EngineFail . pack
+
+instance Semigroup st => Semigroup (EngineState st input) where
   a <> b = EngineState
     { theEngineStateValue = theEngineStateValue a <> theEngineStateValue b
-    , theEngineInputPipe  = (<|>) <$> theEngineInputPipe a <*> theEngineInputPipe  b
+    , theEngineInputPipe  = theEngineInputPipe a <|> theEngineInputPipe b
     }
 
-instance (Applicative m, Monoid st) => Monoid (EngineState st input m) where
+instance Monoid st => Monoid (EngineState st input) where
   mempty = EngineState
     { theEngineStateValue = mempty
-    , theEngineInputPipe  = pure PipeStop
+    , theEngineInputPipe  = empty
     }
   mappend a b = EngineState
-    { theEngineStateValue = mappend (theEngineStateValue a) (theEngineStateValue b)
-    , theEngineInputPipe  = (<|>) <$> theEngineInputPipe a <*> theEngineInputPipe b
+    { theEngineStateValue = theEngineStateValue a `mappend` theEngineStateValue b
+    , theEngineInputPipe  = theEngineInputPipe a <|> theEngineInputPipe b
     }
 
 instance Monad m => Applicative (EngineT st input m) where
-  pure = EngineT . pure . flip PipeNext (EngineT $ pure PipeStop)
+  pure = EngineT . pure . pure
   (EngineT f) <*> (EngineT a) = EngineT $ (<*>) <$> f <*> a
 
 instance Monad m => Alternative (EngineT st input m) where
@@ -271,31 +278,25 @@ instance Monad m => Alternative (EngineT st input m) where
 
 instance Monad m => Monad (EngineT st input m) where
   return = EngineT . return . pure
-  (EngineT a) >>= f = EngineT $
-    let loop = step $ \ a next ->
-          (<|>) <$> unwrapEngineT (f a) <*> unwrapEngineT (next >>= EngineT . loop)
-    in  a >>= loop
+  (EngineT a) >>= f = EngineT $ fmap (unwrapEngineT . f) <$> a >>= fmap join . sequence
 
 instance Monad m => MonadPlus (EngineT st input m) where { mzero = empty; mplus = (<|>); }
 
-instance Monad m => MonadState (EngineState st input m) (EngineT st input m) where
+instance Monad m => MonadState (EngineState st input) (EngineT st input m) where
   state f = EngineT $ state $ \ st0 -> let (a, st) = f st0 in (pure a, st)
 
 instance MonadTrans (EngineT st input) where
-  lift = EngineT . lift . fmap pure
+  lift = EngineT . lift . lift . fmap pure
 
-instance Monad m => MonadError ErrMsg (EngineT st input m) where
-  throwError = EngineT . return . PipeFail
-  catchError (EngineT try) catch = EngineT $ try >>= \ case
-    PipeStop      -> return PipeStop
-    PipeFail  msg -> unwrapEngineT $ catch msg
-    ok@PipeNext{} -> return ok
+instance Monad m => MonadError EngineError (EngineT st input m) where
+  throwError = EngineT . throwError
+  catchError (EngineT try) = EngineT . catchError try . (unwrapEngineT .)
 
 instance Monad m => MonadFail (EngineT st input m) where
   fail = throwError . pack
 
 instance MonadIO m => MonadIO (EngineT st input m) where
-  liftIO = EngineT . fmap pure . liftIO
+  liftIO = EngineT . liftIO . fmap pure
 
 instance (Monad m, Semigroup a) => Semigroup (EngineT st input m a) where
   a <> b = (<>) <$> a <*> b
@@ -337,55 +338,56 @@ instance (Monad m, Monoid a) => Monoid (EngineT st input m a) where
 -- 'unfold'-like function for which the type @output@ is unit @()@ but the state value @st@.
 runEngineT
   :: Monad m
-  => EngineT st input m output -> EngineState st input m
-  -> m (Pipe m (output, EngineState st input m))
-runEngineT f = fmap
-  ( \ (a, st) -> case a of
-    PipeStop        -> PipeStop
-    PipeFail err    -> PipeFail err
-    PipeNext a next -> PipeNext (a, st) $ runEngineT (next >>= EngineT . pure) st
-  ) . runStateT (unwrapEngineT f)
+  => EngineT st input m output -> EngineState st input
+  -> m (Either EngineError (Pipe output), EngineState st input)
+runEngineT = runStateT . runExceptT . unwrapEngineT
 
 -- | The pure version of 'runEngineT'.
 runEngine
   :: Engine st input output
-  -> EngineState st input Identity
-  -> Pipe Identity (output, EngineState st input Identity)
-runEngine f = runIdentity . runEngineT f
+  -> EngineState st input
+  -> (Either EngineError (Pipe output), EngineState st input)
+runEngine = (.) runIdentity . runEngineT
 
 -- | Like 'runEngine' but discards the 'EngineState', leaving a 'Pipe' with only the values of type
 -- @output@. Use this function when the intermediate state values of type @st@ are not important,
 -- and only the 'Pipe'ed @output@ is important.
-evalEngineT :: Monad m => EngineT st input m output -> EngineState st input m -> m (Pipe m output)
-evalEngineT f = fmap (fmap fst) . runEngineT f
+evalEngineT
+  :: Monad m
+  => EngineT st input m output -> EngineState st input
+  -> m (Either EngineError (Pipe output))
+evalEngineT f = fmap fst . runEngineT f
 
 -- | The pure version of 'evalEngineT'.
-evalEngine :: Engine st input output -> EngineState st input Identity -> Pipe Identity output
-evalEngine f = runIdentity . evalEngineT f
+evalEngine :: Engine st input output -> EngineState st input -> Either EngineError (Pipe output)
+evalEngine = (.) runIdentity . evalEngineT
 
 -- | Like 'runEngine' but discards the values of type @output@, returning a 'Pipe' containing every
 -- intermediate state value of type @st@. This can be useful if the 'Engine' function you have
 -- written is to behave as an 'unfold'-like function for which the type @output@ is unit @()@ but
 -- the state value @st@.
-execEngineT :: Monad m => EngineT st input m output -> EngineState st input m -> m (Pipe m st)
-execEngineT f = fmap (fmap (theEngineStateValue . snd)) . runEngineT f
+execEngineT
+  :: Monad m
+  => EngineT st input m output -> EngineState st input
+  -> m (EngineState st input)
+execEngineT = fmap (fmap snd) . runEngineT
 
-execEngine :: Engine st input output -> EngineState st input Identity -> Pipe Identity st
-execEngine f = runIdentity . execEngineT f
+execEngine :: Engine st input output -> EngineState st input -> EngineState st input
+execEngine = (.) runIdentity . execEngineT
 
--- | Convert a plain 'Pipe' into an 'EngineT'.
-engine :: Monad m => Pipe m a -> EngineT st input m a
-engine = \ case
-  PipeStop        -> empty
-  PipeFail err    -> throwError err
-  PipeNext a next -> EngineT $ ((pure a) <|>) <$> (lift next >>= unwrapEngineT . engine)
+instance Monad m => MonadPipe (EngineT st input m) where
+  yield = EngineT . pure
+
+-- | Throw an 'IOException' in the 'EngineT' monad.
+engineIOError :: MonadIO m => IOException -> EngineT st input m void
+engineIOError = throwError . EngineIOError
 
 -- | This is a combinator to define a function of type 'Engine'. When this function is evaluated, it
 -- take a single value of type @input@ from the input stream that is piped to every 'Engine'
 -- function when it is evaluated by 'evalEngine'.
 input :: Monad m => EngineT st input m input
-input = EngineT $ use engineInputPipe >>= lift >>=
-  step (\ input next -> engineInputPipe .= next >> return (pure input))
+input = EngineT $ use engineInputPipe >>=
+  step (\ input next -> engineInputPipe .= next >> push input)
 
 -- | This function is similar to 'pushList', but is specifically designed to evaluate within a
 -- function of type 'Engine'. As the name implies, this function is a counterpart to the 'input'
@@ -415,7 +417,7 @@ while f = input >>= (<|> (while f)) . f
 -- function is defined as: @\\ elem -> 'Engine' ('engineInputPipe' '%=' 'PipeNext' elem . 'return')@
 --
 -- Again, just use the input combinators like 'input', 'collect', 'pump', and 'putBackInput'.
-engineInputPipe :: Lens' (EngineState st input m) (m (Pipe m input))
+engineInputPipe :: Lens' (EngineState st input) (Pipe input)
 engineInputPipe = lens theEngineInputPipe $ \ a b -> a{ theEngineInputPipe = b }
 
 -- | You should never need to use this function.
@@ -427,5 +429,5 @@ engineInputPipe = lens theEngineInputPipe $ \ a b -> a{ theEngineInputPipe = b }
 -- 'put' = 'EngineT' '.' 'assign' 'engineStateValue'
 -- 'get' = EngineT '$' 'use' 'engineStateValue'
 -- @
-engineStateValue :: Lens' (EngineState st input m) st
+engineStateValue :: Lens' (EngineState st input) st
 engineStateValue = lens theEngineStateValue $ \ a b -> a{ theEngineStateValue = b }
