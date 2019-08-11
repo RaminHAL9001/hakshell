@@ -110,13 +110,14 @@ module Hakshell.TextEditor
 
     -- ** The 'EditLine' function type
     --
-    -- Evaluate the a function of type 'EditLine' using the 'editLine' function within the context
-    -- of an 'EditText' function. This places a line of text into a 'LineEditor' which allows the
-    -- text to be edited character-by-character.
+    -- Usually, functions of type 'EditLine' are evaluated by using the 'editLine' function within
+    -- the context of an 'EditText' function. This places a line of text into a 'LineEditor' which
+    -- allows the text to be edited character-by-character.
 
     EditLine, editLine, insertChar, deleteChars, lineEditorTags, moveByChar,
-    copyLineEditorText, copyCharsRange, copyCharsBetween,
+    copyLineEditorText, copyCharsRange, copyCharsBetween, copyChars, copyCharsToEnd,
     replaceCurrentLine, clearCurrentLine, resetCurrentLine, lineEditorCharCount,
+    newLineEditor, newLineEditorAt,
 
     -- ** Text Views
     --
@@ -951,39 +952,44 @@ copyLineEditorIO cur = do
 lineEditorCharCount :: LineEditor tags -> Int
 lineEditorCharCount cur = theCharsBeforeCursor cur + theCharsAfterCursor cur
 
--- Create a new 'LineEditor' from a 'TextLine'. The 'LineEditor' can be updated with an 'EditLine'
--- function. Note that this function works in any monadic function type @m@ which instantiates
--- 'Control.Monad.IO.Class.MonadIO', so this will work in the @IO@ monad, the 'EditText' monad, the
--- 'EditLine' monad, and in other contexts as well.
-newCursorFromLine :: MonadIO m => TextBuffer tags -> Int -> TextLine tags -> m (LineEditor tags)
-newCursorFromLine parent cur line = liftIO $ do
+-- | Create a new 'LineEditor' by copying the line under the given 'TextLocation' point. The
+-- 'LineEditor' can be updated with an 'EditLine' function. Note that this function works in any
+-- monadic function type @m@ which instantiates 'Control.Monad.IO.Class.MonadIO', so this will work
+-- in the @IO@ monad, the 'EditText' monad, the 'EditLine' monad, and in other contexts as well.
+newLineEditorAt
+  :: MonadIO m
+  => TextBuffer tags -> TextLocation -> m (Either TextEditError (LineEditor tags))
+newLineEditorAt parent loc = liftIO $ flip runEditTextIO parent $ do
   -- This function is safe to export because we assume a 'TextLine' never contains more than one
   -- line terminator, and always only at the end of the buffer. The 'TextLine' constructor is not
   -- exported.
-  let str = line ^. textLineString
-  let len = intSize str
-  let breakSize = theTextLineBreakSize line
-  cur <- pure $ min (max 0 $ len - fromIntegral breakSize) $ max 0 cur
-  let (before, after) = splitAt cur $ unpack str
-  let (lenBefore, lenAfter) = (length before, length after)
-  let strlen = lenBefore + lenAfter
-  let len = head $ takeWhile (< strlen) $ iterate (* 2) 1024
-  buf <- UMVec.new len
-  forM_ (zip [0 .. lenBefore - 1] before) $ uncurry $ UMVec.write buf
-  forM_ (zip [len - lenAfter .. len - 1] after) $ uncurry $ UMVec.write buf
-  return LineEditor
-    { theLineEditBuffer    = buf
-    , parentTextEditor     = parent
-    , theCharsBeforeCursor = lenBefore
-    , theCharsAfterCursor  = lenAfter
-    , theCursorBreakSize   = breakSize
-    , theLineEditorTags    = theTextLineTags line
-    }
+  i <- getAbsoluteChk $ Absolute $ lineToIndex $ loc ^. lineIndex
+  line <- getElemIndex i
+  liftIO $ do
+    let str = line ^. textLineString
+    let strlen = intSize str
+    let breakSize = line ^. textLineBreakSize
+    let cur = charToIndex $ loc ^. charIndex
+    cur <- pure $ min (max 0 $ strlen - fromIntegral breakSize) $ max 0 cur
+    let buflen = head $ takeWhile (< strlen) $ iterate (* 2) 1024
+    buf <- liftIO $ UMVec.new buflen
+    UVec.copy (UMVec.slice 0 cur buf)
+              (UVec.slice 0 cur str) 
+    UVec.copy (UMVec.slice (buflen - cur + strlen) (cur - strlen) buf)
+              (UVec.slice cur (strlen - cur) str)
+    return LineEditor
+      { theLineEditBuffer    = buf
+      , parentTextEditor     = parent
+      , theCharsBeforeCursor = cur
+      , theCharsAfterCursor  = strlen - cur - fromIntegral breakSize
+      , theCursorBreakSize   = breakSize
+      , theLineEditorTags    = theTextLineTags line
+      }
 
 -- | This is the default line break function. It will split the line on the character sequence
--- @"\n"@, or @"\r"@, or @"\n\r"@, or @"\r\n"@. The line terminators must be included at the end of
--- each broken string, so that the rule that the law
--- @'Prelude.concat' ('theLineBreaker' 'lineBreakerNLCR' str) == str@ is obeyed.
+-- @"\\n"@, or @"\\r"@, or @"\\n\\r"@, or @"\\r\\n"@. The line terminators must be included at the
+-- end of each broken string, so that the rule that the law @'Prelude.concat' ('theLineBreaker'
+-- 'lineBreakerNLCR' str) == str@ is obeyed.
 lineBreakerNLCR :: LineBreaker
 lineBreakerNLCR = LineBreaker
   { theLineBreakPredicate = nlcr
@@ -1117,7 +1123,7 @@ instance MonadIO m => MonadEditVec (MVec.IOVector (TextLine tags))  (FoldMapLine
   throwCountErr = foldMapLiftEditText . throwCountErr
 
 globalDebugLevel :: Int
-globalDebugLevel = 30
+globalDebugLevel = 0
 
 debugLevel :: Monad m => (String -> m a -> m a) -> Int -> String -> m a -> m a
 debugLevel report lvl msg f = if lvl > globalDebugLevel then f else report msg f
@@ -1158,7 +1164,7 @@ countElems = peek 30 "countElems" $ (+) <$> getElemCount Before <*> getElemCount
 getUnusedSpace :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem) => m Int
 getUnusedSpace = peek 30 "getUnusedSpace" $ subtract <$> countElems <*> getAllocSize
 
--- Like 'cursorIndex' but evaluates to an exception if the index is out of bounds.
+-- Like 'cursorIndex' but evaluates to an exception if 'cursorIndex' is out of bounds.
 vecIndexChk
   :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem)
   => RelativeToCursor -> m Int
@@ -1294,12 +1300,24 @@ copyRegion (Absolute i) (Relative count) = stack 20 ("copyRegion "++show i++' ':
     len    <- getAllocSize
     before <- getElemCount Before
     if lo >= before
-     then liftIO $ GMVec.clone $ GMVec.slice (len - siz + i) siz oldvec
-     else if hi < before then liftIO $ GMVec.clone $ GMVec.slice lo siz oldvec else do
-      let sublen = before - i
+     then do
+      i <- getAbsolute $ Absolute lo
+      traceM $ "(copyRegion: lo="++show hi++" >= before="++show before++ --DEBUG
+               " -> GMVec.clone (lo="++show i++") (siz="++show siz++")" --DEBUG
+      liftIO $ GMVec.clone $ GMVec.slice i siz oldvec
+     else if hi < before
+     then do
+      traceM $ "(copyRegion: hi="++show hi++" < before="++show before++ --DEBUG
+               " -> GMVec.clone (lo="++show lo++") (siz="++show siz++")" --DEBUG
+      liftIO $ GMVec.clone $ GMVec.slice lo siz oldvec
+     else do
+      let sublen = before - lo
+      traceM $ "(copyRegion: before="++show before++" - lo="++show lo++ --DEBUG
+               " -> sublen="++show sublen++")" --DEBUG
       lovec  <- getSlice $ Relative $ negate sublen
       hivec  <- getSlice $ Relative $ hi - before
       newvec <- newVector siz
+      traceM $ "(copyRegion: populate newvec)" --DEBUG
       copy (GMVec.slice 0 sublen newvec) lovec
       copy (GMVec.slice sublen (siz - sublen) newvec) hivec
       return newvec
@@ -1674,6 +1692,47 @@ copyLineEditorText
   => editor tags m (TextLine tags)
 copyLineEditorText = liftEditLine copyLineEditor'
 
+-- | Returns 'True' if the given @'Absolute' 'CharIndex'@ value refers to any character after the
+-- final non-line-breaking character in the current line, i.e. it points to a line-breaking
+-- character or at some point beyond it. If there are no line breaking characters on the current
+-- line, this function always returns 'False'.
+pointContainsLineBreak
+  :: (MonadEditLine editor, MonadIO (editor tags m), MonadIO m
+     , Show tags --DEBUG
+     )
+  => Absolute CharIndex -> editor tags m Bool
+pointContainsLineBreak pt = liftEditLine $ do
+  lbrk  <- use cursorBreakSize
+  count <- countElems
+  return $ lbrk /= 0 && charToIndex pt > count - fromIntegral lbrk
+
+-- | Create a 'TextLine' by copying the characters relative to the cursor.
+copyChars
+  :: (MonadEditLine editor, MonadIO (editor tags m), MonadIO m
+     , Show tags --DEBUG
+     )
+  => Relative CharIndex -> editor tags m (TextLine tags)
+copyChars rel@(Relative (CharIndex i)) = liftEditLine $ do
+  slice <- getSliceChk (Relative i) >>= liftIO . UVec.freeze
+  break <- relativeToAbsolute rel >>= pointContainsLineBreak
+  lbrk  <- use cursorBreakSize
+  tags  <- use lineEditorTags
+  return TextLine
+    { theTextLineString    = slice
+    , theTextLineTags      = tags
+    , theTextLineBreakSize = if break then lbrk else 0
+    }
+
+-- | Calls 'copyChars' with a @'Relative' 'CharIndex'@ value equal to the number of characters
+-- 'Before' or 'After' the cursor on the current line.
+copyCharsToEnd
+  :: (MonadEditLine editor, MonadIO (editor tags m), MonadIO m,
+      MonadEditVec (UMVec.IOVector Char) (editor tags m)
+     , Show tags --DEBUG
+     )
+  => RelativeToCursor -> editor tags m (TextLine tags)
+copyCharsToEnd = getElemCount >=> copyChars . Relative . CharIndex
+
 -- | Create a 'TextLine' by copying the the characters in the given range from the line under the
 -- cursor.
 copyCharsRange
@@ -1682,14 +1741,16 @@ copyCharsRange
      )
   => Absolute CharIndex -> Relative CharIndex -> EditLine tags m (TextLine tags)
 copyCharsRange i count = look 10 ("copyCharsRange ("++show i++") ("++show count++")") $ do
-  -- TODO: handle line breaks correctly
   vec <- liftIO . UVec.freeze =<<
-    copyRegion (Absolute $ charToIndex i) (Relative $ charToCount count)
-  tags <- use lineEditorTags
+    copyRegionChk (Absolute $ charToIndex i) (Relative $ charToCount count)
+  break <- pointContainsLineBreak $
+    (\ (Absolute i, Relative count) -> Absolute $ i + count) (i, count)
+  tags  <- use lineEditorTags
+  lbrk  <- use cursorBreakSize
   return TextLine
     { theTextLineString    = vec
     , theTextLineTags      = tags
-    , theTextLineBreakSize = 0
+    , theTextLineBreakSize = if break then lbrk else 0
     }
 
 -- | Create a 'TextLine' by copying the the characters in between the two given indicies from the
@@ -2202,21 +2263,23 @@ saveCursorEval f = do
   (cur, a) <- (,) <$> getCursor <*> f
   gotoCursor cur >> return a
 
-class RelativeToAbsoluteCursor index where
+class RelativeToAbsoluteCursor index editor | editor -> index where
   -- | Convert a 'Relative' index (either a 'LineIndex' or 'CharIndex') to an 'Absolute' index.
-  relativeToAbsolute
-    :: (MonadEditText editor, Monad (editor tags m), MonadIO m
-       , Show tags --DEBUG
-       )
-    => Relative index -> editor tags m (Absolute index)
+  relativeToAbsolute :: Relative index -> editor (Absolute index)
 
-instance RelativeToAbsoluteCursor LineIndex where
+instance
+  (MonadIO m
+  , Show tags --DEBUG
+  ) => RelativeToAbsoluteCursor LineIndex (EditText tags m) where
   relativeToAbsolute (Relative (LineIndex i)) = liftEditText $
     Absolute . LineIndex . (+ 1) . max 0 . app . (min &&& (+ i)) <$>
     use linesAboveCursor
 
-instance RelativeToAbsoluteCursor CharIndex where
-  relativeToAbsolute (Relative (CharIndex i)) = liftEditText $
+instance
+  (MonadIO m
+  , Show tags --DEBUG
+  ) => RelativeToAbsoluteCursor CharIndex (EditLine tags m) where
+  relativeToAbsolute (Relative (CharIndex i)) = liftEditLine $
     Absolute . CharIndex . (+ 1) . max 0 . app . (min &&& (+ i)) <$>
     liftEditLine (use charsBeforeCursor)
 
@@ -2312,32 +2375,42 @@ textView
   -> m (Either TextEditError (TextView tags))
 textView from to = stack 10 ("textView ("++show from++") ("++show to++")") .
   liftIO . runEditTextIO (mkview (min from to) (max from to)) where
-    mkview from to = countElems >>= \ nmax -> if nmax <= 0 then return emptyTextView else do
-      copyLineEditorText >>= putElem Before
-      let unline = max 0 . min (nmax - 1) . lineToIndex . theLocationLineIndex
-      let (lo, hi) = (unline from, unline to)
-      newvec <- copyRegion (Absolute lo) $ Relative $ 1 + hi - lo
-      let top = MVec.length newvec - 1
-      let unchar len lbrksz = max 0 . min (len - lbrksz) . charToIndex . theLocationCharIndex
-      let onvec i f = liftIO $ MVec.read newvec i >>= MVec.write newvec i . \ case
-            line@TextLine{}   ->
-              let vec      = line ^. textLineString
-                  veclen   = UVec.length vec
-                  lbrksz   = fromIntegral $ theTextLineBreakSize line
-                  (i, len) = f veclen lbrksz
-              in line & textLineString %~ UVec.slice i len
-            TextLineUndefined -> error $
-              "textView: trimmed vector contains undefined line at index "++show i
-      onvec top $ \ len lbrksz -> (0, unchar len lbrksz to) 
-      onvec 0   $ \ len lbrksz -> let i = unchar len lbrksz from in (i, len - i)
-      let freeze = liftIO . if unsafeMode then Vec.unsafeFreeze else Vec.freeze
-      newvec <- freeze newvec
-      return TextView
-        { textViewCharCount = sum $ Vec.toList newvec >>= \ case
-            TextLineUndefined               -> []
-            TextLine{theTextLineString=vec} -> [UVec.length vec]
-        , textViewVector    = newvec
-        }
+    mkview from to = countElems >>= \ nmax ->
+      if nmax <= 0 || from == to then return emptyTextView else do
+        copyLineEditorText >>= putElem Before
+        let unline = lineToIndex . theLocationLineIndex
+        let (lo, hi) = (unline from, unline to)
+        newvec <- copyRegionChk (Absolute lo) $ Relative $ 1 + hi - lo
+        debugnewvec <- liftIO $ Vec.freeze newvec --DEBUG
+        let debugview = TextView --DEBUG
+              { textViewCharCount = sum $ Vec.toList debugnewvec >>= \ case --DEBUG
+                  TextLineUndefined               -> [] --DEBUG
+                  TextLine{theTextLineString=vec} -> [UVec.length vec] --DEBUG
+              , textViewVector    = debugnewvec --DEBUG
+              } --DEBUG
+        traceM $ "(textView: show TextView prior to trimming)" --DEBUG
+        debugPrintView debugview --DEBUG
+        let top = MVec.length newvec - 1
+        let unchar len lbrksz = max 0 . min (len - lbrksz) . charToIndex . theLocationCharIndex
+        let onvec i f = liftIO $ MVec.read newvec i >>= MVec.write newvec i . \ case
+              line@TextLine{}   ->
+                let vec      = line ^. textLineString
+                    veclen   = UVec.length vec
+                    lbrksz   = fromIntegral $ theTextLineBreakSize line
+                    (i, len) = f veclen lbrksz
+                in line & textLineString %~ UVec.slice i len
+              TextLineUndefined -> error $
+                "textView: trimmed vector contains undefined line at index "++show i
+        onvec top $ \ len lbrksz -> (0, unchar len lbrksz to) 
+        onvec 0   $ \ len lbrksz -> let i = unchar len lbrksz from in (i, len - i)
+        let freeze = liftIO . if unsafeMode then Vec.unsafeFreeze else Vec.freeze
+        newvec <- freeze newvec
+        return TextView
+          { textViewCharCount = sum $ Vec.toList newvec >>= \ case
+              TextLineUndefined               -> []
+              TextLine{theTextLineString=vec} -> [UVec.length vec]
+          , textViewVector    = newvec
+          }
 
 -- | Like 'textView', creates a new text view, but rather than taking two 'TextLocation's to delimit
 -- the range, takes two @('Absolute' 'LineIndex')@ values to delimit the range.

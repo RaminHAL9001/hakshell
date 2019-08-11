@@ -11,9 +11,10 @@ import           Control.Monad.IO.Class
 main :: IO ()
 main = do
   begin
+  moveCursorTests
   lineEditorTests
-  --textViewTests
-  --basicTests
+  textViewTests
+  textEditorTests
 
 begin :: IO ()
 begin = putStrLn "\n-------------------------\nBegin HakshellTest Log\n-------------------------\n"
@@ -48,6 +49,71 @@ report = liftIO . putStr
 
 ----------------------------------------------------------------------------------------------------
 
+-- The 'copyRegion' function is a sort of dependency for both the 'lineEditorTests' and the
+-- 'textViewTests'.
+moveCursorTests :: IO ()
+moveCursorTests = do
+  buf <- newTextBuffer defaultTags
+  testTextEditor error buf $ do
+    let ins dir ch = do
+          report $ "insertChar "++show dir++' ':show ch++"\n"
+          insertChar dir ch
+    let check expct = do
+          txt <- copyLineEditorText
+          if unpack txt == expct
+           then do
+            report "content of buffer: "
+            liftIO $ print txt
+           else error $ "\n  Expecting: "++show expct++"\n  Contents: "++show txt
+    let move dir expbef expaft = liftEditLine $ do
+          report $ "moveByChar ("++show dir++")\n"
+          moveByChar dir
+          check (expbef++expaft)
+          let checkpart what txt exp cont = if unpack txt /= exp
+                then error $
+                  " characters "++what++
+                  " cursor do not match expected value:\n  Expecting: "++show expbef++
+                  "\n  Contents: "++show txt
+                else cont
+          beftxt <- copyCharsToEnd Before
+          afttxt <- copyCharsToEnd After
+          checkpart "before" beftxt expbef $ checkpart "after" afttxt expaft $ return ()
+    ins Before 'A'
+    ins After  'F'
+    check "AF"
+    move (-1) "" "AF"
+    move  (2) "AF" ""
+    move (-2) "" "AF"
+    move  (1) "A" "F"
+    ins Before 'B'
+    check "ABF"
+    ins After  'E'
+    check "ABEF"
+    move (-2) "" "ABEF"
+    move  (3) "ABE" "F"
+    move (-3) "" "ABEF"
+    move  (4) "ABEF" ""
+    move (-2) "AB" "EF"
+    ins Before 'C'
+    check "ABCEF"
+    ins After  'D'
+    check "ABCDEF"
+    move (-3) "" "ABCDEF"
+    move  (6) "ABCDEF" ""
+    move (-6) "" "ABCDEF"
+    move  (3) "ABC" "DEF"
+    move  (2) "ABCDE" "F"
+    move (-3) "AB" "CDEF"
+    move  (4) "ABCDEF" ""
+    move (-5) "A" "BCDEF"
+    move (-1) "" "ABCDEF"
+    move  (1) "A" "BCDEF"
+    move  (4) "ABCDE" "F"
+    move  (1) "ABCDEF" ""
+    move (-1) "ABCDE" "F"
+
+----------------------------------------------------------------------------------------------------
+
 lineEditorTests :: IO ()
 lineEditorTests = do
   report "--- line editor tests ---\n"
@@ -64,7 +130,7 @@ lineEditorTests = do
         moveByChar dir
         copyLineEditorText >>= liftIO . print
   let select i count = testTextEditor error buf $ do
-        report $ "--- copyLineRange "++show i++' ':show count++" ---\n"
+        report $ "--- copyCharsRange "++show i++' ':show count++" ---\n"
         editLine (copyCharsRange i count) >>= liftIO . print
   select 12 11
   move minBound
@@ -74,8 +140,8 @@ lineEditorTests = do
   move (-20)
   instr Before "the "
 
-basicTests :: IO ()
-basicTests = do
+textEditorTests :: IO ()
+textEditorTests = do
   buf <- newTextBuffer defaultTags
   report "--- basic tests ---\n"
   let reportInsert str = testTextEditor error buf $ do
