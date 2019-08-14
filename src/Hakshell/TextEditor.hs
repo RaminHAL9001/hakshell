@@ -253,20 +253,26 @@ import Debug.Trace
 -- For efficient insertion, lines below the cursor are shifted toward the end of the vector, leaving
 -- a gap of many conecutive 'TextLineUndefined' lines which can be over-written in O(1) time.
 --
--- When a user positions the cursor, it is done with 1-based indexing values of type @('Absolute'
--- 'LineIndex')@ or @('Absolute' 'CharIndex')@, so the first line is line 1, not line zero. This
--- means care must be taken to translate 'Absolute' addresses to vector indicies by subtracting 1
--- from every line number parameter passed by a public API.
+-- When a user positions the cursor, it is done with 1-based indexing values of type 'LineIndex' or
+-- 'CharIndex', so the first line is line 1, not line zero. This means care must be taken to
+-- translate these addresses to vector indicies by subtracting 1 from every line number parameter
+-- passed by a public API, which is done with functions like 'charToIndex' and
+-- 'lineToIndex'.
 --
--- There are two integer values tracked in the text buffer: 'cursorLineIndex' and
+-- There are two integer values tracked in the text buffer: 'linesAboveCursor' and
 -- 'linesBelowCursor'. The sum of these two numbers indicates how many lines there are in the
--- buffer. The cursor position, and the number of lines of text, is accounted for these two values.
+-- buffer. The cursor position, and the number of lines of text, is accounted for these two values
+-- thusly:
 --
--- It is important to remember, conceptually, that the cursor exists "in between" lines. When put
--- into "insert mode" (as in the Vi editor's way of doing things), a line is selected from just
--- below the cursor. So if the 'cursorLineIndex' value is 0, think of the cursor as being just above
--- the zero'th index in the buffer, and when a entering insert mode to begin editing a line, it
--- selects the line at index 0, which is @'Absolute' ('LineIndex' 1)@.
+-- It is important to remember, conceptually, that the 'linesBelowCursor' value not only indicates
+-- how many lines are before the cursor, but also can be thought of as an address pointing to a
+-- space inbetween two lines. So in order to compute the index of the line under the cursor, as you
+-- would with the 'cursorIndex' function, the index is computed by subtracting 1 from the
+-- 'linesBelowCursor' value. So if the 'linesBelowCursor' value is 0, reading a line will result in
+-- a bounds exception being thrown. Although all buffers are initialized with a single empty line
+-- below the cursor, it is possible to 'popLine' or 'moveByLine' such that there are zero lines
+-- below the cursor. Be careful to use 'pushLine' or 'moveByLine' after moving the cursor to the top
+-- of the buffer before attempting to edit the line under the cursor.
 --
 -- Another important thing to remember is that users express __inclusive__ line ranges. So when
 -- selecting "from lines 2 to 3," the user expects both lines 2 and 3, so subtract 3 from 2 and add
@@ -1186,6 +1192,13 @@ getAbsoluteChk :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem) => Abso
 getAbsoluteChk (Absolute i) = getAllocSize >>= \ siz ->
   (if not $ 0 <= i && i < siz then throwIndexErr else getAbsolute . Absolute) i
 
+-- Get the index within the vector that is associated with the given index value 'Relative' to the
+-- cursor.
+getRelative :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem) => Relative Int -> m Int
+getRelative (Relative count) =
+  trace ("getRelative "++show count) $
+  (+ count) <$> getElemCount Before
+
 -- Get the index within the vector that is associated with the given 'LineIndex'. Bounds checking is
 -- __NOT__ performed.
 getAbsolute :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem) => Absolute Int -> m Int
@@ -1209,10 +1222,12 @@ getRelToAbs (Relative i) =
 getVoid
   :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem)
   => m (Maybe (Absolute Int, Absolute Int))
-getVoid = trace "getVoid" $ do
-  rgn <- (,) <$> (Absolute <$> cursorIndex Before)
-             <*> (Absolute . subtract 1 <$> cursorIndex After)
-  return $ guard (uncurry (<=) rgn) >> Just rgn
+getVoid = trace "getVoid ..." $ do
+  rgn <- (,) <$> (Absolute <$> getElemCount Before)
+             <*> (Absolute . subtract 1 <$> cursorIndexAfter)
+  return $
+    (\ rgn -> trace ("getVoid -> "++show rgn) rgn) $ --DEBUG
+    guard (uncurry (<=) rgn) >> Just rgn
 
 -- Make a slice of elements relative to the current cursor. A negative argument will take elements
 -- before and up-to the cursor, a positive argument will take that many elements starting from
@@ -1225,7 +1240,7 @@ getSlice rel@(Relative count) = trace ("getSlice "++show count) $ do
   vec <- getVector
   if rel < 0
    then do
-    i <- (+ count) <$> getElemCount Before
+    i <- getRelative rel
     return $ trace ("GMVec.slice "++show i++' ':show (abs count)) $ GMVec.slice i (abs count) vec
    else if rel > 0
    then do
@@ -1238,9 +1253,10 @@ getSliceChk
   :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem)
   => Relative Int -> m (vec st elem)
 getSliceChk rel@(Relative count) = trace ("getSliceChk "++show count) $ do
-  (Absolute i) <- getRelToAbs rel
+  i <- getRelative rel
   if count < 0 then when (i < 0) (throwCountErr count) else do
     nelems <- countElems
+    traceM $ "getSliceCheck -> i="++show i++", nelems="++show nelems
     when (i > nelems) (throwCountErr count)
   getSlice rel
 
@@ -1470,7 +1486,7 @@ shiftCursor
 shiftCursor (Relative count) = trace ("shiftCursor "++show count) $
   if count == 0 then return () else getVoid >>= \ case
     Nothing -> done
-    Just (Absolute lo, Absolute hi) ->
+    Just ~(Absolute lo, Absolute hi) ->
       if      count ==  1 then popElem After  >>= pushElem Before
       else if count == -1 then popElem Before >>= pushElem After
       else do
@@ -1478,8 +1494,10 @@ shiftCursor (Relative count) = trace ("shiftCursor "++show count) $
         from <- getSlice (Relative count)
         let slice = if unsafeMode then GMVec.unsafeSlice else GMVec.slice
         let to = vec &
-              if      count > 1 then trace ("GMVec.move (GMVec.slice "++show lo++' ':show count++")") $ slice lo count
-              else if count < 1 then trace ("GMVec.move (GMVec.slice "++show (hi+count)++' ':show (negate count)++")") $ slice (hi + count) (negate count)
+              if      count > 1 then trace ("GMVec.move (GMVec.slice "++show lo++' ':show count++")") $
+                      slice lo count
+              else if count < 1 then trace ("GMVec.move (GMVec.slice "++show (hi+count)++' ':show (negate count)++")") $
+                      slice (hi + count) (negate count)
               else error "shiftCursor: internal error, this should never happen"
         liftIO $ GMVec.move to from
         done
@@ -1720,8 +1738,8 @@ copyChars
      , Show tags --DEBUG
      )
   => Relative CharIndex -> editor tags m (TextLine tags)
-copyChars rel@(Relative (CharIndex i)) = liftEditLine $ do
-  slice <- getSliceChk (Relative i) >>= liftIO . UVec.freeze
+copyChars rel = trace ("copyChars ("++show rel++")") $ liftEditLine $ do
+  slice <- getSliceChk (Relative $ charToCount rel) >>= liftIO . UVec.freeze
   break <- relativeToAbsolute rel >>= pointContainsLineBreak
   lbrk  <- use cursorBreakSize
   tags  <- use lineEditorTags
@@ -1739,8 +1757,10 @@ copyCharsToEnd
      , Show tags --DEBUG
      )
   => RelativeToCursor -> editor tags m (TextLine tags)
-copyCharsToEnd rel = trace ("copyCharsToEnd "++show rel) $
-  getElemCount >=> copyChars . Relative . CharIndex $ rel
+copyCharsToEnd rel =
+  trace ("copyCharsToEnd "++show rel) $ --DEBUG
+  (case rel of { Before -> negate; After -> id; }) <$> getElemCount rel >>=
+  copyChars . countToChar
 
 -- | Create a 'TextLine' by copying the the characters in the given range from the line under the
 -- cursor.
@@ -2282,17 +2302,15 @@ instance
   (MonadIO m
   , Show tags --DEBUG
   ) => RelativeToAbsoluteCursor LineIndex (EditText tags m) where
-  relativeToAbsolute (Relative (LineIndex i)) = liftEditText $
-    Absolute . LineIndex . (+ 1) . max 0 . app . (min &&& (+ i)) <$>
-    use linesAboveCursor
+  relativeToAbsolute = liftEditText .
+    fmap (indexToLine . (\ (Absolute i) -> i)) . getRelToAbs . Relative . lineToCount
 
 instance
   (MonadIO m
   , Show tags --DEBUG
   ) => RelativeToAbsoluteCursor CharIndex (EditLine tags m) where
-  relativeToAbsolute (Relative (CharIndex i)) = liftEditLine $
-    Absolute . CharIndex . (+ 1) . max 0 . app . (min &&& (+ i)) <$>
-    liftEditLine (use charsBeforeCursor)
+  relativeToAbsolute = liftEditLine .
+    fmap (indexToChar . (\ (Absolute i) -> i)) . getRelToAbs . Relative . charToCount
 
 ----------------------------------------------------------------------------------------------------
 
