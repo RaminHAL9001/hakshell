@@ -56,17 +56,17 @@ moveCursorTests = do
   buf <- newTextBuffer defaultTags
   testTextEditor error buf $ do
     let ins dir ch = do
-          report $ "insertChar "++show dir++' ':show ch++"\n"
+          report $ "--- insertChar "++show dir++' ':show ch++"\n"
           insertChar dir ch
     let check expct = do
           txt <- copyLineEditorText
           if unpack txt == expct
            then do
-            report "content of buffer: "
+            report "--- content of buffer: "
             liftIO $ print txt
            else error $ "\n  Expecting: "++show expct++"\n  Contents: "++show txt
     let move dir expbef expaft = liftEditLine $ do
-          report $ "moveByChar ("++show dir++")\n"
+          report $ "--- moveByChar ("++show dir++")\n"
           moveByChar dir
           check (expbef++expaft)
           let checkpart what txt exp cont = if unpack txt /= exp
