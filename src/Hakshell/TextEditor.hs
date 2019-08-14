@@ -1496,8 +1496,8 @@ shiftCursor (Relative count) = trace ("shiftCursor "++show count) $
         let to = vec &
               if      count > 1 then trace ("GMVec.move (GMVec.slice "++show lo++' ':show count++")") $
                       slice lo count
-              else if count < 1 then trace ("GMVec.move (GMVec.slice "++show (hi+count)++' ':show (negate count)++")") $
-                      slice (hi + count) (negate count)
+              else if count < 1 then trace ("GMVec.move (GMVec.slice "++show (hi+count+1)++' ':show (negate count)++")") $
+                      slice (hi + count + 1) (negate count)
               else error "shiftCursor: internal error, this should never happen"
         liftIO $ GMVec.move to from
         done
