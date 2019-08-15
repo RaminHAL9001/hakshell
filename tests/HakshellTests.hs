@@ -13,8 +13,8 @@ main = do
   begin
   moveCursorTests
   lineEditorTests
-  textViewTests
-  textEditorTests
+--  textViewTests
+--  textEditorTests
 
 begin :: IO ()
 begin = putStrLn "\n-------------------------\nBegin HakshellTest Log\n-------------------------\n"
@@ -112,8 +112,6 @@ moveCursorTests = do
     move  (1) "ABCDEF" ""
     move (-1) "ABCDE" "F"
 
-----------------------------------------------------------------------------------------------------
-
 lineEditorTests :: IO ()
 lineEditorTests = do
   report "--- line editor tests ---\n"
@@ -139,34 +137,6 @@ lineEditorTests = do
   instr Before " now"
   move (-20)
   instr Before "the "
-
-textEditorTests :: IO ()
-textEditorTests = do
-  buf <- newTextBuffer defaultTags
-  report "--- basic tests ---\n"
-  let reportInsert str = testTextEditor error buf $ do
-        report $ "insertString " ++ show str ++ "\n"
-        insertString str
-        -- TODO: show the content of the whole buffer as a string here.
-        debugPrintBuffer
-  let reportMove msg line col = testTextEditor error buf $ do
-        report $ "Move cursor "++msg++", line="++show line++" col="++show col++" ...\n"
-        gotoCursor $ mkLoc line col
-        -- TODO: show the content of the whole buffer as a string here.
-        debugPrintBuffer
-  let reportDelete msg n = testTextEditor error buf $ do
-        report $ "Delete on "++msg++", "++show n++" characters...\n"
-        deleteCharsWrap $ Relative $ CharIndex n
-        -- TODO: show the content of the whole buffer as a string here.
-        debugPrintBuffer
-  reportInsert "one two three\n"
-  reportInsert "four five six\nseven eight nine\nten eleven twelve\n"
-  reportMove        "up" 1  1
-  reportMove      "down" 4 16
-  reportMove "to middle" 2  7
-  reportDelete "same line" (-4)
-  reportDelete "to \"three\" on previous line" (-8)
-  report "OK\n"
 
 textViewTests :: IO ()
 textViewTests = do
@@ -212,3 +182,31 @@ textViewTests = do
   reportView (mkLoc  9  1) (mkLoc 10 48)
   reportView (mkLoc  1  1) (mkLoc 16 48)
   reportView (mkLoc  8  1) (mkLoc  8 48)
+
+textEditorTests :: IO ()
+textEditorTests = do
+  buf <- newTextBuffer defaultTags
+  report "--- basic tests ---\n"
+  let reportInsert str = testTextEditor error buf $ do
+        report $ "insertString " ++ show str ++ "\n"
+        insertString str
+        -- TODO: show the content of the whole buffer as a string here.
+        debugPrintBuffer
+  let reportMove msg line col = testTextEditor error buf $ do
+        report $ "Move cursor "++msg++", line="++show line++" col="++show col++" ...\n"
+        gotoCursor $ mkLoc line col
+        -- TODO: show the content of the whole buffer as a string here.
+        debugPrintBuffer
+  let reportDelete msg n = testTextEditor error buf $ do
+        report $ "Delete on "++msg++", "++show n++" characters...\n"
+        deleteCharsWrap $ Relative $ CharIndex n
+        -- TODO: show the content of the whole buffer as a string here.
+        debugPrintBuffer
+  reportInsert "one two three\n"
+  reportInsert "four five six\nseven eight nine\nten eleven twelve\n"
+  reportMove        "up" 1  1
+  reportMove      "down" 4 16
+  reportMove "to middle" 2  7
+  reportDelete "same line" (-4)
+  reportDelete "to \"three\" on previous line" (-8)
+  report "OK\n"

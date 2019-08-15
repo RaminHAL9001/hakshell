@@ -793,7 +793,7 @@ sliceLineToEnd
   ::
     (Show tags) => --DEBUG
     RelativeToCursor -> Absolute CharIndex -> TextLine tags -> TextLine tags
-sliceLineToEnd rel i = trace ("(sliceLineToEnd "++show rel++" ("++show i++"))") . \ case
+sliceLineToEnd rel i = \ case
   TextLineUndefined -> TextLineUndefined
   line -> check $ slice line where
     slice = case rel of
@@ -809,7 +809,7 @@ sliceLine
     (Show tags) => --DEBUG
     Absolute CharIndex -> Relative CharIndex -> TextLine tags
   -> Either TextEditError (TextLine tags)
-sliceLine i0 reqsiz0 = trace ("sliceLine ("++show i0++") ("++show reqsiz0++")") . \ case
+sliceLine i0 reqsiz0 = \ case
   TextLineUndefined -> Left $ TextEditError $ pack $
     "sliceLine ("++show i0++") ("++show reqsiz0++"): evaluated on undefined value"
   line@TextLine{theTextLineString=vec} ->
@@ -1104,24 +1104,24 @@ class MonadIO m => MonadEditVec vec m | m -> vec where
 
 instance MonadIO m => MonadEditVec (MVec.IOVector (TextLine tags)) (EditText tags m) where
   nullElem = pure TextLineUndefined
-  newVector siz = trace ("EditText.newVector "++show siz) $ nullElem >>= liftIO . MVec.replicate siz
+  newVector siz = nullElem >>= liftIO . MVec.replicate siz
   modVector f = state $ \ st -> let vec = f $ theBufferVector st in
     (vec, st{ theBufferVector = vec })
   modCount rel f = state $ \ st -> case rel of
-    Before -> let i = f $ theLinesAboveCursor st in (trace ("{theLinesAboveCursor = "++show i++"}") i, st{ theLinesAboveCursor = i })
-    After  -> let i = f $ theLinesBelowCursor st in (trace ("{theLinesBelowCursor = "++show i++"}") i, st{ theLinesBelowCursor = i })
+    Before -> let i = f $ theLinesAboveCursor st in (i, st{ theLinesAboveCursor = i })
+    After  -> let i = f $ theLinesBelowCursor st in (i, st{ theLinesBelowCursor = i })
   throwLimitErr = throwError . EndOfLineBuffer
   throwIndexErr = throwError . LineIndexOutOfRange . indexToLine
   throwCountErr = throwError . LineCountOutOfRange . countToLine
 
 instance MonadIO m => MonadEditVec (UMVec.IOVector Char) (EditLine tags m) where
   nullElem = pure '\0'
-  newVector siz = trace ("EditLine.newVector "++show siz) $ nullElem >>= liftIO . UMVec.replicate siz
+  newVector siz = nullElem >>= liftIO . UMVec.replicate siz
   modVector f = state $ \ st -> let vec = f $ theLineEditBuffer st in
     (vec, st{ theLineEditBuffer = vec })
   modCount rel f = state $ \ st -> case rel of
-    Before -> let i = f $ theCharsBeforeCursor st in (trace ("{theCharsBeforeCursor = "++show i++"}") i, st{ theCharsBeforeCursor = i })
-    After  -> let i = f $ theCharsAfterCursor  st in (trace ("{theCharsAfterCursor = "++show i++"}") i, st{ theCharsAfterCursor  = i })
+    Before -> let i = f $ theCharsBeforeCursor st in (i, st{ theCharsBeforeCursor = i })
+    After  -> let i = f $ theCharsAfterCursor  st in (i, st{ theCharsAfterCursor  = i })
   throwLimitErr = throwError . EndOfCharBuffer
   throwIndexErr = throwError . CharIndexOutOfRange . indexToChar
   throwCountErr = throwError . CharCountOutOfRange . countToChar
@@ -1153,9 +1153,7 @@ countElems = (+) <$> getElemCount Before <*> getElemCount After
 
 -- The number of elements in the buffer that are not valid, @(bufAllocSize - bufLineCount)@
 getUnusedSpace :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem) => m Int
-getUnusedSpace =
-  (\ i -> trace ("getUnusedSapce -> "++show i) i) <$> --DEBUG
-  (subtract <$> countElems <*> getAllocSize)
+getUnusedSpace = subtract <$> countElems <*> getAllocSize
 
 -- Returns a cursor index, although the index may not be pointing to a valid element. This function
 -- is defined as the value returned by 'getElemCount' subtracted by 1, because the 'getElemCount' is
@@ -1195,17 +1193,13 @@ getAbsoluteChk (Absolute i) = getAllocSize >>= \ siz ->
 -- Get the index within the vector that is associated with the given index value 'Relative' to the
 -- cursor.
 getRelative :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem) => Relative Int -> m Int
-getRelative (Relative count) =
-  trace ("getRelative "++show count) $
-  (+ count) <$> getElemCount Before
+getRelative (Relative count) = (+ count) <$> getElemCount Before
 
 -- Get the index within the vector that is associated with the given 'LineIndex'. Bounds checking is
 -- __NOT__ performed.
 getAbsolute :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem) => Absolute Int -> m Int
 getAbsolute (Absolute i) =
-  trace ("getAbsolute "++show i) $ --DEBUG
-  cursorIndex Before >>= \ cur ->
-  if i <= cur then return i else (+ i) <$> getUnusedSpace
+  cursorIndex Before >>= \ cur -> if i <= cur then return i else (+ i) <$> getUnusedSpace
 
 -- From a 'Relative' index value (relative to the cursor) convert this value to to an 'Absolute'
 -- index value. Absolute as in the actual element number, not it's address index in the vector. A
@@ -1213,21 +1207,17 @@ getAbsolute (Absolute i) =
 getRelToAbs
   :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem)
   => Relative Int -> m (Absolute Int)
-getRelToAbs (Relative i) =
-  trace ("getRelToAbs "++show i) $ --DEBUG
-  Absolute . (+ i) <$> cursorIndex Before
+getRelToAbs (Relative i) = Absolute . (+ i) <$> cursorIndex Before
 
 -- Return the starting and ending index of the void region of the buffer, which is the contiguous
 -- region of undefined elements within the buffer.
 getVoid
   :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem)
   => m (Maybe (Absolute Int, Absolute Int))
-getVoid = trace "getVoid ..." $ do
+getVoid = do
   rgn <- (,) <$> (Absolute <$> getElemCount Before)
              <*> (Absolute . subtract 1 <$> cursorIndexAfter)
-  return $
-    (\ rgn -> trace ("getVoid -> "++show rgn) rgn) $ --DEBUG
-    guard (uncurry (<=) rgn) >> Just rgn
+  return $ guard (uncurry (<=) rgn) >> Just rgn
 
 -- Make a slice of elements relative to the current cursor. A negative argument will take elements
 -- before and up-to the cursor, a positive argument will take that many elements starting from
@@ -1236,27 +1226,26 @@ getVoid = trace "getVoid ..." $ do
 getSlice
   :: (MonadEditVec (mvec st elem) m, GMVec.MVector mvec elem)
   => Relative Int -> m (mvec st elem)
-getSlice rel@(Relative count) = trace ("getSlice "++show count) $ do
+getSlice rel@(Relative count) = do
   vec <- getVector
   if rel < 0
    then do
     i <- getRelative rel
-    return $ trace ("GMVec.slice "++show i++' ':show (abs count)) $ GMVec.slice i (abs count) vec
+    return $ GMVec.slice i (abs count) vec
    else if rel > 0
    then do
     i <- cursorIndexAfter
-    return $ trace ("GMVec.slice "++show i++' ':show count) $ GMVec.slice i count vec
+    return $ GMVec.slice i count vec
    else return $ GMVec.slice 0 0 vec
 
 -- Like 'getSlice' but performs bounds checking.
 getSliceChk
   :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem)
   => Relative Int -> m (vec st elem)
-getSliceChk rel@(Relative count) = trace ("getSliceChk "++show count) $ do
+getSliceChk rel@(Relative count) = do
   i <- getRelative rel
   if count < 0 then when (i < 0) (throwCountErr count) else do
     nelems <- countElems
-    traceM $ "getSliceCheck -> i="++show i++", nelems="++show nelems
     when (i > nelems) (throwCountErr count)
   getSlice rel
 
@@ -1266,25 +1255,25 @@ getSliceChk rel@(Relative count) = trace ("getSliceChk "++show count) $ do
 getVoidSlice
   :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem)
   => Relative Int -> m (Maybe (vec st elem))
-getVoidSlice (Relative count) = trace ("getVoidSlice "++show count) $ do
+getVoidSlice (Relative count) = do
   vec <- getVector
   vsp <- getVoid
   return $ vsp <&> \ (Absolute lo, Absolute hi) ->
    if count < 0
-   then trace ("GMVec.slice "++show (hi + count)++' ':show (abs count)) $ GMVec.slice (hi + count) (abs count) vec
+   then GMVec.slice (hi + count) (abs count) vec
    else if count > 0
-   then trace ("GMVec.slice "++show lo++' ':show count) $ GMVec.slice lo count vec
-   else trace ("GMVec.slice 0 0") $ GMVec.slice 0 0 vec
+   then GMVec.slice lo count vec
+   else GMVec.slice 0 0 vec
 
 -- Obtain a slice (using 'getSlice') for the portion of the vector containing elements before or on
 -- the current cursor.
 getLoSlice :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem) => m (vec st elem)
-getLoSlice = trace "getLoSlice" $ getElemCount Before >>= getSlice . Relative . negate
+getLoSlice = getElemCount Before >>= getSlice . Relative . negate
 
 -- Obtain a slice (using 'getSliceM') for the portion of the vector containing elements after the
 -- current cursor.
 getHiSlice :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem) => m (vec st elem)
-getHiSlice = trace "getHiSlice" $ getElemCount After >>= getSlice . Relative
+getHiSlice = getElemCount After >>= getSlice . Relative
 
 -- Select a region of valid elements given an index and size values, taking into account the
 -- position of the cursor, and copy the region into a new contiguous mutable vector that contains no
@@ -1292,34 +1281,33 @@ getHiSlice = trace "getHiSlice" $ getElemCount After >>= getSlice . Relative
 copyRegion
   :: (GMVec.MVector vec elem, MonadEditVec (vec RealWorld elem) m)
   => Absolute Int -> Relative Int -> m (vec RealWorld elem)
-copyRegion (Absolute i) (Relative count) = trace ("copyRegion "++show i++' ':show count) $
-  if count == 0 then liftIO $ GMVec.new 0 else do
-    let sum = i + count
-    let lo  = min i sum
-    let hi  = max i sum
-    let siz = abs count
-    oldvec <- getVector
-    before <- getElemCount Before
-    if lo >= before
-     then do
-      i <- getAbsolute $ Absolute lo
-      traceM $ "GMVec.clone (GMVec.slice "++show i++' ':show siz++")" --DEBUG
-      liftIO $ GMVec.clone $ GMVec.slice i siz oldvec
-     else if hi < before
-     then do
-      traceM $ "GMVec.clone (GMVec.slice"++show lo++' ':show siz++")" --DEBUG
-      liftIO $ GMVec.clone $ GMVec.slice lo siz oldvec
-     else do
-      let sublen = before - lo
-      lovec  <- getSlice $ Relative $ negate sublen
-      hivec  <- getSlice $ Relative $ hi - before
-      newvec <- newVector siz
-      let copy  = (.) liftIO . if unsafeMode then GMVec.unsafeCopy else GMVec.copy
-      traceM $ "GMVec.copy (GMVec.slice 0 "++show sublen++")"
-      copy (GMVec.slice 0 sublen newvec) lovec
-      traceM $ "GMVec.copy (GMVec.slice "++show sublen++' ':show (siz - sublen)++")"
-      copy (GMVec.slice sublen (siz - sublen) newvec) hivec
-      return newvec
+copyRegion (Absolute i) (Relative count) = if count == 0 then liftIO $ GMVec.new 0 else do
+  let sum = i + count
+  let lo  = min i sum
+  let hi  = max i sum
+  let siz = abs count
+  oldvec <- getVector
+  before <- getElemCount Before
+  if lo >= before
+   then do
+    i <- getAbsolute $ Absolute lo
+    traceM $ "GMVec.clone (GMVec.slice "++show i++' ':show siz++")" --DEBUG
+    liftIO $ GMVec.clone $ GMVec.slice i siz oldvec
+   else if hi < before
+   then do
+    traceM $ "GMVec.clone (GMVec.slice"++show lo++' ':show siz++")" --DEBUG
+    liftIO $ GMVec.clone $ GMVec.slice lo siz oldvec
+   else do
+    let sublen = before - lo
+    lovec  <- getSlice $ Relative $ negate sublen
+    hivec  <- getSlice $ Relative $ hi - before
+    newvec <- newVector siz
+    let copy  = (.) liftIO . if unsafeMode then GMVec.unsafeCopy else GMVec.copy
+    traceM $ "GMVec.copy (GMVec.slice 0 "++show sublen++")"
+    copy (GMVec.slice 0 sublen newvec) lovec
+    traceM $ "GMVec.copy (GMVec.slice "++show sublen++' ':show (siz - sublen)++")"
+    copy (GMVec.slice sublen (siz - sublen) newvec) hivec
+    return newvec
 
 copyRegionChk
   :: (GMVec.MVector vec elem, MonadEditVec (vec RealWorld elem) m)
@@ -1337,11 +1325,8 @@ putElemIndex
      , Show elem --DEBUG
      )
   => Int -> elem -> m ()
-putElemIndex i elem = trace ("putElemIndex "++show i++' ':show elem) $
-  write <$> getVector <*> pure i <*> pure elem >>= liftIO where
-    write =
-      trace ("GMVec.write "++show i++' ':show elem) $ --DEBUG
-      if unsafeMode then GMVec.unsafeWrite else GMVec.write
+putElemIndex i elem = write <$> getVector <*> pure i <*> pure elem >>= liftIO where
+  write = if unsafeMode then GMVec.unsafeWrite else GMVec.write
 
 -- Read an element from a vector index. __WARNING__: there is no bounds checking.
 getElemIndex
@@ -1349,12 +1334,7 @@ getElemIndex
      , Show elem --DEBUG
      )
   => Int -> m elem
-getElemIndex i = trace ("getElemIndex "++show i) $
-  (\ elem -> trace ("GMVec.read "++show i++" -> "++show elem) elem) <$> --DEBUG
-  ( trace ("GMVec.read "++show i++" ...") $ --DEBUG
-    read <$> getVector <*> pure i >>= liftIO
-  )
-  where
+getElemIndex i = read <$> getVector <*> pure i >>= liftIO where
   read = if unsafeMode then GMVec.unsafeRead else GMVec.read
 
 -- Like 'putElemIndex' but the index to which the element is written is given by a
@@ -1365,8 +1345,7 @@ putElem
      , Show elem --DEBUG
      )
   => RelativeToCursor -> elem -> m ()
-putElem rel elem = trace ("putElem "++show rel++' ':show elem) $
-  join $ putElemIndex <$> cursorIndexChk rel <*> pure elem
+putElem rel elem = join $ putElemIndex <$> cursorIndexChk rel <*> pure elem
 
 -- Like 'getElemIndex' but the index from which the element is read is given by a 'RelativeToCursor'
 -- value, so the index returned by 'cursorIndex'. The cursor position is not modified.
@@ -1375,8 +1354,7 @@ getElem
      , Show elem --DEBUG
      )
   => RelativeToCursor -> m elem
-getElem rel = trace ("getElem "++show rel) $
-  cursorIndexChk rel >>= getElemIndex
+getElem rel = cursorIndexChk rel >>= getElemIndex
 
 -- Like 'putElem' but the @elem@ value to be put is taken from the 'nullElem' for this 'MonadEditVec'
 -- context. The cursor position is not modified.
@@ -1385,8 +1363,7 @@ delElem
      , Show elem --DEBUG
      )
   => RelativeToCursor -> m ()
-delElem rel = trace ("delElem "++show rel) $
-  join (putElem rel <$> nullElem) >> void (modCount rel $ subtract 1)
+delElem rel = join (putElem rel <$> nullElem) >> void (modCount rel $ subtract 1)
 
 -- Takes two paramters @oldSize@ and @newSize@. This function finds the minimum power of two scalara
 -- necessary to scale the @oldSize@ such that it is __greater_than__ the @newSize@. Said another
@@ -1409,7 +1386,7 @@ minPow2ScaledSize oldsiz newsiz = head $ dropWhile (<= newsiz) $ iterate (* 2) $
 prepLargerVector
   :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem)
   => Int -> m (Maybe (vec RealWorld elem))
-prepLargerVector newsiz = trace ("prepLargerVector "++show newsiz) $ do
+prepLargerVector newsiz = do
   oldsiz <- getAllocSize
   if oldsiz >= newsiz then return Nothing else
     Just <$> newVector (minPow2ScaledSize oldsiz newsiz)
@@ -1421,8 +1398,7 @@ prepLargerVector newsiz = trace ("prepLargerVector "++show newsiz) $ do
 growVector
   :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem)
   => Int -> m ()
-growVector increase = trace ("growVector "++show increase) $
-  if increase <= 0 then return () else
+growVector increase = if increase <= 0 then return () else
   countElems >>= \ count -> prepLargerVector (count + increase) >>= \ case
     Nothing     -> return ()
     Just newvec -> do
@@ -1430,9 +1406,7 @@ growVector increase = trace ("growVector "++show increase) $
       oldaft <- getHiSlice
       modVector $ const newvec
       newbef <- getLoSlice
-      traceM "GMVec.copy"
       newaft <- getHiSlice
-      traceM "GMVec.copy"
       liftIO $ do
         GMVec.copy newbef oldbef
         GMVec.copy newaft oldaft
@@ -1444,8 +1418,7 @@ pushElem
      , Show elem --DEBUG
      )
   => RelativeToCursor -> elem -> m ()
-pushElem rel elem = trace ("pushElem "++show rel++' ':show elem) $ do
-  growVector 1 >> void (modCount rel (+ 1)) >> putElem rel elem
+pushElem rel elem = growVector 1 >> void (modCount rel (+ 1)) >> putElem rel elem
 
 -- Push a vector of elements starting at the index 'Before' (currently on) the cursor, or the index
 -- 'After' the cursor.
@@ -1454,7 +1427,7 @@ pushElemVec
      , Show elem --DEBUG
      )
   => RelativeToCursor -> vec elem -> m ()
-pushElemVec rel src = trace ("pushElemVec "++show rel) $ do
+pushElemVec rel src = do
   let len = GVec.length src
   let copy = if unsafeMode then GVec.unsafeCopy else GVec.copy
   growVector len
@@ -1471,8 +1444,7 @@ popElem
      , Show elem --DEBUG
      )
   => RelativeToCursor -> m elem
-popElem rel = trace ("popElem "++show rel) $
-  getElem rel <* delElem rel
+popElem rel = getElem rel <* delElem rel
 
 -- Move the cursor, which will shift elements around the vector, using a algorithm of O(n) steps,
 -- where @n@ is the 'Relative' shift value. Pass a boolean value indicating whether or not you would
@@ -1483,7 +1455,7 @@ shiftCursor
      , Show elem --DEBUG
      )
   => Relative Int -> m ()
-shiftCursor (Relative count) = trace ("shiftCursor "++show count) $
+shiftCursor (Relative count) =
   if count == 0 then return () else getVoid >>= \ case
     Nothing -> done
     Just ~(Absolute lo, Absolute hi) ->
@@ -1494,10 +1466,8 @@ shiftCursor (Relative count) = trace ("shiftCursor "++show count) $
         from <- getSlice (Relative count)
         let slice = if unsafeMode then GMVec.unsafeSlice else GMVec.slice
         let to = vec &
-              if      count > 1 then trace ("GMVec.move (GMVec.slice "++show lo++' ':show count++")") $
-                      slice lo count
-              else if count < 1 then trace ("GMVec.move (GMVec.slice "++show (hi+count+1)++' ':show (negate count)++")") $
-                      slice (hi + count + 1) (negate count)
+              if      count > 1 then slice lo count
+              else if count < 1 then slice (hi + count + 1) (negate count)
               else error "shiftCursor: internal error, this should never happen"
         liftIO $ GMVec.move to from
         done
@@ -1522,17 +1492,14 @@ freezeVector
     , Show (vec elem) --DEBUG
     )
   => m (vec elem)
-freezeVector = trace ("freezeVector") $ do
+freezeVector = do
   newvec <- countElems >>= newVector
   bef <- getLoSlice
-  traceM $ "GMVec.copy (GMVec.slice 0 (GMVec.length before -> "++show (GMVec.length bef)++"))"
   aft <- getHiSlice
-  traceM $ "GMVec.copy (GMVec.slice (GMVec.length before -> "++show (GMVec.length bef)++") (GMVec.length after -> "++show (GMVec.length aft)++"))"
   let slice = if unsafeMode then GMVec.unsafeSlice else GMVec.slice
   liftIO $ do
     GMVec.copy (slice 0 (GMVec.length bef) newvec) bef
     GMVec.copy (slice (GMVec.length bef) (GMVec.length aft) newvec) aft
-    traceM $ "GMVec.freeze"
     GVec.unsafeFreeze newvec
 
 ----------------------------------------------------------------------------------------------------
@@ -1734,11 +1701,11 @@ pointContainsLineBreak pt = liftEditLine $ do
 
 -- | Create a 'TextLine' by copying the characters relative to the cursor.
 copyChars
-  :: (MonadEditLine editor, MonadIO (editor tags m), MonadIO m
+  :: (MonadIO m
      , Show tags --DEBUG
      )
-  => Relative CharIndex -> editor tags m (TextLine tags)
-copyChars rel = trace ("copyChars ("++show rel++")") $ liftEditLine $ do
+  => Relative CharIndex -> EditLine tags m (TextLine tags)
+copyChars rel = do
   slice <- getSliceChk (Relative $ charToCount rel) >>= liftIO . UVec.freeze
   break <- relativeToAbsolute rel >>= pointContainsLineBreak
   lbrk  <- use cursorBreakSize
@@ -1752,13 +1719,11 @@ copyChars rel = trace ("copyChars ("++show rel++")") $ liftEditLine $ do
 -- | Calls 'copyChars' with a @'Relative' 'CharIndex'@ value equal to the number of characters
 -- 'Before' or 'After' the cursor on the current line.
 copyCharsToEnd
-  :: (MonadEditLine editor, MonadIO (editor tags m), MonadIO m,
-      MonadEditVec (UMVec.IOVector Char) (editor tags m)
+  :: (MonadIO m
      , Show tags --DEBUG
      )
-  => RelativeToCursor -> editor tags m (TextLine tags)
+  => RelativeToCursor -> EditLine tags m (TextLine tags)
 copyCharsToEnd rel =
-  trace ("copyCharsToEnd "++show rel) $ --DEBUG
   (case rel of { Before -> negate; After -> id; }) <$> getElemCount rel >>=
   copyChars . countToChar
 
@@ -1769,7 +1734,7 @@ copyCharsRange
      , Show tags --DEBUG
      )
   => Absolute CharIndex -> Relative CharIndex -> EditLine tags m (TextLine tags)
-copyCharsRange i count = trace ("copyCharsRange ("++show i++") ("++show count++")") $ do
+copyCharsRange i count = do
   vec <- liftIO . UVec.freeze =<<
     copyRegionChk (Absolute $ charToIndex i) (Relative $ charToCount count)
   break <- pointContainsLineBreak $
@@ -1982,8 +1947,7 @@ moveByChar
      , Show tags --DEBUG
      )
   => Relative CharIndex -> editor tags m ()
-moveByChar rel = trace ("moveByChar "++show rel) $
-  liftEditLine . shiftCursorChk . Relative . charToCount $ rel
+moveByChar rel = liftEditLine . shiftCursorChk . Relative . charToCount $ rel
 
 -- | Go to an absolute line number, the first line is 1 (line 0 and below all send the cursor to
 -- line 1), the last line is 'Prelude.maxBound'.
@@ -2025,10 +1989,9 @@ insertChar
      , Show tags --DEBUG
      )
   => RelativeToCursor -> Char -> editor tags m (Relative CharIndex)
-insertChar rel c = trace ("insertChar "++show rel++' ':show c) $
-  liftEditText $ Relative . CharIndex <$> do
-    isBreak <- use $ bufferLineBreaker . lineBreakPredicate
-    if isBreak c then return 0 else liftEditLine (pushElem rel c) >> return 1
+insertChar rel c = liftEditText $ Relative . CharIndex <$> do
+  isBreak <- use $ bufferLineBreaker . lineBreakPredicate
+  if isBreak c then return 0 else liftEditLine (pushElem rel c) >> return 1
 
 -- | This function only deletes characters on the current line, if the cursor is at the start of the
 -- line and you evaluate @'deleteChars' 'Before'@, this function does nothing. This function does
