@@ -88,7 +88,7 @@ module Hakshell.TextEditor
 
     insertString, lineBreak, deleteCharsWrap, pushLine, popLine,
     currentTextLocation, currentLineNumber, currentColumnNumber,
-    readLineIndex, writeLineIndex, beginInsertMode, endInsertMode,
+    readLineIndex, writeLineIndex,
 
     -- *** Error Data Type
 
@@ -927,12 +927,12 @@ newTextBufferState this size tags = do
         , theTextLineString    = mempty
         , theTextLineBreakSize = 0
         }
-  MVec.write buf 0 emptyLine
+  -- MVec.write buf 0 emptyLine
   return TextBufferState
     { theBufferDefaultLine = emptyLine
     , theBufferLineBreaker = lineBreakerNLCR
     , theBufferVector      = buf
-    , theLinesAboveCursor  = 1
+    , theLinesAboveCursor  = 0 -- 1
     , theLinesBelowCursor  = 0
     , theBufferLineEditor  = cur
     , theBufferInsertMode  = False
@@ -1776,61 +1776,6 @@ writeLineIndex
 writeLineIndex i line = liftEditText $
   getAbsoluteChk (Absolute $ lineToIndex i) >>= flip putElemIndex line
 
--- | If not already in 'bufferInsertMode', this function copies the 'TextLine' at the 'LineIndex'
--- given by 'linesAboveCursor' (i.e. it copies the line under the cursor) into the local
--- 'bufferLineEditor' line editor. Functions that evaluate to an 'EditLine' function type can then
--- perform a character-by-character edit on the 'bufferLineEditor' line editor. No 'TextLine's in
--- the 'TextBuffer' are modified or overwritten until 'endInsertMode' is evaluated.
---
--- This function returns 'True' if the insertion mode state was changed successfully. If the
--- 'TextBuffer' was already in insert mode when this function was called this function returns
--- 'False' because no state change is necessary if this function is called when the 'TextBuffer' is
--- already in insert mode.
-beginInsertMode
-  :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
-     , Show tags --DEBUG
-     )
-  => editor tags m Bool
-beginInsertMode = trace "beginInsertMode" $ liftEditText $ do
-  insMode <- use bufferInsertMode
-  if insMode then return False else do
-    bufferInsertMode .= True
-    before <- getElemCount Before
-    after  <- getElemCount After
-    when (before <= 0) $ pushElem Before =<<
-      if after <= 0 then use bufferDefaultLine else popElem After
-    before <- getElemCount Before
-    elem   <- getElemIndex (before - 1)
-    editLine $ join $
-      editReplaceCurrentLine <$> (indexToChar <$> getElemCount Before) <*> pure elem
-    return True
-
--- | If in 'bufferInsertMode', this function places the 'bufferLineEditor' back into the text
--- buffer, overwriting the 'TextLine' at the 'LineIndex' given by 'linesAboveCursor'. This function
--- then clears the 'bufferLineEditor' line editor.
---
--- It is possible to move the 'linesAboveCursor' to some other 'LineIndex' while in insert mode,
--- 'endInsertMode' does not care what the 'linesAboveCursor' was when 'beginInsertMode' was called,
--- it will always write the edited line to the 'LineIndex' given by 'linesAboveCursor'. So it is
--- possible to overwrite a 'TextLine' different from the line that was copied when 'beginInsertMode'
--- was evaluated.
---
--- This function returns 'True' if the insertion mode state was changed successfully. If the
--- 'TextBuffer' was not in insert mode when this function was called this function returns 'False'
--- because no state change is necessary if this function is called when the 'TextBuffer' is already
--- not in insert mode.
-endInsertMode
-  :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
-     , Show tags --DEBUG
-     )
-  => editor tags m Bool
-endInsertMode = trace "endInsertMode" $ liftEditText $ do
-  insMode <- use bufferInsertMode
-  if not insMode then return False else do
-    (editLine copyLineEditor' <* clearCurrentLine) >>= putElem Before
-    bufferInsertMode .= False
-    return True
-
 -- | Replace the content in the 'bufferLineEditor' with the content in the given 'TextLine'. Pass
 -- an integer value indicating where the cursor position should be set. This function does not
 -- re-allocate the current line editor buffer unless it is too small to hold all of the characters
@@ -1848,7 +1793,7 @@ replaceCurrentLine i = \ case
 -- not for export
 --
 -- Identical to 'replaceCurrentLine' but does not call 'liftEditLine', which calls 'editLine', which
--- calls 'beginInsertMode', which calls 'replaceCurrentLine'.
+-- calls 'replaceCurrentLine'.
 editReplaceCurrentLine
   :: (MonadIO m
      , Show tags --DEBUG
@@ -2076,7 +2021,7 @@ insertString str = trace ("insertString "++show str) $ liftEditText $ do
               ) >>= pushElem Before >> return (strlen + lbrklen)
   let loop count = seq count . \ case
         []        -> return count
-        line:more -> writeLine line >>= flip loop more
+        line:more -> (writeLine line <* clearCurrentLine) >>= flip loop more
   Relative . CharIndex <$> loop 0 (breaker str)
 
 -- Not for export: this code shared by 'forLinesInRange' and 'forLines' but requires knowledge of
@@ -2095,10 +2040,10 @@ forLinesLoop fold f count dir = execFoldMapLines (callCC $ loop count) fold wher
     liftEditText (popElem dir) >>= f halt >>= mapM_ (pushElem $ opposite dir) >>
     loop (count - 1) halt
 
--- | This function moves the cursor to the first @'Absolute' 'LineIndex'@ parameter given (will
--- evaluate 'endInsertMode)', then evaluate a folding and mapping monadic function over a range of
--- lines specified. If the first 'LineIndex' parameter is greater than the second 'LineIndex'
--- parameter, the fold map operation evaluates in reverse line order.
+-- | This function moves the cursor to the first @'Absolute' 'LineIndex'@ parameter given, then
+-- evaluate a folding and mapping monadic function over a range of lines specified. If the first
+-- 'LineIndex' parameter is greater than the second 'LineIndex' parameter, the fold map operation
+-- evaluates in reverse line order.
 --
 -- If you do not want to lose the current cursor position, be sure to wrap the evaluation of this
 -- function in a call to the 'saveCursorEval'.
@@ -2122,7 +2067,6 @@ forLinesInRange
       TextLine tags -> FoldMapLines fold fold tags m [TextLine tags])
   -> EditText tags m fold
 forLinesInRange absFrom@(Absolute (LineIndex from)) (Absolute (LineIndex to)) fold f = do
-  endInsertMode
   gotoLine absFrom
   lineCount <- (+) <$> use linesAboveCursor <*> use linesBelowCursor
   let dist = to - from

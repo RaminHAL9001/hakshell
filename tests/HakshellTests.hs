@@ -11,10 +11,10 @@ import           Control.Monad.IO.Class
 main :: IO ()
 main = do
   begin
-  moveCursorTests
-  lineEditorTests
---  textViewTests
---  textEditorTests
+  --moveCursorTests
+  --lineEditorTests
+  textViewTests
+  textEditorTests
 
 begin :: IO ()
 begin = putStrLn "\n-------------------------\nBegin HakshellTest Log\n-------------------------\n"
