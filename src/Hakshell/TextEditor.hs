@@ -68,6 +68,15 @@ module Hakshell.TextEditor
     TextLine, emptyTextLine, nullTextLine, textLineWeight, textLineIsUndefined,
     sliceLine, sliceLineToEnd,
 
+    -- *** 'ViewChars' functions
+    --
+    -- This is a monadic function type for evaluating over the contents of a 'TextLine'. You can
+    -- evaluate over a 'TextLine' object, replace the entire object if necessary, and fold an
+    -- additional value over it. However it is not to be used for character-by-character editing,
+    -- for that you would use 'EditLine' instead.
+
+    ViewChars(..), runViewChars, execViewChars, evalViewChars,
+
     -- *** 'TextLine' lenses
 
     textLineString, textLineTags,
@@ -128,6 +137,14 @@ module Hakshell.TextEditor
 
     TextView, textView, textViewOnLines, textViewAppend, emptyTextView,
     newTextBufferFromView, textViewCharCount, textViewVector,
+
+    -- *** 'ViewLines' functions
+    --
+    -- This is a monadic function type for evaluating over the contents of a 'TextView' object,
+    -- analogous to how a 'ViewChars' function type is for evaluating over the contents of a
+    -- 'TextLine' object.
+
+    ViewLines(..), runViewLines, execViewLines, evalViewLines,
 
     -- *** Fold over a 'TextView'.
     --
@@ -536,6 +553,49 @@ editLine
 editLine (EditLine f) = use bufferLineEditor >>= runStateT (runExceptT f) >>= \ case
   (Left err, _   ) -> throwError err
   (Right  a, line) -> bufferLineEditor .= line >> return a
+
+----------------------------------------------------------------------------------------------------
+
+-- | Functions of this type operate on a single 'TextView', which is a read-only character buffer,
+-- so mostly this type is used to define fold-like functions.
+newtype ViewChars tags m a
+  = ViewChars
+    { unwrapViewChars :: ExceptT TextEditError (StateT (TextLine tags) (ViewLines tags m)) a }
+  deriving (Functor, Applicative, Monad, MonadIO)
+
+instance Monad m => MonadState (TextLine tags) (ViewChars tags m) where
+  state = ViewChars . lift . state
+
+instance Monad m => MonadError TextEditError (ViewChars tags m) where
+  throwError = ViewChars . throwError
+  catchError (ViewChars try) catch = ViewChars $ catchError try $ unwrapViewChars . catch
+
+instance MonadTrans (ViewChars tags) where
+  lift = ViewChars . lift . lift . lift
+
+-- | Evaluate a line viewing 'ViewChars' function on a line of text 'TextLine' within a text viewing
+-- 'TextView' function context.
+runViewChars
+  :: Monad m
+  => ViewChars tags m a -> TextLine tags -> ViewLines tags m (a, TextLine tags)
+runViewChars (ViewChars f) = runStateT (runExceptT f) >=> \ case
+  (Left err, _   ) -> throwError err
+  (Right  a, line) -> return (a, line)
+
+-- | Like 'runViewChars' but only returns the 'TextLine', which is useful if you might have replaced
+-- the 'TextLine' during evaluation of the given 'ViewChars' function.
+execViewChars
+  :: Monad m
+  => ViewChars tags m a -> TextLine tags -> ViewLines tags m (TextLine tags)
+execViewChars = (.) (fmap snd) . runViewChars
+
+-- | Like 'runViewChars' but only returns the result (of type @a@) of the 'ViewChars' function, which
+-- is useful if you have performed a fold over the elements of the 'TextLine' during evaluation of
+-- the given 'ViewChars' function.
+evalViewChars
+  :: Monad m
+  => ViewChars tags m a -> TextLine tags -> ViewLines tags m a
+evalViewChars = (.) (fmap fst) . runViewChars
 
 ----------------------------------------------------------------------------------------------------
 
@@ -1093,7 +1153,7 @@ bufferLineEditor = lens theBufferLineEditor $ \ a b -> a{ theBufferLineEditor = 
 -- ranges of lines, and code involving translating user-facing @('Absolute' 'LineIndex')@ values to
 -- simplliied arithmetic expressions that I consuder to be more human readable.
 
-class MonadIO m => MonadEditVec vec m | m -> vec where
+class Monad m => MonadEditVec vec m | m -> vec where
   nullElem  :: vec ~ v elem => m elem
   newVector :: Int -> m vec
   modVector :: (vec -> vec) -> m vec
@@ -1125,6 +1185,30 @@ instance MonadIO m => MonadEditVec (UMVec.IOVector Char) (EditLine tags m) where
   throwLimitErr = throwError . EndOfCharBuffer
   throwIndexErr = throwError . CharIndexOutOfRange . indexToChar
   throwCountErr = throwError . CharCountOutOfRange . countToChar
+
+instance Monad m => MonadEditVec (UVec.Vector Char) (ViewChars tags m) where
+  nullElem = pure '\0'
+  newVector = pure . flip UVec.replicate '\0'
+    --TODO: ^ this is used by copying functions, it should not initialize a null vector only for it
+    --to be replaced by the copier.
+  modVector f = state $ \ case
+    TextLineUndefined ->
+      error "Evaluated an updating 'ViewChars' function on an undefined 'TextLine'"
+    st -> let vec = f $ theTextLineString st in (vec, st{ theTextLineString = vec })
+  throwLimitErr = throwError . EndOfCharBuffer
+  throwIndexErr = throwError . CharIndexOutOfRange . indexToChar
+  throwCountErr = throwError . CharCountOutOfRange . countToChar
+
+instance (Monad m) => MonadEditVec (Vec.Vector (TextLine tags)) (ViewLines tags m) where
+  nullElem = pure TextLineUndefined
+  newVector = pure . flip Vec.replicate TextLineUndefined
+    --TODO: ^ this is used by copying functions, it should not initialize a null vector only for it
+    --to be replaced by the copier.
+  modVector f = state $ \ st ->
+    let vec = f $ textViewVector st in (vec, st{ textViewVector = vec })
+  throwLimitErr = throwError . EndOfLineBuffer
+  throwIndexErr = throwError . LineIndexOutOfRange . indexToLine
+  throwCountErr = throwError . LineCountOutOfRange . countToLine
 
 instance MonadIO m => MonadEditVec (MVec.IOVector (TextLine tags))  (FoldMapLines r fold tags m) where
   nullElem      = foldMapLiftEditText nullElem
@@ -1279,7 +1363,7 @@ getHiSlice = getElemCount After >>= getSlice . Relative
 -- position of the cursor, and copy the region into a new contiguous mutable vector that contains no
 -- invalid elements.
 copyRegion
-  :: (GMVec.MVector vec elem, MonadEditVec (vec RealWorld elem) m)
+  :: (GMVec.MVector vec elem, MonadEditVec (vec RealWorld elem) m, MonadIO m)
   => Absolute Int -> Relative Int -> m (vec RealWorld elem)
 copyRegion (Absolute i) (Relative count) = if count == 0 then liftIO $ GMVec.new 0 else do
   let sum = i + count
@@ -1307,7 +1391,7 @@ copyRegion (Absolute i) (Relative count) = if count == 0 then liftIO $ GMVec.new
 
 -- Like 'copyRegion', but performs bounds checking.
 copyRegionChk
-  :: (GMVec.MVector vec elem, MonadEditVec (vec RealWorld elem) m)
+  :: (GMVec.MVector vec elem, MonadEditVec (vec RealWorld elem) m, MonadIO m)
   => Absolute Int -> Relative Int -> m (vec RealWorld elem)
 copyRegionChk i0@(Absolute i) count0@(Relative count) =
   countElems >>= \ siz -> let sum = i + count in
@@ -1318,7 +1402,7 @@ copyRegionChk i0@(Absolute i) count0@(Relative count) =
 -- Copy a vector range starting at an 'Absolute' index and moving toward the start ('Before') or
 -- the end ('After') of the buffer. This function DOES perform bounds checking.
 copyElemsToEndFrom
-  :: (GMVec.MVector vec elem, MonadEditVec (vec RealWorld elem) m)
+  :: (GMVec.MVector vec elem, MonadEditVec (vec RealWorld elem) m, MonadIO m)
   => Absolute Int -> RelativeToCursor -> m (vec RealWorld elem)
 copyElemsToEndFrom (Absolute i) = \ case
   Before -> copyRegionChk (Absolute 0) $ Relative $ i + 1
@@ -1327,7 +1411,7 @@ copyElemsToEndFrom (Absolute i) = \ case
 -- Write an element to a vector index, overwriting whatever was there before. __WARNING__: there is
 -- no bounds checking.
 putElemIndex
-  :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem
+  :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem, MonadIO m
      , Show elem --DEBUG
      )
   => Int -> elem -> m ()
@@ -1336,7 +1420,7 @@ putElemIndex i elem = write <$> getVector <*> pure i <*> pure elem >>= liftIO wh
 
 -- Read an element from a vector index. __WARNING__: there is no bounds checking.
 getElemIndex
-  :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem
+  :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem, MonadIO m
      , Show elem --DEBUG
      )
   => Int -> m elem
@@ -1347,7 +1431,7 @@ getElemIndex i = read <$> getVector <*> pure i >>= liftIO where
 -- 'RelativeToCursor' value, so the index returned by 'cursorIndex'. The cursor position is not
 -- modified.
 putElem
-  :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem
+  :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem, MonadIO m
      , Show elem --DEBUG
      )
   => RelativeToCursor -> elem -> m ()
@@ -1356,7 +1440,7 @@ putElem rel elem = join $ putElemIndex <$> cursorIndexChk rel <*> pure elem
 -- Like 'getElemIndex' but the index from which the element is read is given by a 'RelativeToCursor'
 -- value, so the index returned by 'cursorIndex'. The cursor position is not modified.
 getElem
-  :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem
+  :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem, MonadIO m
      , Show elem --DEBUG
      )
   => RelativeToCursor -> m elem
@@ -1365,7 +1449,7 @@ getElem rel = cursorIndexChk rel >>= getElemIndex
 -- Like 'putElem' but the @elem@ value to be put is taken from the 'nullElem' for this 'MonadEditVec'
 -- context. The cursor position is not modified.
 delElem
-  :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem
+  :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem, MonadIO m
      , Show elem --DEBUG
      )
   => RelativeToCursor -> m ()
@@ -1402,7 +1486,7 @@ prepLargerVector newsiz = do
 -- then copy the elements from the current vector to the new vector, and then replace the current
 -- vector with the new one.
 growVector
-  :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem)
+  :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem, MonadIO m)
   => Int -> m ()
 growVector increase = if increase <= 0 then return () else
   countElems >>= \ count -> prepLargerVector (count + increase) >>= \ case
@@ -1420,7 +1504,7 @@ growVector increase = if increase <= 0 then return () else
 -- Push a single element to the index 'Before' (currently on) the cursor, or the index 'After' the
 -- cursor, and then shift the cursor to point to the pushed element.
 pushElem
-  :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem
+  :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem, MonadIO m
      , Show elem --DEBUG
      )
   => RelativeToCursor -> elem -> m ()
@@ -1429,7 +1513,7 @@ pushElem rel elem = growVector 1 >> void (modCount rel (+ 1)) >> putElem rel ele
 -- Push a vector of elements starting at the index 'Before' (currently on) the cursor, or the index
 -- 'After' the cursor.
 pushElemVec
-  :: (GVec.Vector vec elem, MonadEditVec (GVec.Mutable vec RealWorld elem) m
+  :: (GVec.Vector vec elem, MonadEditVec (GVec.Mutable vec RealWorld elem) m, MonadIO m
      , Show elem --DEBUG
      )
   => RelativeToCursor -> vec elem -> m ()
@@ -1446,7 +1530,7 @@ pushElemVec rel src = do
 -- Pop a single element from the index 'Before' (currently on) the cursor, or from the index 'After'
 -- the cursor, and then shift the cursor to point to the pushed element.
 popElem
-  :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem
+  :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem, MonadIO m
      , Show elem --DEBUG
      )
   => RelativeToCursor -> m elem
@@ -1457,7 +1541,7 @@ popElem rel = getElem rel <* delElem rel
 -- like to perform bounds checking, if so an exception will be raised if the line index goes out of
 -- bounds.
 shiftCursor
-  :: (GMVec.MVector vec elem, MonadEditVec (vec RealWorld elem) m
+  :: (GMVec.MVector vec elem, MonadEditVec (vec RealWorld elem) m, MonadIO m
      , Show elem --DEBUG
      )
   => Relative Int -> m ()
@@ -1484,7 +1568,7 @@ shiftCursor (Relative count) =
 -- exception, rather it simply calls 'shiftCursor' with the minimal in-range value, as shifting the
 -- cursor (in my opinion) should not result in an error.
 shiftCursorChk
-  :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem
+  :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem, MonadIO m
      , Show elem --DEBUG
      )
   => Relative Int -> m ()
@@ -1494,7 +1578,7 @@ shiftCursorChk (Relative count) = getElemCount (if count <= 0 then Before else A
 -- Copy the current mutable buffer vector to an immutable vector.
 freezeVector
   :: forall vec elem m
-  . (GVec.Vector vec elem, MonadEditVec (GVec.Mutable vec RealWorld elem) m
+  . (GVec.Vector vec elem, MonadEditVec (GVec.Mutable vec RealWorld elem) m, MonadIO m
     , Show (vec elem) --DEBUG
     )
   => m (vec elem)
@@ -2248,6 +2332,23 @@ instance Monoid tags => Monoid (TextView tags) where
   mempty  = TextView{ textViewCharCount = 0, textViewVector = mempty }
   mappend = textViewAppend mappend
 
+-- | Functions of this type operate on a single 'TextView', which is a read-only character buffer,
+-- so mostly this type is used to define fold-like functions.
+newtype ViewLines tags m a
+  = ViewLines
+    { unwrapViewLines :: ExceptT TextEditError (StateT (TextView tags) m) a }
+  deriving (Functor, Applicative, Monad, MonadIO)
+
+instance Monad m => MonadState (TextView tags) (ViewLines tags m) where
+  state = ViewLines . lift . state
+
+instance Monad m => MonadError TextEditError (ViewLines tags m) where
+  throwError = ViewLines . throwError
+  catchError (ViewLines try) catch = ViewLines $ catchError try $ unwrapViewLines . catch
+
+instance MonadTrans (ViewLines tags) where
+  lift = ViewLines . lift . lift
+
 newtype FoldTextView r fold tags m a
   = FoldTextView
     { unwrapFoldTextView :: ContT r (StateT fold m) a
@@ -2264,6 +2365,26 @@ instance MonadTrans (FoldTextView r fold tags) where
   lift = FoldTextView . lift . lift
 
 type FoldTextViewHalt void fold tags m r = r -> FoldTextView r fold tags m void
+
+-- | Evaluate a line viewing 'ViewLines' function on a line of text 'TextLine' within a text viewing
+-- 'TextView' function context.
+runViewLines :: ViewLines tags m a -> TextView tags -> m (Either TextEditError a, TextView tags)
+runViewLines = runStateT . runExceptT . unwrapViewLines
+
+-- | Like 'runViewLines' but only returns the 'TextLine', which is useful if you might have replaced
+-- the 'TextLine' during evaluation of the given 'ViewLines' function.
+execViewLines
+  :: Monad m
+  => ViewLines tags m a -> TextView tags -> m (TextView tags)
+execViewLines = (.) (fmap snd) . runViewLines
+
+-- | Like 'runViewLines' but only returns the result (of type @a@) of the 'ViewLines' function, which
+-- is useful if you have performed a fold over the elements of the 'TextLine' during evaluation of
+-- the given 'ViewLines' function.
+evalViewLines
+  :: Monad m
+  => ViewLines tags m a -> TextView tags -> m (Either TextEditError a)
+evalViewLines = (.) (fmap fst) . runViewLines
 
 -- | An empty 'TextView', containing zero lines of text.
 emptyTextView :: TextView tags
