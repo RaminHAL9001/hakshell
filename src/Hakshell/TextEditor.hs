@@ -1155,10 +1155,10 @@ countElems = (+) <$> getElemCount Before <*> getElemCount After
 getUnusedSpace :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem) => m Int
 getUnusedSpace = subtract <$> countElems <*> getAllocSize
 
--- Returns a cursor index, although the index may not be pointing to a valid element. This function
--- is defined as the value returned by 'getElemCount' subtracted by 1, because the 'getElemCount' is
--- always pointing at the undefined vector index just after the element that is considered to be
--- "under" the cursor.
+-- Returns a cursor index, although the index may NOT necessarily be pointing to a valid
+-- element. This function is defined as the value returned by 'getElemCount' subtracted by 1,
+-- because the 'getElemCount' is always pointing at the undefined vector index just after the
+-- element that is considered to be "under" the cursor.
 cursorIndex
   :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem)
   => RelativeToCursor -> m Int -- line editors and text editor have different cursors
@@ -1291,11 +1291,9 @@ copyRegion (Absolute i) (Relative count) = if count == 0 then liftIO $ GMVec.new
   if lo >= before
    then do
     i <- getAbsolute $ Absolute lo
-    traceM $ "GMVec.clone (GMVec.slice "++show i++' ':show siz++")" --DEBUG
     liftIO $ GMVec.clone $ GMVec.slice i siz oldvec
    else if hi < before
    then do
-    traceM $ "GMVec.clone (GMVec.slice"++show lo++' ':show siz++")" --DEBUG
     liftIO $ GMVec.clone $ GMVec.slice lo siz oldvec
    else do
     let sublen = before - lo
@@ -1303,12 +1301,11 @@ copyRegion (Absolute i) (Relative count) = if count == 0 then liftIO $ GMVec.new
     hivec  <- getSlice $ Relative $ hi - before
     newvec <- newVector siz
     let copy  = (.) liftIO . if unsafeMode then GMVec.unsafeCopy else GMVec.copy
-    traceM $ "GMVec.copy (GMVec.slice 0 "++show sublen++")"
     copy (GMVec.slice 0 sublen newvec) lovec
-    traceM $ "GMVec.copy (GMVec.slice "++show sublen++' ':show (siz - sublen)++")"
     copy (GMVec.slice sublen (siz - sublen) newvec) hivec
     return newvec
 
+-- Like 'copyRegion', but performs bounds checking.
 copyRegionChk
   :: (GMVec.MVector vec elem, MonadEditVec (vec RealWorld elem) m)
   => Absolute Int -> Relative Int -> m (vec RealWorld elem)
@@ -1317,6 +1314,15 @@ copyRegionChk i0@(Absolute i) count0@(Relative count) =
   if i < 0 || i >= siz then throwIndexErr i
   else if sum < 0 || i > sum then throwCountErr count
   else copyRegion i0 count0
+
+-- Copy a vector range starting at an 'Absolute' index and moving toward the start ('Before') or
+-- the end ('After') of the buffer. This function DOES perform bounds checking.
+copyElemsToEndFrom
+  :: (GMVec.MVector vec elem, MonadEditVec (vec RealWorld elem) m)
+  => Absolute Int -> RelativeToCursor -> m (vec RealWorld elem)
+copyElemsToEndFrom (Absolute i) = \ case
+  Before -> copyRegionChk (Absolute 0) $ Relative $ i + 1
+  After  -> countElems >>= copyRegionChk (Absolute i) . Relative . subtract i
 
 -- Write an element to a vector index, overwriting whatever was there before. __WARNING__: there is
 -- no bounds checking.
@@ -2342,9 +2348,7 @@ textView from to = trace ("textView ("++show from++") ("++show to++")") .
         let freeze = liftIO . if unsafeMode then Vec.unsafeFreeze else Vec.freeze
         newvec <- freeze newvec
         return TextView
-          { textViewCharCount = sum $ Vec.toList newvec >>= \ case
-              TextLineUndefined               -> []
-              TextLine{theTextLineString=vec} -> [UVec.length vec]
+          { textViewCharCount = sum $ intSize <$> Vec.toList newvec
           , textViewVector    = newvec
           }
 
