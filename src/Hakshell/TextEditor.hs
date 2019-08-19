@@ -96,7 +96,7 @@ module Hakshell.TextEditor
 
     -- ** Moving the Cursor
 
-    getCursor, gotoCursor, saveCursorEval, gotoPosition, gotoLine, gotoChar,
+    getPosition, gotoPosition, saveCursorEval, gotoLine, gotoChar,
 
     Absolute(..),  LineIndex(..), CharIndex(..), TextLocation(..),
     shiftAbsolute, diffAbsolute,
@@ -1910,16 +1910,6 @@ gotoChar (Absolute (CharIndex n)) = liftEditLine $ do
   before    <- use charsBeforeCursor
   moveByChar $ Relative $ CharIndex $ n - before
 
--- | This function calls 'gotoLine' and then 'gotoChar' to move the cursor to an absolute a line
--- number and characters (column) number.
-gotoPosition
-  :: (MonadEditText editor, MonadEditLine editor, MonadIO (editor tags m), MonadIO m
-     , Show tags --DEBUG
-     )
-  => TextLocation -> editor tags m ()
-gotoPosition (TextLocation{theLocationLineIndex=line,theLocationCharIndex=col}) =
-  liftEditText $ gotoLine line >> gotoChar col
-
 -- | Insert a single character. If the 'lineBreakPredicate' function evaluates to 'Prelude.True',
 -- meaning the given character is a line breaking character, this function does nothing. To insert
 -- line breaks, using 'insertString'. Returns the number of characters added to the buffer.
@@ -2161,24 +2151,25 @@ lineIndex = lens theLocationLineIndex $ \ a b -> a{ theLocationLineIndex = b }
 charIndex :: Lens' TextLocation (Absolute CharIndex)
 charIndex = lens theLocationCharIndex $ \ a b -> a{ theLocationCharIndex = b }
 
--- | Get the current cursor location.
-getCursor
+-- | Get the current position of the cursor.
+getPosition
   :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
      )
   => editor tags m TextLocation
-getCursor = liftEditText $ TextLocation
+getPosition = liftEditText $ TextLocation
   <$> (Absolute . LineIndex . (+ 1) <$> use linesAboveCursor)
   <*> editLine (Absolute . CharIndex . (+ 1) <$> use charsBeforeCursor)
 
--- | Move the cursor to given 'TextLocation'.
-gotoCursor
+-- | This function calls 'gotoLine' and then 'gotoChar' to move the cursor to an absolute a line
+-- number and characters (column) number.
+gotoPosition
   :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
      )
   => TextLocation -> editor tags m ()
-gotoCursor (TextLocation{theLocationLineIndex=line,theLocationCharIndex=char}) = liftEditText $
-  gotoLine line >> editLine (gotoChar char)
+gotoPosition (TextLocation{theLocationLineIndex=line,theLocationCharIndex=char}) =
+  liftEditText $ gotoLine line >> editLine (gotoChar char)
 
 -- | Save the location of the cursor, then evaluate an @editor@ function. After evaluation
 -- completes, restore the location of the cursor (within range, as the location may no longer exist)
@@ -2189,8 +2180,8 @@ saveCursorEval
      )
   => editor tags m a -> editor tags m a
 saveCursorEval f = do
-  (cur, a) <- (,) <$> getCursor <*> f
-  gotoCursor cur >> return a
+  (cur, a) <- (,) <$> getPosition <*> f
+  gotoPosition cur >> return a
 
 class RelativeToAbsoluteCursor index editor | editor -> index where
   -- | Convert a 'Relative' index (either a 'LineIndex' or 'CharIndex') to an 'Absolute' index.

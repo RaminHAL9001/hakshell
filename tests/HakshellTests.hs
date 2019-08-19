@@ -148,8 +148,8 @@ textViewTests = do
     insertString $ chars >>= \ a -> unwords ((\ b -> [a,b]) <$> chars) ++ "\n"
     debugPrintBuffer
   testTextEditor error buf $ do
-    report "--- gotoCursor 1 1\n"
-    gotoCursor $ mkLoc 1 1
+    report "--- gotoPosition 1 1\n"
+    gotoPosition $ mkLoc 1 1
     debugPrintBuffer
   let reportView a b = do
         report $ "view "++showLoc a++"->"++showLoc b++"\n"
@@ -197,7 +197,7 @@ textEditorTests = do
         debugPrintBuffer
   let reportMove msg line col = testTextEditor error buf $ do
         report $ "Move cursor "++msg++", line="++show line++" col="++show col++" ...\n"
-        gotoCursor $ mkLoc line col
+        gotoPosition $ mkLoc line col
         -- TODO: show the content of the whole buffer as a string here.
         debugPrintBuffer
   let reportDelete msg n = testTextEditor error buf $ do
