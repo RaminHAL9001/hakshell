@@ -2317,15 +2317,6 @@ textView from to =
         let unline = lineToIndex . theLocationLineIndex
         let (lo, hi) = (unline from, unline to)
         newvec <- copyRegionChk (Absolute lo) $ Relative $ 1 + hi - lo
-        debugnewvec <- liftIO $ Vec.freeze newvec --DEBUG
-        let debugview = TextView --DEBUG
-              { textViewCharCount = sum $ Vec.toList debugnewvec >>= \ case --DEBUG
-                  TextLineUndefined               -> [] --DEBUG
-                  TextLine{theTextLineString=vec} -> [UVec.length vec] --DEBUG
-              , textViewVector    = debugnewvec --DEBUG
-              } --DEBUG
-        traceM $ "(textView: show TextView prior to trimming)" --DEBUG
-        debugPrintView debugview --DEBUG
         let top = MVec.length newvec - 1
         let unchar len lbrksz = max 0 . min (len - lbrksz) . charToIndex . theLocationCharIndex
         let onvec i f = liftIO $ MVec.read newvec i >>= MVec.write newvec i . \ case
