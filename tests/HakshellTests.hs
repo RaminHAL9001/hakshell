@@ -148,6 +148,7 @@ textViewTests = do
     insertString $ chars >>= \ a -> unwords ((\ b -> [a,b]) <$> chars) ++ "\n"
     debugPrintBuffer
   testTextEditor error buf $ do
+    report "--- gotoCursor 1 1\n"
     gotoCursor $ mkLoc 1 1
     debugPrintBuffer
   let reportView a b = do
@@ -162,8 +163,9 @@ textViewTests = do
   reportView (mkLoc  1 12) (mkLoc  9 28)
   report "Move cursor to start of buffer...\n"
   testTextEditor error buf $ do
+    report "--- gotoPosition 1 1\n"
     gotoPosition $ mkLoc 1 1
-    debugPrintBuffer
+    --debugPrintBuffer
   report "OK\n"
   reportView (mkLoc  3 24) (mkLoc  5 25)
   reportView (mkLoc 14  1) (mkLoc 15 48)
@@ -172,8 +174,9 @@ textViewTests = do
   reportView (mkLoc  9 12) (mkLoc  8 25)
   report "Move cursor to middle of buffer...\n"
   testTextEditor error buf $ do
+    report "--- gotoPosition 8 23\n"
     gotoPosition $ mkLoc 8 23
-    debugPrintBuffer
+    --debugPrintBuffer
   report "OK\n"
   reportView (mkLoc  1  1) (mkLoc  8 48)
   reportView (mkLoc  7 24) (mkLoc 11 25)
