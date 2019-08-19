@@ -2027,7 +2027,7 @@ insertString str = trace ("insertString "++show str) $ liftEditText $ do
               ) >>= pushElem Before >> return (strlen + lbrklen)
   let loop count = seq count . \ case
         []        -> return count
-        line:more -> (writeLine line <* clearCurrentLine) >>= flip loop more
+        line:more -> writeLine line >>= flip loop more
   Relative . CharIndex <$> loop 0 (breaker str)
 
 -- Not for export: this code shared by 'forLinesInRange' and 'forLines' but requires knowledge of
