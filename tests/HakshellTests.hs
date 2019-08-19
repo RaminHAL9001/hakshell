@@ -168,7 +168,7 @@ textViewTests = do
   reportView (mkLoc  3 24) (mkLoc  5 25)
   reportView (mkLoc 14  1) (mkLoc 15 48)
   reportView (mkLoc  1  1) (mkLoc  2 48)
-  reportView (mkLoc  1 12) (mkLoc  0 25)
+  reportView (mkLoc  1 12) (mkLoc  1 25)
   reportView (mkLoc  9 12) (mkLoc  8 25)
   report "Move cursor to middle of buffer...\n"
   testTextEditor error buf $ do
