@@ -677,9 +677,6 @@ data TextBufferState tags
       -- ^ The number of line below the cursor
     , theBufferLineEditor  :: !(LineEditor tags)
       -- ^ A data structure for editing individual characters in a line of text.
-    , theBufferInsertMode  :: !Bool
-      -- ^ Whether or not the buffer is in insert mode, which means a 'TextLine' has been copied
-      -- into 'theBufferLineEditor'.
     }
 
 data TextEditError
@@ -935,7 +932,6 @@ newTextBufferState this size tags = do
     , theLinesAboveCursor  = 0 -- 1
     , theLinesBelowCursor  = 0
     , theBufferLineEditor  = cur
-    , theBufferInsertMode  = False
     }
 
 -- Use this to initialize a new empty 'LineEditor'. This is usually only handy if you want to
@@ -1074,11 +1070,6 @@ linesBelowCursor = lens theLinesBelowCursor $ \ a b -> a{ theLinesBelowCursor = 
 -- Not for export: the vector containing all the lines of text in this buffer.
 bufferVector :: Lens' (TextBufferState tags) (MVec.IOVector (TextLine tags))
 bufferVector = lens theBufferVector $ \ a b -> a{ theBufferVector = b }
-
--- Not for export: needs to be set by higher-level combinators to prevent a line in the line editor
--- cursor from being accidentally copied to more than one index in the line buffer.
-bufferInsertMode :: Lens' (TextBufferState tags) Bool
-bufferInsertMode = lens theBufferInsertMode $ \ a b -> a{ theBufferInsertMode = b }
 
 -- | The current line of text being edited under the cursor.
 bufferLineEditor :: Lens' (TextBufferState tags) (LineEditor tags)
@@ -2433,12 +2424,10 @@ debugPrintBuffer = liftEditText $ do
   printLines 0 0
   above   <- use linesAboveCursor
   below   <- use linesBelowCursor
-  insmode <- use bufferInsertMode
   liftIO $ do
     putStrLn $ "   linesAboveCursor: " ++ show above
     putStrLn $ "   linesBelowCursor: " ++ show below
     putStrLn $ "    bufferLineCount: " ++ show (above + below)
-    putStrLn $ " __bufferInsertMode: " ++ show insmode
 
 -- | The 'bufferLineEditor', which is a 'LineEditor' is a separate data structure contained within
 -- the 'TextBuffer', and it is often not necessary to know this information when debugging, so you
