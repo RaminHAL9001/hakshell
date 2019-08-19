@@ -1688,8 +1688,7 @@ copyLineEditorText
      , Show tags --DEBUG
      )
   => editor tags m (TextLine tags)
-copyLineEditorText = trace "copyLineEditorText" $
-  liftEditLine copyLineEditor'
+copyLineEditorText = liftEditLine copyLineEditor'
 
 -- | Returns 'True' if the given @'Absolute' 'CharIndex'@ value refers to any character after the
 -- final non-line-breaking character in the current line, i.e. it points to a line-breaking
@@ -1805,26 +1804,25 @@ editReplaceCurrentLine
      , Show tags --DEBUG
      )
   => Absolute CharIndex -> TextLine tags -> EditLine tags m ()
-editReplaceCurrentLine cur' line =
-  trace ("editReplaceCurrentLine "++show cur'++' ':show line) $ do
-    let srcvec = theTextLineString line
-    let srclen = intSize srcvec
-    let lbrksz = theTextLineBreakSize line
-    let srctop = srclen - fromIntegral lbrksz
-    let cur    = max 0 $ min srctop $ charToIndex cur'
-    join $ maybe (pure ()) (void . modVector . const) <$> prepLargerVector srclen
-    targlo <- getLoSlice
-    targhi <- getHiSlice
-    let targlolen = UMVec.length targlo
-    let targhilen = UMVec.length targhi
-    charsBeforeCursor .= targlolen
-    charsAfterCursor  .= targhilen
-    cursorBreakSize   .= lbrksz
-    lineEditorTags    .= theTextLineTags line
-    liftIO $ do
-      let slice = if unsafeMode then UVec.unsafeSlice else UVec.slice
-      when (cur > 0) $ UVec.copy targlo $ slice 0 targlolen srcvec
-      UVec.copy targhi $ slice targlolen targhilen srcvec
+editReplaceCurrentLine cur' line = do
+  let srcvec = theTextLineString line
+  let srclen = intSize srcvec
+  let lbrksz = theTextLineBreakSize line
+  let srctop = srclen - fromIntegral lbrksz
+  let cur    = max 0 $ min srctop $ charToIndex cur'
+  join $ maybe (pure ()) (void . modVector . const) <$> prepLargerVector srclen
+  targlo <- getLoSlice
+  targhi <- getHiSlice
+  let targlolen = UMVec.length targlo
+  let targhilen = UMVec.length targhi
+  charsBeforeCursor .= targlolen
+  charsAfterCursor  .= targhilen
+  cursorBreakSize   .= lbrksz
+  lineEditorTags    .= theTextLineTags line
+  liftIO $ do
+    let slice = if unsafeMode then UVec.unsafeSlice else UVec.slice
+    when (cur > 0) $ UVec.copy targlo $ slice 0 targlolen srcvec
+    UVec.copy targhi $ slice targlolen targhilen srcvec
 
 -- | Delete the content of the 'bufferLineEditor' except for the line breaking characters (if any)
 -- at the end of the line. This function does not change the memory allocation for the 'LineEditor',
@@ -1834,7 +1832,7 @@ clearCurrentLine
      , Show tags --DEBUG
      )
   => editor tags m ()
-clearCurrentLine = trace "clearCurrentLine" $ liftEditLine $ do
+clearCurrentLine = liftEditLine $ do
   charsBeforeCursor .= 0
   use cursorBreakSize >>= assign charsAfterCursor . fromIntegral
 
@@ -1868,8 +1866,7 @@ copyLineEditor
      , Show tags --DEBUG
      )
   => editor tags m (LineEditor tags)
-copyLineEditor = trace "copyLineEditor" $
-  liftEditText $ use bufferLineEditor >>= liftIO . copyLineEditorIO
+copyLineEditor = liftEditText $ use bufferLineEditor >>= liftIO . copyLineEditorIO
 
 -- | This function calls 'moveByLine' and then 'moveByChar' to move the cursor by a number of lines
 -- and characters relative to the current cursor position.
@@ -1953,7 +1950,7 @@ deleteChars
      , Show tags --DEBUG
      )
   => Relative CharIndex -> editor tags m (Relative CharIndex)
-deleteChars rel@(Relative (CharIndex n)) = trace ("deleteChars "++show rel) $
+deleteChars (Relative (CharIndex n)) =
   liftEditLine $ fmap (Relative . CharIndex) $
   if n < 0 then do
     before <- getElemCount Before
@@ -1983,7 +1980,6 @@ deleteCharsWrap request = if request == 0 then return 0 else
   if safeAbs delcount >= safeAbs request then return delcount else
   -- otherwise ues 'forLines' to delete each line until the request has been satsified.
   fmap snd $ forLines direction (safeAbs request + delcount, delcount) $ \ halt line ->
-    trace ("(deleteCharsWrap: "++show line++")") $
     get >>= \ st@(request, delcount) ->
     if request <= 0 then halt st else
     let weight = countToChar $ textLineWeight line in
@@ -2012,10 +2008,10 @@ insertString
      , Show tags --DEBUG
      )
   => String -> editor tags m (Relative CharIndex)
-insertString str = trace ("insertString "++show str) $ liftEditText $ do
+insertString str = liftEditText $ do
   breaker <- use (bufferLineBreaker . lineBreaker)
   let writeStr = editLine . fmap sum . mapM ((>> (return 1)) . pushElem Before)
-  let writeLine line@(str, lbrk) = trace ("writeLine "++show line) $ do
+  let writeLine (str, lbrk) = do
         (strlen, lbrklen) <- (,) <$> writeStr str <*> writeStr lbrk
         let maxlen = fromIntegral (maxBound :: Word16) :: Int
         if lbrklen >= maxlen
@@ -2042,7 +2038,7 @@ forLinesLoop
       TextLine tags -> FoldMapLines fold fold tags m [TextLine tags])
   -> Int -> RelativeToCursor -> EditText tags m fold
 forLinesLoop fold f count dir = execFoldMapLines (callCC $ loop count) fold where
-  loop count halt = trace ("(forLinesLoop "++show count++")") $ if count <= 0 then get else
+  loop count halt = if count <= 0 then get else
     liftEditText (popElem dir) >>= f halt >>= mapM_ (pushElem $ opposite dir) >>
     loop (count - 1) halt
 
@@ -2106,11 +2102,9 @@ forLines
 forLines rel fold f = do
   above <- use linesAboveCursor
   below <- use linesBelowCursor
-  uncurry (forLinesLoop fold f) $
-    (\ a -> trace ("(forLines -> forLinesLoop "++show a++")") a) $ --DEBUG
-    case rel of
-      Before -> (above, Before)
-      After  -> (below, After)
+  uncurry (forLinesLoop fold f) $ case rel of
+    Before -> (above, Before)
+    After  -> (below, After)
 
 -- | Use the 'defaultLineBreak' value to break the line at the current cursor position.
 lineBreak
@@ -2315,7 +2309,7 @@ textView
      )
   => TextLocation -> TextLocation -> TextBuffer tags
   -> m (Either TextEditError (TextView tags))
-textView from to = trace ("textView ("++show from++") ("++show to++")") .
+textView from to =
   liftIO . runEditTextIO (mkview (min from to) (max from to)) where
     mkview from to = countElems >>= \ nmax ->
       if nmax <= 0 || from == to then return emptyTextView else do
