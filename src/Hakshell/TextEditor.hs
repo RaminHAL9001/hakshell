@@ -88,7 +88,7 @@ module Hakshell.TextEditor
 
     insertString, lineBreak, deleteCharsWrap, pushLine, popLine,
     currentTextLocation, currentLineNumber, currentColumnNumber,
-    readLineIndex, writeLineIndex,
+    getLineIndex, putLineIndex,
 
     -- *** Error Data Type
 
@@ -919,17 +919,15 @@ newTextBufferState :: TextBuffer tags -> Int -> tags -> IO (TextBufferState tags
 newTextBufferState this size tags = do
   cur <- newLineEditorIO this tags
   buf <- MVec.replicate size TextLineUndefined
-  let emptyLine = TextLine
+  return TextBufferState
+    { theBufferDefaultLine = TextLine
         { theTextLineTags      = tags
         , theTextLineString    = mempty
         , theTextLineBreakSize = 0
         }
-  -- MVec.write buf 0 emptyLine
-  return TextBufferState
-    { theBufferDefaultLine = emptyLine
     , theBufferLineBreaker = lineBreakerNLCR
     , theBufferVector      = buf
-    , theLinesAboveCursor  = 0 -- 1
+    , theLinesAboveCursor  = 0
     , theLinesBelowCursor  = 0
     , theBufferLineEditor  = cur
     }
@@ -1755,21 +1753,21 @@ copyCharsBetween from' to' = let (from, to) = if from > to then (to', from') els
   copyCharsRange from (diffAbsolute from to + 1)
 
 -- | Read a 'TextLine' from an @('Absolute' 'LineIndex')@ address.
-readLineIndex
+getLineIndex
   :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
      )
   => Absolute LineIndex -> editor tags m (TextLine tags)
-readLineIndex i = liftEditText $ getAbsoluteChk (Absolute $ lineToIndex i) >>= getElemIndex
+getLineIndex i = liftEditText $ getAbsoluteChk (Absolute $ lineToIndex i) >>= getElemIndex
 
--- | Write a 'TextLine' (as produced by 'copyLineEditorText' or readLineIndex') to an @('Absolute'
+-- | Write a 'TextLine' (as produced by 'copyLineEditorText' or getLineIndex') to an @('Absolute'
 -- 'LineIndex')@ address.
-writeLineIndex
+putLineIndex
   :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
      )
   => Absolute LineIndex -> TextLine tags -> editor tags m ()
-writeLineIndex i line = liftEditText $
+putLineIndex i line = liftEditText $
   getAbsoluteChk (Absolute $ lineToIndex i) >>= flip putElemIndex line
 
 -- | Replace the content in the 'bufferLineEditor' with the content in the given 'TextLine'. Pass
