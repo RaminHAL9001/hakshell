@@ -2293,7 +2293,6 @@ textView from to =
   liftIO . runEditTextIO (mkview (min from to) (max from to)) where
     mkview from to = countElems >>= \ nmax ->
       if nmax <= 0 || from == to then return emptyTextView else do
-        copyLineEditorText >>= putElem Before
         let unline = lineToIndex . theLocationLineIndex
         let (lo, hi) = (unline from, unline to)
         newvec <- copyRegionChk (Absolute lo) $ Relative $ 1 + hi - lo
