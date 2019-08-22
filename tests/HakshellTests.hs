@@ -162,6 +162,25 @@ lineEditorTests = do
   move (-20)
   instr Before "the "
 
+selectStrings :: TextLocation -> TextLocation -> [String] -> [String]
+selectStrings a b lines =
+  let ( TextLocation{theLocationLineIndex=lineA0,theLocationCharIndex=charA0},
+        TextLocation{theLocationLineIndex=lineB0,theLocationCharIndex=charB0}
+       ) = (min a b, max a b)
+      lineA = lineToIndex lineA0
+      lineB = lineToIndex lineB0
+      charA = charToIndex charA0
+      charB = charToIndex charB0
+      final = \ case
+        []         -> []
+        [line]     -> [take charB line]
+        line:lines -> line : final lines
+  in  case take (lineB - lineA + 1) $ drop (max 0 lineA) $ lines of
+        []         -> []
+        [line]     -> let (lo, hi) = (min charA charB, max charA charB) in
+                        [take (hi - lo) $ drop lo line]
+        line:lines -> drop charA line : final lines
+
 textViewTests :: IO ()
 textViewTests = do
   report "--- text view tests ---\n"
@@ -170,8 +189,9 @@ textViewTests = do
   --      report "<> ----------------------------------------------------------------\n"
   --      debugPrintBuffer
   report "fill buffer...\n"
-  let chars = "0123456789ABCDEF"
-  let grid  = chars >>= \ a -> unwords ((\ b -> [a,b]) <$> chars) ++ "\n"
+  let chars     = "0123456789ABCDEF"
+  let gridLines = (\ a -> unwords ((\ b -> [a,b]) <$> chars) ++ "\n") <$> chars :: [String]
+  let grid      = concat gridLines :: String
   testTextEditor error buf $ do
     insertString grid
     report "OK\n"
@@ -180,16 +200,21 @@ textViewTests = do
     gotoPosition $ mkLoc 1 1
     report "OK\n"
   let reportView a b = do
-        report $ "view "++showLoc a++"->"++showLoc b++"\n"
+        report $ "view "++showLoc a++"->"++showLoc b++" ... "
         textView a b buf >>= \ case
           Left err -> error $ show err
-          Right  v -> debugPrintView v
+          Right  v ->
+            let reslt = fst <$> textViewToStrings v
+                expct = selectStrings a b gridLines
+            in  if reslt == expct then report "OK\n" else error $
+                  "\n'textView'-> bad result\n  expected:\n" ++
+                  (expct >>= (++ "\n") . ("    " ++) . show) ++
+                  "\n  received:\n" ++
+                  (reslt >>= (++ "\n") . ("    " ++) . show)
   reportView (mkLoc  3 25) (mkLoc  6 24)
   reportView (mkLoc 14  1) (mkLoc 16 48)
   reportView (mkLoc  1  1) (mkLoc  3 48)
-  ---
   reportView (mkLoc  1 12) (mkLoc  1 28)
-  ---
   reportView (mkLoc  1 12) (mkLoc  9 28)
   report "(move position to start of buffer)\n"
   testTextEditor error buf $ do

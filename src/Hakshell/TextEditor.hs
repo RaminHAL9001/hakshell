@@ -130,6 +130,7 @@ module Hakshell.TextEditor
 
     TextView, textView, textViewOnLines, textViewAppend, emptyTextView,
     newTextBufferFromView, textViewCharCount, textViewVector,
+    textViewToList, textViewToStrings,
 
     -- *** Fold over a 'TextView'.
     --
@@ -2240,6 +2241,22 @@ instance MonadTrans (FoldTextView r fold tags) where
   lift = FoldTextView . lift . lift
 
 type FoldTextViewHalt void fold tags m r = r -> FoldTextView r fold tags m void
+
+-- | Decompose a 'TextView' into a list of 'TextLine's.
+textViewToList :: TextView tags -> [TextLine tags]
+textViewToList = Vec.toList . textViewVector
+
+-- | Decompose a 'TextView' into a list of tagged 'String's. The 'String' is paired with a 'Word16'
+-- count of the number of line-breaking characters exist at the end of the string, and the @tags@
+-- assoicated with the text.
+textViewToStrings :: TextView tags -> [(String, (Word16, tags))]
+textViewToStrings = textViewToList >=> \ case
+  TextLineUndefined -> []
+  TextLine
+   { theTextLineString=vec
+   , theTextLineTags=tags
+   , theTextLineBreakSize=lbrksiz
+   } -> [(unpack vec, (lbrksiz, tags))]
 
 -- | An empty 'TextView', containing zero lines of text.
 emptyTextView :: TextView tags
