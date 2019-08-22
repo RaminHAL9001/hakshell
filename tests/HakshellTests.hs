@@ -3,6 +3,7 @@ module Main where
 import           Hakshell.TextEditor
 
 import           Data.Char
+import           Data.List (tails)
 
 import           Control.Monad.IO.Class
 
@@ -11,8 +12,8 @@ import           Control.Monad.IO.Class
 main :: IO ()
 main = do
   begin
-  --moveCursorTests
-  --lineEditorTests
+  moveCursorTests
+  lineEditorTests
   textViewTests
   textEditorTests
 
@@ -65,6 +66,23 @@ moveCursorTests = do
             report "--- content of buffer: "
             liftIO $ print txt
            else error $ "\n  Expecting: "++show expct++"\n  Contents: "++show txt
+    let copy at len expct = liftEditLine $ do
+          let check lbl rgn = if unpack rgn == expct then report "OK\n" else do
+                report "FAILED\n"
+                error $ "FAILED ("++lbl++"):\n"++
+                        "  expected: "++show expct++
+                        "    result: "++show rgn
+          report $ "--- copyRegion ("++show at++") ("++show len++") -> "++show expct++" ... "
+          copyCharsRange at len >>= check "forward"
+          report $ "--- copyRegion ("++show (shiftAbsolute at len)++") ("++show (negate len)++") -> "++show expct++" ... "
+          copyCharsRange (shiftAbsolute at len) (negate len) >>= check "reverse"
+    let copyEach n str = do
+          report $ "--- copyEach ("++show n++"), elems="++show str++"\n"
+          let len   = length str
+          let count = charToCount n
+          mapM_ (uncurry $ uncurry copy) $ [1 ..] `zip` repeat n `zip`
+            (take count . fst <$> (tails str `zip` [0 .. len - count]))
+    let copy123 str = copyEach 1 str >> copyEach 2 str >> copyEach 3 str
     let move dir expbef expaft = liftEditLine $ do
           report $ "--- moveByChar ("++show dir++")\n"
           moveByChar dir
@@ -99,11 +117,15 @@ moveCursorTests = do
     ins After  'D'
     check "ABCDEF"
     move (-3) "" "ABCDEF"
+    copy123 "ABCDEF"
     move  (6) "ABCDEF" ""
+    copy123 "ABCDEF"
     move (-6) "" "ABCDEF"
     move  (3) "ABC" "DEF"
+    copy123 "ABCDEF"
     move  (2) "ABCDE" "F"
     move (-3) "AB" "CDEF"
+    copy123 "ABCDEF"
     move  (4) "ABCDEF" ""
     move (-5) "A" "BCDEF"
     move (-1) "" "ABCDEF"
@@ -111,6 +133,7 @@ moveCursorTests = do
     move  (4) "ABCDE" "F"
     move  (1) "ABCDEF" ""
     move (-1) "ABCDE" "F"
+    copy123 "ABCDEF"
 
 lineEditorTests :: IO ()
 lineEditorTests = do
@@ -142,15 +165,19 @@ textViewTests :: IO ()
 textViewTests = do
   report "--- text view tests ---\n"
   buf <- newTextBuffer defaultTags
+  --let showWholeBuf = testTextEditor error buf $ do
+  --      report "<> ----------------------------------------------------------------\n"
+  --      debugPrintBuffer
   report "fill buffer...\n"
+  let chars = "0123456789ABCDEF"
+  let grid  = chars >>= \ a -> unwords ((\ b -> [a,b]) <$> chars) ++ "\n"
   testTextEditor error buf $ do
-    let chars = "0123456789ABCDEF"
-    insertString $ chars >>= \ a -> unwords ((\ b -> [a,b]) <$> chars) ++ "\n"
-    debugPrintBuffer
+    insertString grid
+    report "OK\n"
   testTextEditor error buf $ do
-    report "--- gotoPosition 1 1\n"
+    report "--- gotoPosition 1 1 ... "
     gotoPosition $ mkLoc 1 1
-    debugPrintBuffer
+    report "OK\n"
   let reportView a b = do
         report $ "view "++showLoc a++"->"++showLoc b++"\n"
         textView a b buf >>= \ case
@@ -159,32 +186,32 @@ textViewTests = do
   reportView (mkLoc  3 25) (mkLoc  6 24)
   reportView (mkLoc 14  1) (mkLoc 16 48)
   reportView (mkLoc  1  1) (mkLoc  3 48)
+  ---
   reportView (mkLoc  1 12) (mkLoc  1 28)
+  ---
   reportView (mkLoc  1 12) (mkLoc  9 28)
-  report "Move cursor to start of buffer...\n"
+  report "(move position to start of buffer)\n"
   testTextEditor error buf $ do
-    report "--- gotoPosition 1 1\n"
+    report "--- gotoPosition 1 1 ... "
     gotoPosition $ mkLoc 1 1
-    --debugPrintBuffer
-  report "OK\n"
+    report "OK\n"
   reportView (mkLoc  3 24) (mkLoc  5 25)
   reportView (mkLoc 14  1) (mkLoc 15 48)
   reportView (mkLoc  1  1) (mkLoc  2 48)
   reportView (mkLoc  1 12) (mkLoc  1 25)
   reportView (mkLoc  9 12) (mkLoc  8 25)
-  report "Move cursor to middle of buffer...\n"
+  report "(Move cursor to middle of buffer)\n"
   testTextEditor error buf $ do
     report "--- gotoPosition 8 23\n"
     gotoPosition $ mkLoc 8 23
-    --debugPrintBuffer
-  report "OK\n"
+    report "OK\n"
   reportView (mkLoc  1  1) (mkLoc  8 48)
   reportView (mkLoc  7 24) (mkLoc 11 25)
-  reportView (mkLoc  7  1) (mkLoc  8 48)
+  reportView (mkLoc  7  1) (mkLoc  8 49)
   reportView (mkLoc  8  1) (mkLoc  9 48)
-  reportView (mkLoc  9  1) (mkLoc 10 48)
+  reportView (mkLoc  9  1) (mkLoc 10 49)
   reportView (mkLoc  1  1) (mkLoc 16 48)
-  reportView (mkLoc  8  1) (mkLoc  8 48)
+  reportView (mkLoc  8  1) (mkLoc  8 49)
 
 textEditorTests :: IO ()
 textEditorTests = do
