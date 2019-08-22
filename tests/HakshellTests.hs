@@ -72,10 +72,11 @@ moveCursorTests = do
                 error $ "FAILED ("++lbl++"):\n"++
                         "  expected: "++show expct++
                         "    result: "++show rgn
-          report $ "--- copyRegion ("++show at++") ("++show len++") -> "++show expct++" ... "
-          copyCharsRange at len >>= check "forward"
-          report $ "--- copyRegion ("++show (shiftAbsolute at len)++") ("++show (negate len)++") -> "++show expct++" ... "
-          copyCharsRange (shiftAbsolute at len) (negate len) >>= check "reverse"
+          let cp lbl at len = do
+                report $ "--- copyRegion ("++show at++") ("++show len++") -> "++show expct++" ... "
+                copyCharsRange at len >>= check lbl
+          cp "forward" at len
+          cp "reverse" (shiftAbsolute at len) (negate len)
     let copyEach n str = do
           report $ "--- copyEach ("++show n++"), elems="++show str++"\n"
           let len   = length str

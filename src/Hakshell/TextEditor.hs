@@ -100,6 +100,7 @@ module Hakshell.TextEditor
 
     Absolute(..),  LineIndex(..), CharIndex(..), TextLocation(..),
     shiftAbsolute, diffAbsolute,
+    lineToIndex, charToIndex, indexToLine, indexToChar,
 
     -- *** Moving the cursor relative to the cursor
 
@@ -108,6 +109,7 @@ module Hakshell.TextEditor
     Relative(..), RelativeToCursor(..),
     RelativeToAbsoluteCursor, -- <- does not export members
     relativeToAbsolute, relativeLine, relativeChar, lineIndex, charIndex,
+    lineToCount, charToCount, countToLine, countToChar,
 
     -- ** The 'EditLine' function type
     --
@@ -1300,8 +1302,8 @@ copyRegionChk
   => Absolute Int -> Relative Int -> m (vec RealWorld elem)
 copyRegionChk i0@(Absolute i) count0@(Relative count) =
   countElems >>= \ siz -> let sum = i + count in
-  if i < 0 || i >= siz then throwIndexErr i
-  else if sum < 0 || i > sum then throwCountErr count
+  if i < 0 || (count < 0 && i > siz) || (count > 0 && i >= siz) then throwIndexErr i
+  else if sum < 0 || sum > siz then throwCountErr count
   else copyRegion i0 count0
 
 -- Copy a vector range starting at an 'Absolute' index and moving toward the start ('Before') or
@@ -2304,7 +2306,7 @@ textView from to =
                     veclen   = UVec.length vec
                     lbrksz   = fromIntegral $ theTextLineBreakSize line
                     (i, len) = f veclen lbrksz
-                in line & textLineString %~ UVec.slice i len
+                in  line & textLineString %~ UVec.slice i len
               TextLineUndefined -> error $
                 "textView: trimmed vector contains undefined line at index "++show i
         onvec top $ \ len lbrksz -> (0, unchar len lbrksz to) 
