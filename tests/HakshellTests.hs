@@ -1,24 +1,23 @@
 module Main where
 
+import           Hakshell.String
 import           Hakshell.TextEditor
 
-import           Data.Char
 import           Data.List (tails)
 
 import           Control.Monad.IO.Class
+import           Control.Monad.Reader
+
+import           Test.Hspec
 
 ----------------------------------------------------------------------------------------------------
 
 main :: IO ()
-main = do
-  begin
+main = hspec $ describe "hakshell" $ do
   moveCursorTests
   lineEditorTests
   textViewTests
   textEditorTests
-
-begin :: IO ()
-begin = putStrLn "\n-------------------------\nBegin HakshellTest Log\n-------------------------\n"
 
 ----------------------------------------------------------------------------------------------------
 
@@ -37,10 +36,16 @@ showLoc
    ,theLocationCharIndex=Absolute (CharIndex char)
    }) = '(' : show line ++ ':' : show char ++ ")"
 
-testTextEditor :: (String -> IO ()) -> TextBuffer tags -> EditText tags IO () -> IO ()
+testTextEditor :: (String -> IO a) -> TextBuffer tags -> EditText tags IO a -> IO a
 testTextEditor onErr buf f = runEditTextIO f buf >>= \ case
   Left err -> onErr $ show err
   Right a  -> return a
+
+ed :: TextBuffer tags -> EditText tags IO a -> IO a
+ed = testTextEditor error
+
+edln :: Show tags => TextBuffer tags -> EditLine tags IO a -> IO a
+edln buf = ed buf . editLine
 
 defaultTags :: Tags
 defaultTags = ()
@@ -52,115 +57,92 @@ report = liftIO . putStr
 
 -- The 'copyRegion' function is a sort of dependency for both the 'lineEditorTests' and the
 -- 'textViewTests'.
-moveCursorTests :: IO ()
-moveCursorTests = do
-  buf <- newTextBuffer defaultTags
-  testTextEditor error buf $ do
-    let ins dir ch = do
-          report $ "--- insertChar "++show dir++' ':show ch++"\n"
-          insertChar dir ch
-    let check expct = do
-          txt <- copyLineEditorText
-          if unpack txt == expct
-           then do
-            report "--- content of buffer: "
-            liftIO $ print txt
-           else error $ "\n  Expecting: "++show expct++"\n  Contents: "++show txt
-    let copy at len expct = liftEditLine $ do
-          let check lbl rgn = if unpack rgn == expct then report "OK\n" else do
-                report "FAILED\n"
-                error $ "FAILED ("++lbl++"):\n"++
-                        "  expected: "++show expct++
-                        "    result: "++show rgn
-          let cp lbl at len = do
-                report $ "--- copyRegion ("++show at++") ("++show len++") -> "++show expct++" ... "
-                copyCharsRange at len >>= check lbl
-          cp "forward" at len
-          cp "reverse" (shiftAbsolute at len) (negate len)
-    let copyEach n str = do
-          report $ "--- copyEach ("++show n++"), elems="++show str++"\n"
-          let len   = length str
-          let count = charToCount n
-          mapM_ (uncurry $ uncurry copy) $ [1 ..] `zip` repeat n `zip`
-            (take count . fst <$> (tails str `zip` [0 .. len - count]))
-    let copy123 str = copyEach 1 str >> copyEach 2 str >> copyEach 3 str
-    let move dir expbef expaft = liftEditLine $ do
-          report $ "--- moveByChar ("++show dir++")\n"
-          moveByChar dir
-          check (expbef++expaft)
-          let checkpart what txt exp cont = if unpack txt /= exp
-                then error $
-                  " characters "++what++
-                  " cursor do not match expected value:\n  Expecting: "++show expbef++
-                  "\n  Contents: "++show txt
-                else cont
-          beftxt <- copyCharsToEnd Before
-          afttxt <- copyCharsToEnd After
-          checkpart "before" beftxt expbef $ checkpart "after" afttxt expaft $ return ()
-    ins Before 'A'
-    ins After  'F'
-    check "AF"
-    move (-1) "" "AF"
-    move  (2) "AF" ""
-    move (-2) "" "AF"
-    move  (1) "A" "F"
-    ins Before 'B'
-    check "ABF"
-    ins After  'E'
-    check "ABEF"
-    move (-2) "" "ABEF"
-    move  (3) "ABE" "F"
-    move (-3) "" "ABEF"
-    move  (4) "ABEF" ""
-    move (-2) "AB" "EF"
-    ins Before 'C'
-    check "ABCEF"
-    ins After  'D'
-    check "ABCDEF"
-    move (-3) "" "ABCDEF"
-    copy123 "ABCDEF"
-    move  (6) "ABCDEF" ""
-    copy123 "ABCDEF"
-    move (-6) "" "ABCDEF"
-    move  (3) "ABC" "DEF"
-    copy123 "ABCDEF"
-    move  (2) "ABCDE" "F"
-    move (-3) "AB" "CDEF"
-    copy123 "ABCDEF"
-    move  (4) "ABCDEF" ""
-    move (-5) "A" "BCDEF"
-    move (-1) "" "ABCDEF"
-    move  (1) "A" "BCDEF"
-    move  (4) "ABCDE" "F"
-    move  (1) "ABCDEF" ""
-    move (-1) "ABCDE" "F"
-    copy123 "ABCDEF"
+moveCursorTests :: Spec
+moveCursorTests = describe "moveCursor" $ do
+  buf <- runIO $ newTextBuffer defaultTags
+  let ins dir ch expct =
+        it ("insertChar "++show dir++' ':show ch) $
+        ed buf (insertChar dir ch >> unpack <$> copyLineEditorText)
+        `shouldReturn` expct
+  let copy1way dir at len expct =
+        it ("copyRegion ("++show at++") ("++show len++") -- in "++dir++" direction") $
+        edln buf (unpack <$> copyCharsRange at len)
+        `shouldReturn` expct
+  let copy at len expct = do
+        copy1way "forward" at len expct
+        copy1way "reverse" (shiftAbsolute at len) (negate len) expct
+  let copyEach str n = do
+        let len   = length str
+        let count = charToCount n
+        mapM_ (uncurry $ uncurry copy) $ [1 ..] `zip` repeat n `zip`
+          (take count . fst <$> (tails str `zip` [0 .. len - count]))
+  let copy123 = forM_ [1..3] . copyEach
+  let toEnd dir = (,) dir . unpack <$> copyCharsToEnd dir
+  let move rel expbef expaft = 
+        it ("moveByChar ("++show rel++")") $
+        edln buf (moveByChar rel >> (,) <$> toEnd Before <*> toEnd After)
+        `shouldReturn` ((Before, expbef), (After, expaft))
+  ins Before 'A' "A"
+  ins After  'F' "AF"
+  move (-1) "" "AF"
+  move  (2) "AF" ""
+  move (-2) "" "AF"
+  move  (1) "A" "F"
+  ins Before 'B' "ABF"
+  ins After  'E' "ABEF"
+  move (-2) "" "ABEF"
+  move  (3) "ABE" "F"
+  move (-3) "" "ABEF"
+  move  (4) "ABEF" ""
+  move (-2) "AB" "EF"
+  ins Before 'C' "ABCEF"
+  ins After  'D' "ABCDEF"
+  move (-3) "" "ABCDEF"
+  copy123 "ABCDEF"
+  move  (6) "ABCDEF" ""
+  copy123 "ABCDEF"
+  move (-6) "" "ABCDEF"
+  move  (3) "ABC" "DEF"
+  copy123 "ABCDEF"
+  move  (2) "ABCDE" "F"
+  move (-3) "AB" "CDEF"
+  copy123 "ABCDEF"
+  move  (4) "ABCDEF" ""
+  move (-5) "A" "BCDEF"
+  move (-1) "" "ABCDEF"
+  move  (1) "A" "BCDEF"
+  move  (4) "ABCDE" "F"
+  move  (1) "ABCDEF" ""
+  move (-1) "ABCDE" "F"
+  copy123 "ABCDEF"
 
-lineEditorTests :: IO ()
-lineEditorTests = do
-  report "--- line editor tests ---\n"
-  buf <- newTextBuffer defaultTags
-  let instr dir str = testTextEditor error buf $ do
-        report $ "--- insert string "++
-          ((\ (c:cx) -> toLower c : cx) $ show dir)++" cursor: "++show str++" ---\n"
-        mapM_ (insertChar dir) str
-        copyLineEditorText >>= liftIO . print
+lineEditorTests :: Spec
+lineEditorTests = describe "EditLine" $ do
+  buf <- runIO $ newTextBuffer defaultTags
+  let instr dir str =
+        it ("insertChar "++show dir++' ':show str) $
+        ed buf (forM_ str (insertChar dir))
   instr After $ reverse "characters after"
   instr Before "characters before "
-  let move dir = testTextEditor error buf $ do
-        report $ "--- moveByChar "++show dir++" ---\n"
-        moveByChar dir
-        copyLineEditorText >>= liftIO . print
-  let select i count = testTextEditor error buf $ do
-        report $ "--- copyCharsRange "++show i++' ':show count++" ---\n"
-        editLine (copyCharsRange i count) >>= liftIO . print
-  select 12 11
+  let move rel = it ("moveByChar ("++show rel++")") $
+        ed buf (moveByChar rel)
+  let select i count expct =
+        it ("copyCharsRange "++show i++' ':show count++" ---\n") $
+        edln buf (unpack <$> copyCharsRange i count)
+        `shouldReturn` expct
+  select 12 11 "cters after"
   move minBound
   instr Before "what "
   move maxBound
   instr Before " now"
   move (-20)
-  instr Before "the "
+  instr Before "the what now"
+
+----------------------------------------------------------------------------------------------------
+
+newtype Lines = Lines{ unwrapLines :: [String] } deriving (Eq, Ord)
+instance Show Lines where
+  show (Lines lines) = "\n" ++ (lines >>= (++ "\n") . ("    " ++) . show)
 
 selectStrings :: TextLocation -> TextLocation -> [String] -> [String]
 selectStrings a b lines =
@@ -181,88 +163,63 @@ selectStrings a b lines =
                         [take (hi - lo) $ drop lo line]
         line:lines -> drop charA line : final lines
 
-textViewTests :: IO ()
-textViewTests = do
-  report "--- text view tests ---\n"
-  buf <- newTextBuffer defaultTags
-  --let showWholeBuf = testTextEditor error buf $ do
-  --      report "<> ----------------------------------------------------------------\n"
-  --      debugPrintBuffer
-  report "fill buffer...\n"
+textViewTests :: Spec
+textViewTests = describe "TextView" $ do
   let chars     = "0123456789ABCDEF"
   let gridLines = (\ a -> unwords ((\ b -> [a,b]) <$> chars) ++ "\n") <$> chars :: [String]
   let grid      = concat gridLines :: String
-  testTextEditor error buf $ do
-    insertString grid
-    report "OK\n"
-  testTextEditor error buf $ do
-    report "--- gotoPosition 1 1 ... "
-    gotoPosition $ mkLoc 1 1
-    report "OK\n"
-  let reportView a b = do
-        report $ "view "++showLoc a++"->"++showLoc b++" ... "
-        textView a b buf >>= \ case
-          Left err -> error $ show err
-          Right  v ->
-            let reslt = fst <$> textViewToStrings v
-                expct = selectStrings a b gridLines
-            in  if reslt == expct then report "OK\n" else error $
-                  "\n'textView'-> bad result\n  expected:\n" ++
-                  (expct >>= (++ "\n") . ("    " ++) . show) ++
-                  "\n  received:\n" ++
-                  (reslt >>= (++ "\n") . ("    " ++) . show)
-  reportView (mkLoc  3 25) (mkLoc  6 24)
-  reportView (mkLoc 14  1) (mkLoc 16 48)
-  reportView (mkLoc  1  1) (mkLoc  3 48)
-  reportView (mkLoc  1 12) (mkLoc  1 28)
-  reportView (mkLoc  1 12) (mkLoc  9 28)
-  report "(move position to start of buffer)\n"
-  testTextEditor error buf $ do
-    report "--- gotoPosition 1 1 ... "
-    gotoPosition $ mkLoc 1 1
-    report "OK\n"
-  reportView (mkLoc  3 24) (mkLoc  5 25)
-  reportView (mkLoc 14  1) (mkLoc 15 48)
-  reportView (mkLoc  1  1) (mkLoc  2 48)
-  reportView (mkLoc  1 12) (mkLoc  1 25)
-  reportView (mkLoc  9 12) (mkLoc  8 25)
-  report "(Move cursor to middle of buffer)\n"
-  testTextEditor error buf $ do
-    report "--- gotoPosition 8 23\n"
-    gotoPosition $ mkLoc 8 23
-    report "OK\n"
-  reportView (mkLoc  1  1) (mkLoc  8 48)
-  reportView (mkLoc  7 24) (mkLoc 11 25)
-  reportView (mkLoc  7  1) (mkLoc  8 49)
-  reportView (mkLoc  8  1) (mkLoc  9 48)
-  reportView (mkLoc  9  1) (mkLoc 10 49)
-  reportView (mkLoc  1  1) (mkLoc 16 48)
-  reportView (mkLoc  8  1) (mkLoc  8 49)
+  buf <- runIO $ newTextBuffer defaultTags
+  it ("insertString grid") $ ed buf $ void $ insertString grid
+  let vi a b = it ("textView ("++showLoc a++") ("++showLoc b++")") $
+        ( textView a b buf >>= \ case
+            Left err -> error $ show err
+            Right  v -> return $ Lines $ fst <$> textViewToStrings v
+        ) `shouldReturn` Lines (selectStrings a b gridLines)
+  it ("move cursor to start of buffer: gotoPosition 1 1") $
+    ed buf $ gotoPosition (mkLoc 1 1)
+  vi (mkLoc  3 25) (mkLoc  6 24)
+  vi (mkLoc 14  1) (mkLoc 16 48)
+  vi (mkLoc  1  1) (mkLoc  3 48)
+  vi (mkLoc  1 12) (mkLoc  1 28)
+  vi (mkLoc  1 12) (mkLoc  9 28)
+  it ("move cursor to start of buffer: gotoPosition 1 1") $
+    ed buf $ gotoPosition $ mkLoc 1 1
+  vi (mkLoc  3 24) (mkLoc  5 25)
+  vi (mkLoc 14  1) (mkLoc 15 48)
+  vi (mkLoc  1  1) (mkLoc  2 48)
+  vi (mkLoc  1 12) (mkLoc  1 25)
+  vi (mkLoc  9 12) (mkLoc  8 25)
+  it ("move cursor to middle of buffer: gotoPosition 8 23") $
+    ed buf $ gotoPosition $ mkLoc 8 23
+  vi (mkLoc  1  1) (mkLoc  8 48)
+  vi (mkLoc  7 24) (mkLoc 11 25)
+  vi (mkLoc  7  1) (mkLoc  8 49)
+  vi (mkLoc  8  1) (mkLoc  9 48)
+  vi (mkLoc  9  1) (mkLoc 10 49)
+  vi (mkLoc  1  1) (mkLoc 16 48)
+  vi (mkLoc  8  1) (mkLoc  8 49)
+  return ()
 
-textEditorTests :: IO ()
-textEditorTests = do
-  buf <- newTextBuffer defaultTags
-  report "--- basic tests ---\n"
-  let reportInsert str = testTextEditor error buf $ do
-        report $ "insertString " ++ show str ++ "\n"
-        insertString str
+textEditorTests :: Spec
+textEditorTests = describe "EditText" $ do
+  buf <- runIO $ newTextBuffer defaultTags
+  let ins str =
+        it ("insertString " ++ show str) $
+        ed buf (void $ insertString str)
         -- TODO: show the content of the whole buffer as a string here.
-        debugPrintBuffer
-  let reportMove msg line col = testTextEditor error buf $ do
-        report $ "Move cursor "++msg++", line="++show line++" col="++show col++" ...\n"
-        gotoPosition $ mkLoc line col
+  let move msg line col = let pos = mkLoc line col in
+        it ("move cursor "++msg++", gotoPosition ("++show pos++")") $
+        ed buf (gotoPosition $ mkLoc line col)
         -- TODO: show the content of the whole buffer as a string here.
-        debugPrintBuffer
-  let reportDelete msg n = testTextEditor error buf $ do
-        report $ "Delete on "++msg++", "++show n++" characters...\n"
-        deleteCharsWrap $ Relative $ CharIndex n
+  let del msg n =
+        it ("delete on "++msg++", deleteCharsWrap "++show n) $
+        ed buf (void $ deleteCharsWrap $ Relative $ CharIndex n)
         -- TODO: show the content of the whole buffer as a string here.
-        debugPrintBuffer
-  reportInsert "one two three\n"
-  reportInsert "four five six\nseven eight nine\nten eleven twelve\n"
-  reportMove        "up" 1  1
-  reportMove      "down" 4 16
-  reportMove "to middle" 2  7
-  reportDelete "same line" (-4)
-  reportDelete "to \"three\" on previous line" (-8)
-  report "OK\n"
+  ins "one two three\n"
+  ins "four five six\nseven eight nine\nten eleven twelve\n"
+  move        "up" 1  1
+  move      "down" 4 16
+  move "to middle" 2  7
+  del "same line" (-4)
+  del "to \"three\" on previous line" (-8)
+  return ()
