@@ -4,6 +4,7 @@ debug
 Makefile.bak
 .projectile
 .stack-work
+failure-report.log
 tags
 TAGS
 *~

@@ -14,10 +14,10 @@ import           Test.Hspec
 
 main :: IO ()
 main = hspec $ describe "hakshell" $ do
-  moveCursorTests
   lineEditorTests
-  textViewTests
   textEditorTests
+  moveCursorTests
+  textViewTests
 
 ----------------------------------------------------------------------------------------------------
 
@@ -55,8 +55,64 @@ report = liftIO . putStr
 
 ----------------------------------------------------------------------------------------------------
 
--- The 'copyRegion' function is a sort of dependency for both the 'lineEditorTests' and the
--- 'textViewTests'.
+-- | The simplest tests, tests whether 'insetChar' and 'moveByChar' do not crash, it is not tested
+-- whether or not the characters inserted are correct. These functions are used during
+-- initialization of all other tests, so they at least need be able to run without crashing, whether
+-- they run correctly is tested by other tests.
+lineEditorTests :: Spec
+lineEditorTests = describe "EditLine" $ do
+  buf <- runIO $ newTextBuffer defaultTags
+  let instr dir str =
+        it ("insertChar "++show dir++' ':show str) $
+        ed buf (forM_ str (insertChar dir))
+  instr After $ reverse "characters after"
+  instr Before "characters before "
+  let move rel = it ("moveByChar ("++show rel++")") $
+        ed buf (moveByChar rel)
+  let select i count expct =
+        it ("copyCharsRange "++show i++' ':show count++" ---\n") $
+        edln buf (unpack <$> copyCharsRange i count)
+        `shouldReturn` expct
+  select 12 11 "before char"
+  move minBound
+  instr Before "what "
+  move maxBound
+  instr Before " now"
+  move (-20)
+  instr Before "the what now"
+
+-- | The next simplest tests, tests whether 'insertString' and 'gotoPosition' do not crash, it is
+-- not tested whether or not the text inserted is correct. These functions are used during
+-- initialization of all other tests, so they at least need be able to run without crashing, whether
+-- they run correctly is tested by other tests.
+textEditorTests :: Spec
+textEditorTests = describe "EditText" $ do
+  buf <- runIO $ newTextBuffer defaultTags
+  let ins str =
+        it ("insertString " ++ show str) $
+        ed buf (void $ insertString str)
+        -- TODO: show the content of the whole buffer as a string here.
+  let move msg line col = let pos = mkLoc line col in
+        it ("move cursor "++msg++", gotoPosition ("++show pos++")") $
+        ed buf (gotoPosition $ mkLoc line col)
+        -- TODO: show the content of the whole buffer as a string here.
+  let del msg n =
+        it ("delete on "++msg++", deleteCharsWrap "++show n) $
+        ed buf (void $ deleteCharsWrap $ Relative $ CharIndex n)
+        -- TODO: show the content of the whole buffer as a string here.
+  ins "one two three\n"
+  ins "four five six\nseven eight nine\nten eleven twelve\n"
+  move        "up" 1  1
+  move      "down" 4 16
+  move "to middle" 2  7
+  del "same line" (-4)
+  del "to \"three\" on previous line" (-8)
+  return ()
+
+-- | This function tests whether 'insertChar', 'moveByChar', and 'copyCharsRange' produce correct
+-- results. These tests operate on a line buffer, but the same vector computations used for the line
+-- buffer are also used for the full text buffer, so ensuring these functions are correct goes more
+-- than half way to ensuring the text editor functions are correct as well.
 moveCursorTests :: Spec
 moveCursorTests = describe "moveCursor" $ do
   buf <- runIO $ newTextBuffer defaultTags
@@ -116,28 +172,6 @@ moveCursorTests = describe "moveCursor" $ do
   move (-1) "ABCDE" "F"
   copy123 "ABCDEF"
 
-lineEditorTests :: Spec
-lineEditorTests = describe "EditLine" $ do
-  buf <- runIO $ newTextBuffer defaultTags
-  let instr dir str =
-        it ("insertChar "++show dir++' ':show str) $
-        ed buf (forM_ str (insertChar dir))
-  instr After $ reverse "characters after"
-  instr Before "characters before "
-  let move rel = it ("moveByChar ("++show rel++")") $
-        ed buf (moveByChar rel)
-  let select i count expct =
-        it ("copyCharsRange "++show i++' ':show count++" ---\n") $
-        edln buf (unpack <$> copyCharsRange i count)
-        `shouldReturn` expct
-  select 12 11 "cters after"
-  move minBound
-  instr Before "what "
-  move maxBound
-  instr Before " now"
-  move (-20)
-  instr Before "the what now"
-
 ----------------------------------------------------------------------------------------------------
 
 newtype Lines = Lines{ unwrapLines :: [String] } deriving (Eq, Ord)
@@ -163,13 +197,18 @@ selectStrings a b lines =
                         [take (hi - lo) $ drop lo line]
         line:lines -> drop charA line : final lines
 
+-- | Tests the 'textView' function, which has some arithmetical computations regarding vector slices
+-- with line breaks that are not shared with most other functions, so 'textView' needs it's own
+-- extensive set of tests.
 textViewTests :: Spec
 textViewTests = describe "TextView" $ do
   let chars     = "0123456789ABCDEF"
   let gridLines = (\ a -> unwords ((\ b -> [a,b]) <$> chars) ++ "\n") <$> chars :: [String]
   let grid      = concat gridLines :: String
-  buf <- runIO $ newTextBuffer defaultTags
-  it ("insertString grid") $ ed buf $ void $ insertString grid
+  buf <- runIO $ do
+    buf <- newTextBuffer defaultTags
+    ed buf $ insertString grid
+    return buf
   let vi a b = it ("textView ("++showLoc a++") ("++showLoc b++")") $
         ( textView a b buf >>= \ case
             Left err -> error $ show err
@@ -198,28 +237,4 @@ textViewTests = describe "TextView" $ do
   vi (mkLoc  9  1) (mkLoc 10 49)
   vi (mkLoc  1  1) (mkLoc 16 48)
   vi (mkLoc  8  1) (mkLoc  8 49)
-  return ()
-
-textEditorTests :: Spec
-textEditorTests = describe "EditText" $ do
-  buf <- runIO $ newTextBuffer defaultTags
-  let ins str =
-        it ("insertString " ++ show str) $
-        ed buf (void $ insertString str)
-        -- TODO: show the content of the whole buffer as a string here.
-  let move msg line col = let pos = mkLoc line col in
-        it ("move cursor "++msg++", gotoPosition ("++show pos++")") $
-        ed buf (gotoPosition $ mkLoc line col)
-        -- TODO: show the content of the whole buffer as a string here.
-  let del msg n =
-        it ("delete on "++msg++", deleteCharsWrap "++show n) $
-        ed buf (void $ deleteCharsWrap $ Relative $ CharIndex n)
-        -- TODO: show the content of the whole buffer as a string here.
-  ins "one two three\n"
-  ins "four five six\nseven eight nine\nten eleven twelve\n"
-  move        "up" 1  1
-  move      "down" 4 16
-  move "to middle" 2  7
-  del "same line" (-4)
-  del "to \"three\" on previous line" (-8)
   return ()
