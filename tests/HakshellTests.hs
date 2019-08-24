@@ -214,27 +214,26 @@ textViewTests = describe "TextView" $ do
             Left err -> error $ show err
             Right  v -> return $ Lines $ fst <$> textViewToStrings v
         ) `shouldReturn` Lines (selectStrings a b gridLines)
-  it ("move cursor to start of buffer: gotoPosition 1 1") $
-    ed buf $ gotoPosition (mkLoc 1 1)
-  vi (mkLoc  3 25) (mkLoc  6 24)
-  vi (mkLoc 14  1) (mkLoc 16 48)
-  vi (mkLoc  1  1) (mkLoc  3 48)
-  vi (mkLoc  1 12) (mkLoc  1 28)
-  vi (mkLoc  1 12) (mkLoc  9 28)
-  it ("move cursor to start of buffer: gotoPosition 1 1") $
-    ed buf $ gotoPosition $ mkLoc 1 1
-  vi (mkLoc  3 24) (mkLoc  5 25)
-  vi (mkLoc 14  1) (mkLoc 15 48)
-  vi (mkLoc  1  1) (mkLoc  2 48)
-  vi (mkLoc  1 12) (mkLoc  1 25)
-  vi (mkLoc  9 12) (mkLoc  8 25)
-  it ("move cursor to middle of buffer: gotoPosition 8 23") $
-    ed buf $ gotoPosition $ mkLoc 8 23
-  vi (mkLoc  1  1) (mkLoc  8 48)
-  vi (mkLoc  7 24) (mkLoc 11 25)
-  vi (mkLoc  7  1) (mkLoc  8 49)
-  vi (mkLoc  8  1) (mkLoc  9 48)
-  vi (mkLoc  9  1) (mkLoc 10 49)
-  vi (mkLoc  1  1) (mkLoc 16 48)
-  vi (mkLoc  8  1) (mkLoc  8 49)
-  return ()
+  describe ("move cursor to start of buffer: gotoPosition 1 1") $ do
+    vi (mkLoc  3 25) (mkLoc  6 24)
+    vi (mkLoc 14  1) (mkLoc 16 48)
+    vi (mkLoc  1  1) (mkLoc  3 48)
+    vi (mkLoc  1 12) (mkLoc  1 28)
+    vi (mkLoc  1 12) (mkLoc  9 28)
+  describe ("move cursor to start of buffer: gotoPosition 1 1") $ do
+    runIO $ ed buf $ gotoPosition $ mkLoc 1 1
+    vi (mkLoc  3 24) (mkLoc  5 25)
+    vi (mkLoc 14  1) (mkLoc 15 48)
+    vi (mkLoc  1  1) (mkLoc  2 48)
+    vi (mkLoc  1 12) (mkLoc  1 25)
+    vi (mkLoc  3 13) (mkLoc  6 49)
+    vi (mkLoc  9 12) (mkLoc  8 25)
+  describe ("move cursor to middle of buffer: gotoPosition 8 23") $ do
+    runIO $ ed buf $ gotoPosition $ mkLoc 8 23
+    vi (mkLoc  1  1) (mkLoc  8 48)
+    vi (mkLoc  7 24) (mkLoc 11 25)
+    vi (mkLoc  7  1) (mkLoc  8 49)
+    vi (mkLoc  8  1) (mkLoc  9 48)
+    vi (mkLoc  9  1) (mkLoc 10 49)
+    vi (mkLoc  1  1) (mkLoc 16 48)
+    vi (mkLoc  8  1) (mkLoc  8 49)

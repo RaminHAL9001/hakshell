@@ -236,11 +236,6 @@ import qualified Data.Vector.Unboxed.Mutable as UMVec
 import           Data.Word
 
 import Debug.Trace
---trace :: String -> a -> a
---trace = const id
-
---traceM :: Monad m => String -> m ()
---traceM = const $ return ()
 
 ----------------------------------------------------------------------------------------------------
 
@@ -2308,32 +2303,31 @@ textView
      )
   => TextLocation -> TextLocation -> TextBuffer tags
   -> m (Either TextEditError (TextView tags))
-textView from to =
-  liftIO . runEditTextIO (mkview (min from to) (max from to)) where
-    mkview from to = countElems >>= \ nmax ->
-      if nmax <= 0 || from == to then return emptyTextView else do
-        let unline = lineToIndex . theLocationLineIndex
-        let (lo, hi) = (unline from, unline to)
-        newvec <- copyRegionChk (Absolute lo) $ Relative $ 1 + hi - lo
-        let top = MVec.length newvec - 1
-        let unchar len lbrksz = max 0 . min (len - lbrksz) . charToIndex . theLocationCharIndex
-        let onvec i f = liftIO $ MVec.read newvec i >>= MVec.write newvec i . \ case
-              line@TextLine{}   ->
-                let vec      = line ^. textLineString
-                    veclen   = UVec.length vec
-                    lbrksz   = fromIntegral $ theTextLineBreakSize line
-                    (i, len) = f veclen lbrksz
-                in  line & textLineString %~ UVec.slice i len
-              TextLineUndefined -> error $
-                "textView: trimmed vector contains undefined line at index "++show i
-        onvec top $ \ len lbrksz -> (0, unchar len lbrksz to) 
-        onvec 0   $ \ len lbrksz -> let i = unchar len lbrksz from in (i, len - i)
-        let freeze = liftIO . if unsafeMode then Vec.unsafeFreeze else Vec.freeze
-        newvec <- freeze newvec
-        return TextView
-          { textViewCharCount = sum $ intSize <$> Vec.toList newvec
-          , textViewVector    = newvec
-          }
+textView from to = liftIO . runEditTextIO (mkview (min from to) (max from to)) where
+  mkview from to = countElems >>= \ nmax ->
+    if nmax <= 0 || from == to then return emptyTextView else do
+      let unline = lineToIndex . theLocationLineIndex
+      let (lo, hi) = (unline from, unline to)
+      newvec <- copyRegionChk (Absolute lo) $ Relative $ 1 + hi - lo
+      let top = MVec.length newvec - 1
+      let unchar len lbrksz = max 0 . min (len - lbrksz) . charToIndex . theLocationCharIndex
+      let onvec i f = liftIO $ MVec.read newvec i >>= MVec.write newvec i . \ case
+            line@TextLine{}   ->
+              let vec      = line ^. textLineString
+                  veclen   = UVec.length vec
+                  lbrksz   = fromIntegral $ theTextLineBreakSize line
+                  (i, len) = f veclen lbrksz
+              in  line & textLineString %~ UVec.slice i len
+            TextLineUndefined -> error $
+              "textView: trimmed vector contains undefined line at index "++show i
+      onvec top $ \ len lbrksz -> (0, unchar len lbrksz to) 
+      onvec 0   $ \ len lbrksz -> let i = unchar len lbrksz from in (i, len - i)
+      let freeze = liftIO . if unsafeMode then Vec.unsafeFreeze else Vec.freeze
+      newvec <- freeze newvec
+      return TextView
+        { textViewCharCount = sum $ intSize <$> Vec.toList newvec
+        , textViewVector    = newvec
+        }
 
 -- | Like 'textView', creates a new text view, but rather than taking two 'TextLocation's to delimit
 -- the range, takes two @('Absolute' 'LineIndex')@ values to delimit the range.
