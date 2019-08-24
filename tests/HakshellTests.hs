@@ -14,10 +14,11 @@ import           Test.Hspec
 
 main :: IO ()
 main = hspec $ describe "hakshell" $ do
+  lineEditorPreTests
+  textEditorPreTests
   lineEditorTests
-  textEditorTests
-  moveCursorTests
   textViewTests
+  textDeletionTests
 
 ----------------------------------------------------------------------------------------------------
 
@@ -59,8 +60,8 @@ report = liftIO . putStr
 -- whether or not the characters inserted are correct. These functions are used during
 -- initialization of all other tests, so they at least need be able to run without crashing, whether
 -- they run correctly is tested by other tests.
-lineEditorTests :: Spec
-lineEditorTests = describe "EditLine" $ do
+lineEditorPreTests :: Spec
+lineEditorPreTests = describe "line editor pre-tests" $ do
   buf <- runIO $ newTextBuffer defaultTags
   let instr dir str =
         it ("insertChar "++show dir++' ':show str) $
@@ -85,36 +86,27 @@ lineEditorTests = describe "EditLine" $ do
 -- not tested whether or not the text inserted is correct. These functions are used during
 -- initialization of all other tests, so they at least need be able to run without crashing, whether
 -- they run correctly is tested by other tests.
-textEditorTests :: Spec
-textEditorTests = describe "EditText" $ do
+textEditorPreTests :: Spec
+textEditorPreTests = describe "test editor pre-tests" $ do
   buf <- runIO $ newTextBuffer defaultTags
   let ins str =
         it ("insertString " ++ show str) $
         ed buf (void $ insertString str)
-        -- TODO: show the content of the whole buffer as a string here.
   let move msg line col = let pos = mkLoc line col in
         it ("move cursor "++msg++", gotoPosition ("++show pos++")") $
         ed buf (gotoPosition $ mkLoc line col)
-        -- TODO: show the content of the whole buffer as a string here.
-  let del msg n =
-        it ("delete on "++msg++", deleteCharsWrap "++show n) $
-        ed buf (void $ deleteCharsWrap $ Relative $ CharIndex n)
-        -- TODO: show the content of the whole buffer as a string here.
   ins "one two three\n"
   ins "four five six\nseven eight nine\nten eleven twelve\n"
   move        "up" 1  1
   move      "down" 4 16
   move "to middle" 2  7
-  del "same line" (-4)
-  del "to \"three\" on previous line" (-8)
-  return ()
 
 -- | This function tests whether 'insertChar', 'moveByChar', and 'copyCharsRange' produce correct
 -- results. These tests operate on a line buffer, but the same vector computations used for the line
 -- buffer are also used for the full text buffer, so ensuring these functions are correct goes more
 -- than half way to ensuring the text editor functions are correct as well.
-moveCursorTests :: Spec
-moveCursorTests = describe "moveCursor" $ do
+lineEditorTests :: Spec
+lineEditorTests = describe "line editor tests" $ do
   buf <- runIO $ newTextBuffer defaultTags
   let ins dir ch expct =
         it ("insertChar "++show dir++' ':show ch) $
@@ -199,9 +191,12 @@ selectStrings a b lines =
 
 -- | Tests the 'textView' function, which has some arithmetical computations regarding vector slices
 -- with line breaks that are not shared with most other functions, so 'textView' needs it's own
--- extensive set of tests.
+-- extensive set of tests. 'textView' is the function used to inspect the state of the 'TextBuffer',
+-- so ANY tests for any functions that can update the 'TextBuffer' depend on this test, because all
+-- tests of 'TextBuffer' updating functions require a correct implementation of 'textView' in order
+-- to inspect the updates.
 textViewTests :: Spec
-textViewTests = describe "TextView" $ do
+textViewTests = describe "testing 'textView'" $ do
   let chars     = "0123456789ABCDEF"
   let gridLines = (\ a -> unwords ((\ b -> [a,b]) <$> chars) ++ "\n") <$> chars :: [String]
   let grid      = concat gridLines :: String
@@ -237,3 +232,12 @@ textViewTests = describe "TextView" $ do
     vi (mkLoc  9  1) (mkLoc 10 49)
     vi (mkLoc  1  1) (mkLoc 16 48)
     vi (mkLoc  8  1) (mkLoc  8 49)
+
+----------------------------------------------------------------------------------------------------
+
+textDeletionTests :: Spec
+textDeletionTests = describe "text deletion tests" $ do
+  it ("deleteChars") $ do
+    pendingWith "TODO"
+  it ("deleteCharsWrap") $ do
+    pendingWith "TODO"
