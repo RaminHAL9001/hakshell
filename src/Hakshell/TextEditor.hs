@@ -2310,7 +2310,7 @@ textView from to = liftIO . runEditTextIO (mkview (min from to) (max from to)) w
       let (lo, hi) = (unline from, unline to)
       newvec <- copyRegionChk (Absolute lo) $ Relative $ 1 + hi - lo
       let top = MVec.length newvec - 1
-      let unchar len lbrksz = max 0 . min (len - lbrksz) . charToIndex . theLocationCharIndex
+      let unchar len lbrksz = max 0 . min (len - lbrksz + 1) . charToIndex . theLocationCharIndex
       let onvec i f = liftIO $ MVec.read newvec i >>= MVec.write newvec i . \ case
             line@TextLine{}   ->
               let vec      = line ^. textLineString
