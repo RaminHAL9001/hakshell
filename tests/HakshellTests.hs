@@ -189,6 +189,21 @@ selectStrings a b lines =
                         [take (hi - lo) $ drop lo line]
         line:lines -> drop charA line : final lines
 
+gridLines :: [String]
+gridLines = (\ a -> unwords ((\ b -> [a,b]) <$> chars) ++ "\n") <$> chars where
+  chars = "0123456789ABCDEF"
+{-# INLINE gridLines #-}
+
+grid :: String
+grid = concat gridLines
+{-# INLINE grid #-}
+
+testWithGrid :: (TextBuffer Tags -> Spec) -> Spec
+testWithGrid = (>>=) $ runIO $ do
+  buf <- newTextBuffer defaultTags
+  ed buf $ insertString grid
+  return buf
+
 -- | Tests the 'textView' function, which has some arithmetical computations regarding vector slices
 -- with line breaks that are not shared with most other functions, so 'textView' needs it's own
 -- extensive set of tests. 'textView' is the function used to inspect the state of the 'TextBuffer',
@@ -196,14 +211,7 @@ selectStrings a b lines =
 -- tests of 'TextBuffer' updating functions require a correct implementation of 'textView' in order
 -- to inspect the updates.
 textViewTests :: Spec
-textViewTests = describe "testing 'textView'" $ do
-  let chars     = "0123456789ABCDEF"
-  let gridLines = (\ a -> unwords ((\ b -> [a,b]) <$> chars) ++ "\n") <$> chars :: [String]
-  let grid      = concat gridLines :: String
-  buf <- runIO $ do
-    buf <- newTextBuffer defaultTags
-    ed buf $ insertString grid
-    return buf
+textViewTests = describe "testing 'textView'" $ testWithGrid $ \ buf -> do
   let vi a b = it ("textView ("++showLoc a++") ("++showLoc b++")") $
         ( textView a b buf >>= \ case
             Left err -> error $ show err
@@ -236,7 +244,7 @@ textViewTests = describe "testing 'textView'" $ do
 ----------------------------------------------------------------------------------------------------
 
 textDeletionTests :: Spec
-textDeletionTests = describe "text deletion tests" $ do
+textDeletionTests = describe "text deletion tests" $ testWithGrid $ \ buf -> do
   it ("deleteChars") $ do
     pendingWith "TODO"
   it ("deleteCharsWrap") $ do
