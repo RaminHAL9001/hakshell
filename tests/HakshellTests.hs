@@ -3,8 +3,10 @@ module Main where
 import           Hakshell.String
 import           Hakshell.TextEditor
 
+import           Data.IORef
 import           Data.List (tails)
 
+import           Control.Monad.Except
 import           Control.Monad.IO.Class
 import           Control.Monad.Reader
 
@@ -166,6 +168,8 @@ lineEditorTests = describe "line editor tests" $ do
 
 ----------------------------------------------------------------------------------------------------
 
+-- | A wrapper around a list of strings that instantiates the 'Eq' and 'Show' typeclasses so as to
+-- produce better output when they are pretty-printed by the Hspec logging function.
 newtype Lines = Lines{ unwrapLines :: [String] } deriving (Eq, Ord)
 instance Show Lines where
   show (Lines lines) = "\n" ++ (lines >>= (++ "\n") . ("    " ++) . show)
@@ -188,6 +192,34 @@ selectStrings a b lines =
         [line]     -> let (lo, hi) = (min charA charB, max charA charB) in
                         [take (hi - lo) $ drop lo line]
         line:lines -> drop charA line : final lines
+
+gotoListItem :: Int -> [a] -> ([a] -> [a] -> a -> b) -> [a] -> b
+gotoListItem i rev f = \ case
+  []    -> error $ "bug in test code: (gotoListItem "++show i++"), index is out of bounds"
+  a:fwd -> if i <= 0 then f rev fwd a else (gotoListItem $! i - 1) (a : rev) f fwd
+
+dropChars :: Int -> [String] -> [String]
+dropChars i = if i <= 0 then id else \ case
+  []               -> []
+  "":lines         -> dropChars i lines -- <-- DO NOT subtract 1 from i here.
+  (_c:chars):lines -> (dropChars $! i - 1) (chars : lines)
+
+deleteStrings :: TextLocation -> Relative CharIndex -> [String] -> [String]
+deleteStrings (TextLocation{theLocationLineIndex=line,theLocationCharIndex=char}) len =
+  let count = charToCount len in
+  if count == 0 then id else
+    gotoListItem (lineToIndex line) [] $ \ revLines fwdLines ->
+    let chidx = charToIndex char in
+    gotoListItem chidx "" $ \ revChars fwdChars _c -> -- <-- drop _c, must subtract 1 from count
+    if abs count <= chidx then
+      if count < 0 then
+        reverse (reverse (drop (negate count - 1) revChars :: String) : revLines :: [String]) ++ (fwdChars :: String) : fwdLines :: [String]
+      else
+        reverse ((reverse revChars :: String) : revLines :: [String]) ++ (drop (count - 1) fwdChars :: String) : fwdLines :: [String]
+    else if count < 0 then
+      reverse (dropChars (negate $ count + chidx + 1) revLines :: [String]) ++ (fwdChars :: String) : fwdLines :: [String]
+    else
+      reverse ((reverse revChars :: String) : revLines :: [String]) ++ (dropChars (count - chidx - 1) fwdLines :: [String]) :: [String]
 
 gridLines :: [String]
 gridLines = (\ a -> unwords ((\ b -> [a,b]) <$> chars) ++ "\n") <$> chars where
@@ -213,10 +245,8 @@ testWithGrid = (>>=) $ runIO $ do
 textViewTests :: Spec
 textViewTests = describe "testing 'textView'" $ testWithGrid $ \ buf -> do
   let vi a b = it ("textView ("++showLoc a++") ("++showLoc b++")") $
-        ( textView a b buf >>= \ case
-            Left err -> error $ show err
-            Right  v -> return $ Lines $ fst <$> textViewToStrings v
-        ) `shouldReturn` Lines (selectStrings a b gridLines)
+        (ed buf $ Lines . fmap fst . textViewToStrings <$> textView a b)
+        `shouldReturn` Lines (selectStrings a b gridLines)
   describe ("move cursor to start of buffer: gotoPosition 1 1") $ do
     vi (mkLoc  3 25) (mkLoc  6 24)
     vi (mkLoc 14  1) (mkLoc 16 48)
@@ -245,7 +275,18 @@ textViewTests = describe "testing 'textView'" $ testWithGrid $ \ buf -> do
 
 textDeletionTests :: Spec
 textDeletionTests = describe "text deletion tests" $ testWithGrid $ \ buf -> do
-  it ("deleteChars") $ do
-    pendingWith "TODO"
-  it ("deleteCharsWrap") $ do
-    pendingWith "TODO"
+  fakebuf <- runIO $ newIORef gridLines
+  let del at len = it ("deleteCharsWrap ("++show at++") ("++show len++")") $ do
+        grid0 <- liftIO $ readIORef fakebuf
+        let grid1 = deleteStrings at len grid0
+        liftIO $ writeIORef fakebuf grid1
+        flip shouldReturn (Lines grid1) $ ed buf $ do
+          gotoPosition at
+          deleteCharsWrap len
+          Lines . fmap fst . textViewToStrings <$>
+            textView (mkLoc minBound minBound) (mkLoc maxBound maxBound)
+  del (mkLoc 16 24) (-24)
+  del (mkLoc 16  1)  (24)
+  del (mkLoc 14  1)  (49)
+  del (mkLoc 13 48) (-49)
+  del (mkLoc 12 24) (-49)

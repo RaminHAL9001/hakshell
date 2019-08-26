@@ -2295,48 +2295,47 @@ textViewAppend appendTags
           )
     }
 
--- | Create a 'TextView' from the content of a 'TextBuffer' in the given range delimited by the two
--- given 'TextLocation' values.
+-- | Copy a region of the current 'TextBuffer' into a 'TextView', delimited by the two given
+-- 'TextLocation' values.
 textView
-  :: (MonadIO m
+  :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
      )
-  => TextLocation -> TextLocation -> TextBuffer tags
-  -> m (Either TextEditError (TextView tags))
-textView from to = liftIO . runEditTextIO (mkview (min from to) (max from to)) where
-  mkview from to = countElems >>= \ nmax ->
-    if nmax <= 0 || from == to then return emptyTextView else do
-      let unline = lineToIndex . theLocationLineIndex
-      let (lo, hi) = (unline from, unline to)
-      newvec <- copyRegionChk (Absolute lo) $ Relative $ 1 + hi - lo
-      let top = MVec.length newvec - 1
-      let unchar len lbrksz = max 0 . min (len - lbrksz + 1) . charToIndex . theLocationCharIndex
-      let onvec i f = liftIO $ MVec.read newvec i >>= MVec.write newvec i . \ case
-            line@TextLine{}   ->
-              let vec      = line ^. textLineString
-                  veclen   = UVec.length vec
-                  lbrksz   = fromIntegral $ theTextLineBreakSize line
-                  (i, len) = f veclen lbrksz
-              in  line & textLineString %~ UVec.slice i len
-            TextLineUndefined -> error $
-              "textView: trimmed vector contains undefined line at index "++show i
-      onvec top $ \ len lbrksz -> (0, unchar len lbrksz to) 
-      onvec 0   $ \ len lbrksz -> let i = unchar len lbrksz from in (i, len - i)
-      let freeze = liftIO . if unsafeMode then Vec.unsafeFreeze else Vec.freeze
-      newvec <- freeze newvec
-      return TextView
-        { textViewCharCount = sum $ intSize <$> Vec.toList newvec
-        , textViewVector    = newvec
-        }
+  => TextLocation -> TextLocation -> editor tags m (TextView tags)
+textView from to = liftEditText $ do
+  (from, to) <- pure (min from to, max from to)
+  nmax <- countElems
+  if nmax <= 0 || from == to then return emptyTextView else do
+    let unline = lineToIndex . theLocationLineIndex
+    let (lo, hi) = (unline from, unline to)
+    newvec <- copyRegionChk (Absolute lo) $ Relative $ 1 + hi - lo
+    let top = MVec.length newvec - 1
+    let unchar len lbrksz = max 0 . min (len - lbrksz + 1) . charToIndex . theLocationCharIndex
+    let onvec i f = liftIO $ MVec.read newvec i >>= MVec.write newvec i . \ case
+          line@TextLine{}   ->
+            let vec      = line ^. textLineString
+                veclen   = UVec.length vec
+                lbrksz   = fromIntegral $ theTextLineBreakSize line
+                (i, len) = f veclen lbrksz
+            in  line & textLineString %~ UVec.slice i len
+          TextLineUndefined -> error $
+            "textView: trimmed vector contains undefined line at index "++show i
+    onvec top $ \ len lbrksz -> (0, unchar len lbrksz to) 
+    onvec 0   $ \ len lbrksz -> let i = unchar len lbrksz from in (i, len - i)
+    let freeze = liftIO . if unsafeMode then Vec.unsafeFreeze else Vec.freeze
+    newvec <- freeze newvec
+    return TextView
+      { textViewCharCount = sum $ intSize <$> Vec.toList newvec
+      , textViewVector    = newvec
+      }
 
 -- | Like 'textView', creates a new text view, but rather than taking two 'TextLocation's to delimit
 -- the range, takes two @('Absolute' 'LineIndex')@ values to delimit the range.
 textViewOnLines
-  :: (MonadIO m
+  :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
      )
-  => Absolute LineIndex -> Absolute LineIndex
-  -> TextBuffer tags -> m (Either TextEditError (TextView tags))
+  => Absolute LineIndex -> Absolute LineIndex -> editor tags m (TextView tags)
 textViewOnLines from to = textView
   (TextLocation
    { theLocationLineIndex = min from to
