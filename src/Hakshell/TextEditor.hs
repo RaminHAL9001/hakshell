@@ -1475,7 +1475,9 @@ shiftCursorChk
      , Show elem --DEBUG
      )
   => Relative Int -> m ()
-shiftCursorChk (Relative count) = getElemCount (if count <= 0 then Before else After) >>=
+shiftCursorChk (Relative count) =
+  trace ("--| shiftCursorChk "++show count)
+  getElemCount (if count <= 0 then Before else After) >>=
   shiftCursor . Relative . ((signum count) *) . min (safeAbs count) . safeAbs where
 
 -- Copy the current mutable buffer vector to an immutable vector.
@@ -1891,8 +1893,10 @@ gotoLine
      , Show tags --DEBUG
      )
   => Absolute LineIndex -> editor tags m ()
-gotoLine (Absolute (LineIndex n)) = liftEditText $ do
+gotoLine (Absolute (LineIndex n)) = trace ("--| gotoLine "++show n) $ liftEditText $ do
   bef <- getElemCount Before
+  traceM $ "--| getElemCount Before -> "++show bef --DEBUG
+  traceM $ "--| moveByLine "++show (n - bef)
   moveByLine $ Relative $ LineIndex $ n - bef
 
 -- | Go to an absolute character (column) number, the first character is 1 (character 0 and below
@@ -1932,13 +1936,17 @@ deleteChars (Relative (CharIndex n)) =
   if n < 0 then do
     before <- getElemCount Before
     let count = negate $ min before $ abs n 
+    traceM $ "--| deleteChars: before="++show before++", count="++show count
+    traceM $ "--| deleteChars: modCount Before (const"++show (before + count)++")"
     modCount Before $ const $ before + count
     return count
   else if n > 0 then do
     lbrksz <- fromIntegral <$> use cursorBreakSize
     after  <- getElemCount After
     let count = negate $ min n $ max 0 $ after - lbrksz
-    modCount Before $ const $ after + count
+    traceM $ "--| deleteChars: after="++show after++", count="++show count
+    traceM $ "--| deleteChars: modCount After (const "++show (after + count)++")"
+    modCount After $ const $ after + count
     return count
   else return 0
 
@@ -1950,14 +1958,19 @@ deleteCharsWrap
   :: ( MonadIO m
      , Show tags --DEBUG
      ) => Relative CharIndex -> EditText tags m (Relative CharIndex)
-deleteCharsWrap request = if request == 0 then return 0 else
+deleteCharsWrap request =
+  trace ("--| deleteCharsWrap ("++show request++")") $ --DEBUG
+  if request == 0 then return 0 else
   let direction = if request < 0 then Before else After in
   -- First, delete the chararacters in the line editor, see if that satisfies the request...
+  trace ("--| deleteChars ("++show request++")") $ --DEBUG
   deleteChars request >>= \ delcount ->
+  trace ("--| delcount -> "++show delcount) $ --DEBUG
   if safeAbs delcount >= safeAbs request then return delcount else
   -- otherwise ues 'forLines' to delete each line until the request has been satsified.
   fmap snd $ forLines direction (safeAbs request + delcount, delcount) $ \ halt line ->
     get >>= \ st@(request, delcount) ->
+    trace ("--| get -> ("++show st++")") $ --DEBUG
     if request <= 0 then halt st else
     let weight = countToChar $ textLineWeight line in
     if weight <= request then
@@ -2015,7 +2028,7 @@ forLinesLoop
       TextLine tags -> FoldMapLines fold fold tags m [TextLine tags])
   -> Int -> RelativeToCursor -> EditText tags m fold
 forLinesLoop fold f count dir = execFoldMapLines (callCC $ loop count) fold where
-  loop count halt = if count <= 0 then get else
+  loop count halt = trace ("--| forLinesLoop "++show count) $ if count <= 0 then get else
     liftEditText (popElem dir) >>= f halt >>= mapM_ (pushElem $ opposite dir) >>
     loop (count - 1) halt
 
@@ -2079,6 +2092,7 @@ forLines
 forLines rel fold f = do
   above <- use linesAboveCursor
   below <- use linesBelowCursor
+  traceM $ "--| forLines "++show rel++": above="++show above++", below="++show below
   uncurry (forLinesLoop fold f) $ case rel of
     Before -> (above, Before)
     After  -> (below, After)
@@ -2164,7 +2178,8 @@ gotoPosition
      , Show tags --DEBUG
      )
   => TextLocation -> editor tags m ()
-gotoPosition (TextLocation{theLocationLineIndex=line,theLocationCharIndex=char}) =
+gotoPosition to@(TextLocation{theLocationLineIndex=line,theLocationCharIndex=char}) =
+  trace ("--| gotoPosition ("++show to++")") $ --DEBUG
   liftEditText $ gotoLine line >> editLine (gotoChar char)
 
 -- | Save the location of the cursor, then evaluate an @editor@ function. After evaluation

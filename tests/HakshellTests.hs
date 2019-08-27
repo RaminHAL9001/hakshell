@@ -4,11 +4,9 @@ import           Hakshell.String
 import           Hakshell.TextEditor
 
 import           Data.IORef
-import           Data.List (tails)
+import           Data.List (tails, (!!))
 
 import           Control.Monad.Except
-import           Control.Monad.IO.Class
-import           Control.Monad.Reader
 
 import           Test.Hspec
 
@@ -20,7 +18,8 @@ main = hspec $ describe "hakshell" $ do
   textEditorPreTests
   lineEditorTests
   textViewTests
-  textDeletionTests
+  textGotoTests
+  --textDeletionTests
 
 ----------------------------------------------------------------------------------------------------
 
@@ -270,6 +269,32 @@ textViewTests = describe "testing 'textView'" $ testWithGrid $ \ buf -> do
     vi (mkLoc  9  1) (mkLoc 10 49)
     vi (mkLoc  1  1) (mkLoc 16 48)
     vi (mkLoc  8  1) (mkLoc  8 49)
+
+----------------------------------------------------------------------------------------------------
+
+textGotoTests :: Spec
+textGotoTests = describe "testing gotoPosition, cursor motion" $ testWithGrid $ \ buf -> do
+  let go loc =
+        let TextLocation{theLocationLineIndex=line,theLocationCharIndex=char} = loc
+            expct = splitAt (charToIndex char) $ gridLines !! lineToIndex line
+        in it ("gotoPosition ("++show loc++")") $
+           (ed buf $ gotoPosition loc >>
+             (,) <$> getPosition <*> editLine
+             ((,) <$> (unpack <$> copyCharsToEnd Before) <*> (unpack <$> copyCharsToEnd After))
+           ) `shouldReturn` (loc, expct)
+  go (mkLoc 16 24)
+  go (mkLoc 16  8)
+  go (mkLoc 16 32)
+  go (mkLoc  1  1)
+  go (mkLoc  1 48)
+  go (mkLoc  1 24)
+  go (mkLoc  8 48)
+  go (mkLoc  8  1)
+  go (mkLoc  8 24)
+  go (mkLoc  9 24)
+  go (mkLoc  9  1)
+  go (mkLoc  9 48)
+  go (mkLoc 16 48)
 
 ----------------------------------------------------------------------------------------------------
 
