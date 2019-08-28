@@ -235,8 +235,6 @@ import qualified Data.Vector.Generic.Mutable as GMVec
 import qualified Data.Vector.Unboxed.Mutable as UMVec
 import           Data.Word
 
-import Debug.Trace
-
 ----------------------------------------------------------------------------------------------------
 
 -- Programmer notes:
@@ -1318,8 +1316,10 @@ putElemIndex
      , Show elem --DEBUG
      )
   => Int -> elem -> m ()
-putElemIndex i elem = write <$> getVector <*> pure i <*> pure elem >>= liftIO where
-  write = if unsafeMode then GMVec.unsafeWrite else GMVec.write
+putElemIndex i elem = 
+  ((if unsafeMode then GMVec.unsafeWrite else GMVec.write) <$>
+    getVector <*> pure i <*> pure elem
+  ) >>= liftIO
 
 -- Read an element from a vector index. __WARNING__: there is no bounds checking.
 getElemIndex
@@ -1476,9 +1476,8 @@ shiftCursorChk
      )
   => Relative Int -> m ()
 shiftCursorChk (Relative count) =
-  trace ("--| shiftCursorChk "++show count)
   getElemCount (if count <= 0 then Before else After) >>=
-  shiftCursor . Relative . ((signum count) *) . min (safeAbs count) . safeAbs where
+  shiftCursor . Relative . ((signum count) *) . min (safeAbs count)
 
 -- Copy the current mutable buffer vector to an immutable vector.
 freezeVector
@@ -1646,7 +1645,7 @@ currentLineNumber
      , Show tags --DEBUG
      )
   => editor tags m (Absolute LineIndex)
-currentLineNumber = liftEditText $ indexToLine <$> getElemCount Before
+currentLineNumber = liftEditText $ indexToLine <$> cursorIndex Before
 
 -- | Get the current column number of the cursor.
 currentColumnNumber
@@ -1884,7 +1883,7 @@ moveByChar
      , Show tags --DEBUG
      )
   => Relative CharIndex -> editor tags m ()
-moveByChar rel = liftEditLine . shiftCursorChk . Relative . charToCount $ rel
+moveByChar = liftEditLine . shiftCursorChk . Relative . charToCount
 
 -- | Go to an absolute line number, the first line is 1 (line 0 and below all send the cursor to
 -- line 1), the last line is 'Prelude.maxBound'.
@@ -1893,11 +1892,9 @@ gotoLine
      , Show tags --DEBUG
      )
   => Absolute LineIndex -> editor tags m ()
-gotoLine (Absolute (LineIndex n)) = trace ("--| gotoLine "++show n) $ liftEditText $ do
-  bef <- getElemCount Before
-  traceM $ "--| getElemCount Before -> "++show bef --DEBUG
-  traceM $ "--| moveByLine "++show (n - bef)
-  moveByLine $ Relative $ LineIndex $ n - bef
+gotoLine n = liftEditText $ do
+  before <- indexToLine <$> cursorIndex Before
+  moveByLine $ diffAbsolute before n
 
 -- | Go to an absolute character (column) number, the first character is 1 (character 0 and below
 -- all send the cursor to column 1), the last line is 'Prelude.maxBound'.
@@ -1906,9 +1903,9 @@ gotoChar
      , Show tags --DEBUG
      )
   => Absolute CharIndex -> editor tags m ()
-gotoChar (Absolute (CharIndex n)) = liftEditLine $ do
-  before    <- use charsBeforeCursor
-  moveByChar $ Relative $ CharIndex $ n - before
+gotoChar n = liftEditLine $ do
+  before <- indexToChar <$> cursorIndex Before
+  moveByChar $ diffAbsolute before n
 
 -- | Insert a single character. If the 'lineBreakPredicate' function evaluates to 'Prelude.True',
 -- meaning the given character is a line breaking character, this function does nothing. To insert
@@ -1936,16 +1933,12 @@ deleteChars (Relative (CharIndex n)) =
   if n < 0 then do
     before <- getElemCount Before
     let count = negate $ min before $ abs n 
-    traceM $ "--| deleteChars: before="++show before++", count="++show count
-    traceM $ "--| deleteChars: modCount Before (const"++show (before + count)++")"
     modCount Before $ const $ before + count
     return count
   else if n > 0 then do
     lbrksz <- fromIntegral <$> use cursorBreakSize
     after  <- getElemCount After
     let count = negate $ min n $ max 0 $ after - lbrksz
-    traceM $ "--| deleteChars: after="++show after++", count="++show count
-    traceM $ "--| deleteChars: modCount After (const "++show (after + count)++")"
     modCount After $ const $ after + count
     return count
   else return 0
@@ -1959,18 +1952,14 @@ deleteCharsWrap
      , Show tags --DEBUG
      ) => Relative CharIndex -> EditText tags m (Relative CharIndex)
 deleteCharsWrap request =
-  trace ("--| deleteCharsWrap ("++show request++")") $ --DEBUG
   if request == 0 then return 0 else
   let direction = if request < 0 then Before else After in
   -- First, delete the chararacters in the line editor, see if that satisfies the request...
-  trace ("--| deleteChars ("++show request++")") $ --DEBUG
   deleteChars request >>= \ delcount ->
-  trace ("--| delcount -> "++show delcount) $ --DEBUG
   if safeAbs delcount >= safeAbs request then return delcount else
   -- otherwise ues 'forLines' to delete each line until the request has been satsified.
   fmap snd $ forLines direction (safeAbs request + delcount, delcount) $ \ halt line ->
     get >>= \ st@(request, delcount) ->
-    trace ("--| get -> ("++show st++")") $ --DEBUG
     if request <= 0 then halt st else
     let weight = countToChar $ textLineWeight line in
     if weight <= request then
@@ -2007,8 +1996,8 @@ insertString str = liftEditText $ do
         if lbrklen >= maxlen
          then error $ "insertString: line break string length is "++show lbrklen++
                 "exceeeds maximum length of "++show maxlen++" characters"
-         else ( editLine $
-                  (cursorBreakSize .= fromIntegral lbrklen) >>
+         else ( editLine $ do
+                  cursorBreakSize .= fromIntegral lbrklen
                   copyLineEditor' <* (charsBeforeCursor .= 0 >> charsAfterCursor .= 0)
               ) >>= pushElem Before >> return (strlen + lbrklen)
   let loop count = seq count . \ case
@@ -2028,7 +2017,7 @@ forLinesLoop
       TextLine tags -> FoldMapLines fold fold tags m [TextLine tags])
   -> Int -> RelativeToCursor -> EditText tags m fold
 forLinesLoop fold f count dir = execFoldMapLines (callCC $ loop count) fold where
-  loop count halt = trace ("--| forLinesLoop "++show count) $ if count <= 0 then get else
+  loop count halt = if count <= 0 then get else
     liftEditText (popElem dir) >>= f halt >>= mapM_ (pushElem $ opposite dir) >>
     loop (count - 1) halt
 
@@ -2092,7 +2081,6 @@ forLines
 forLines rel fold f = do
   above <- use linesAboveCursor
   below <- use linesBelowCursor
-  traceM $ "--| forLines "++show rel++": above="++show above++", below="++show below
   uncurry (forLinesLoop fold f) $ case rel of
     Before -> (above, Before)
     After  -> (below, After)
@@ -2178,8 +2166,7 @@ gotoPosition
      , Show tags --DEBUG
      )
   => TextLocation -> editor tags m ()
-gotoPosition to@(TextLocation{theLocationLineIndex=line,theLocationCharIndex=char}) =
-  trace ("--| gotoPosition ("++show to++")") $ --DEBUG
+gotoPosition (TextLocation{theLocationLineIndex=line,theLocationCharIndex=char}) =
   liftEditText $ gotoLine line >> editLine (gotoChar char)
 
 -- | Save the location of the cursor, then evaluate an @editor@ function. After evaluation

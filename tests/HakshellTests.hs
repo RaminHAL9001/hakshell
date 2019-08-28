@@ -18,8 +18,8 @@ main = hspec $ describe "hakshell" $ do
   textEditorPreTests
   lineEditorTests
   textViewTests
-  textGotoTests
-  --textDeletionTests
+  cursorMotionTests
+  textDeletionTests
 
 ----------------------------------------------------------------------------------------------------
 
@@ -110,11 +110,11 @@ lineEditorTests :: Spec
 lineEditorTests = describe "line editor tests" $ do
   buf <- runIO $ newTextBuffer defaultTags
   let ins dir ch expct =
-        it ("insertChar "++show dir++' ':show ch) $
+        it ("*** insertChar "++show dir++' ':show ch) $
         ed buf (insertChar dir ch >> unpack <$> copyLineEditorText)
         `shouldReturn` expct
   let copy1way dir at len expct =
-        it ("copyRegion ("++show at++") ("++show len++") -- in "++dir++" direction") $
+        it ("*** copyRegion ("++show at++") ("++show len++") -- in "++dir++" direction") $
         edln buf (unpack <$> copyCharsRange at len)
         `shouldReturn` expct
   let copy at len expct = do
@@ -128,7 +128,7 @@ lineEditorTests = describe "line editor tests" $ do
   let copy123 = forM_ [1..3] . copyEach
   let toEnd dir = (,) dir . unpack <$> copyCharsToEnd dir
   let move rel expbef expaft = 
-        it ("moveByChar ("++show rel++")") $
+        it ("*** moveByChar ("++show rel++")") $
         edln buf (moveByChar rel >> (,) <$> toEnd Before <*> toEnd After)
         `shouldReturn` ((Before, expbef), (After, expaft))
   ins Before 'A' "A"
@@ -243,16 +243,16 @@ testWithGrid = (>>=) $ runIO $ do
 -- to inspect the updates.
 textViewTests :: Spec
 textViewTests = describe "testing 'textView'" $ testWithGrid $ \ buf -> do
-  let vi a b = it ("textView ("++showLoc a++") ("++showLoc b++")") $
+  let vi a b = it ("*** textView ("++showLoc a++") ("++showLoc b++")") $
         (ed buf $ Lines . fmap fst . textViewToStrings <$> textView a b)
         `shouldReturn` Lines (selectStrings a b gridLines)
-  describe ("move cursor to start of buffer: gotoPosition 1 1") $ do
+  describe ("move cursor to start of buffer 1 1") $ do
     vi (mkLoc  3 25) (mkLoc  6 24)
     vi (mkLoc 14  1) (mkLoc 16 48)
     vi (mkLoc  1  1) (mkLoc  3 48)
     vi (mkLoc  1 12) (mkLoc  1 28)
     vi (mkLoc  1 12) (mkLoc  9 28)
-  describe ("move cursor to start of buffer: gotoPosition 1 1") $ do
+  describe ("move cursor to start of buffer 1 1") $ do
     runIO $ ed buf $ gotoPosition $ mkLoc 1 1
     vi (mkLoc  3 24) (mkLoc  5 25)
     vi (mkLoc 14  1) (mkLoc 15 48)
@@ -260,7 +260,7 @@ textViewTests = describe "testing 'textView'" $ testWithGrid $ \ buf -> do
     vi (mkLoc  1 12) (mkLoc  1 25)
     vi (mkLoc  3 13) (mkLoc  6 49)
     vi (mkLoc  9 12) (mkLoc  8 25)
-  describe ("move cursor to middle of buffer: gotoPosition 8 23") $ do
+  describe ("move cursor to middle of buffer 8 23") $ do
     runIO $ ed buf $ gotoPosition $ mkLoc 8 23
     vi (mkLoc  1  1) (mkLoc  8 48)
     vi (mkLoc  7 24) (mkLoc 11 25)
@@ -272,12 +272,12 @@ textViewTests = describe "testing 'textView'" $ testWithGrid $ \ buf -> do
 
 ----------------------------------------------------------------------------------------------------
 
-textGotoTests :: Spec
-textGotoTests = describe "testing gotoPosition, cursor motion" $ testWithGrid $ \ buf -> do
+cursorMotionTests :: Spec
+cursorMotionTests = describe "testing cursor motion" $ testWithGrid $ \ buf -> do
   let go loc =
         let TextLocation{theLocationLineIndex=line,theLocationCharIndex=char} = loc
             expct = splitAt (charToIndex char) $ gridLines !! lineToIndex line
-        in it ("gotoPosition ("++show loc++")") $
+        in it ("*** gotoPosition ("++show loc++")") $
            (ed buf $ gotoPosition loc >>
              (,) <$> getPosition <*> editLine
              ((,) <$> (unpack <$> copyCharsToEnd Before) <*> (unpack <$> copyCharsToEnd After))
