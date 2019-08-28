@@ -88,7 +88,8 @@ module Hakshell.TextEditor
 
     insertString, lineBreak, deleteCharsWrap, pushLine, popLine,
     currentTextLocation, currentLineNumber, currentColumnNumber,
-    getLineIndex, putLineIndex,
+    getLineIndex, putLineIndex, withCurrentLine,
+    bufferLineCount, bufferIsEmpty,
 
     -- *** Error Data Type
 
@@ -673,6 +674,12 @@ data TextBufferState tags
       -- ^ The number of line below the cursor
     , theBufferLineEditor  :: !(LineEditor tags)
       -- ^ A data structure for editing individual characters in a line of text.
+    , theBufferTargetCol   :: !(Absolute CharIndex)
+      -- ^ When moving the cursor up and down the 'TextBuffer' (e.g. using 'gotoPosition'), the
+      -- cursor should generally remain at the same character column position.
+    , theBufferColumn      :: !(Absolute CharIndex)
+      -- ^ This value is always set to the minimum of 'theBufferTargetCol' and the 'textLineWeight'
+      -- of the 'TextLine' at the current 'cursorIndex'.
     }
 
 data TextEditError
@@ -728,8 +735,8 @@ data TextLine tags
   = TextLineUndefined
   | TextLine
     { theTextLineString    :: !CharVector
-    , theTextLineTags      :: !tags
     , theTextLineBreakSize :: !Word16
+    , theTextLineTags      :: !tags
     }
   deriving Functor
 
@@ -926,6 +933,8 @@ newTextBufferState this size tags = do
     , theLinesAboveCursor  = 0
     , theLinesBelowCursor  = 0
     , theBufferLineEditor  = cur
+    , theBufferTargetCol   = 1
+    , theBufferColumn      = 1
     }
 
 -- Use this to initialize a new empty 'LineEditor'. This is usually only handy if you want to
@@ -1068,6 +1077,16 @@ bufferVector = lens theBufferVector $ \ a b -> a{ theBufferVector = b }
 -- | The current line of text being edited under the cursor.
 bufferLineEditor :: Lens' (TextBufferState tags) (LineEditor tags)
 bufferLineEditor = lens theBufferLineEditor $ \ a b -> a{ theBufferLineEditor = b }
+
+-- | When moving the cursor up and down the 'TextBuffer' (e.g. using 'gotoPosition'), the cursor
+-- should generally remain at the same character column position.
+bufferTargetCol :: Lens' (TextBufferState tags) (Absolute CharIndex)
+bufferTargetCol = lens theBufferTargetCol $ \ a b -> a{ theBufferTargetCol = b }
+
+-- | This value is always set to the minimum of 'theBufferTargetCol' and the 'textLineWeight' of the
+-- 'TextLine' at the current 'cursorIndex'.
+bufferColumn :: Lens' (TextBufferState tags) (Absolute CharIndex)
+bufferColumn = lens theBufferColumn $ \ a b -> a{ theBufferColumn = b }
 
 ----------------------------------------------------------------------------------------------------
 
@@ -1668,7 +1687,7 @@ copyLineEditor'
      , Show tags --DEBUG
      )
   => EditLine tags m (TextLine tags)
-copyLineEditor' = TextLine <$> freezeVector <*> use lineEditorTags <*> use cursorBreakSize
+copyLineEditor' = TextLine <$> freezeVector <*> use cursorBreakSize <*> use lineEditorTags
 
 -- | Create a copy of the 'bufferLineEditor'.
 copyLineEditorText
@@ -1875,15 +1894,72 @@ moveByLine
   => Relative LineIndex -> editor tags m ()
 moveByLine = liftEditText . shiftCursorChk . Relative . lineToCount
 
+-- | Evaluate a function on the 'TextLine' currently under the 'currentLineNumber'.
+withCurrentLine
+  :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
+     , Show tags --DEBUG
+     )
+  => (Absolute LineIndex -> TextLine tags -> editor tags m a) -> editor tags m a
+withCurrentLine f =
+  liftEditText (currentLineNumber >>= \ ln -> (,) ln <$> getLineIndex ln) >>= \ case
+    (ln, TextLineUndefined) -> liftEditText $ throwError $ LineIndexOutOfRange ln
+    (ln, line@TextLine{})   -> f ln line
+
+-- | Return the number of lines of text in this buffer.
+bufferLineCount
+  :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
+     , Show tags --DEBUG
+     )
+  => editor tags m (Relative LineIndex)
+bufferLineCount = liftEditText $ countToLine <$> countElems
+
+-- | Returns a boolean indicating whether there is no content in the current buffer.
+bufferIsEmpty
+  :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
+     , Show tags --DEBUG
+     )
+  => editor tags m Bool
+bufferIsEmpty = bufferLineCount >>= \ ln ->
+  if ln > 1 then return False
+  else if ln <= 0 then return True
+  else withCurrentLine $ \ _ line -> return $ textLineWeight line == 0
+
+-- not for export
+modifyColumn
+  :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
+     , Show tags --DEBUG
+     )
+  => (Absolute CharIndex -> Relative CharIndex -> Absolute CharIndex)
+  -> editor tags m ()
+modifyColumn f = liftEditText $ withCurrentLine $ \ _ line -> do
+  oldch <- use bufferColumn
+  let weight = textLineWeight line
+  let ch     = max 1 $ min (indexToChar weight) $ f oldch (countToChar weight)
+  bufferColumn    .= ch
+  bufferTargetCol .= ch
+
+-- not for export
+resetTargetColumn
+  :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
+     , Show tags
+     )
+  => editor tags m ()
+resetTargetColumn = liftEditText $ use bufferColumn >>= assign bufferTargetCol
+
 -- | Move the cursor to a different character position within the 'bufferLineEditor' by an @n ::
 -- Int@ number of characters. A negative @n@ indicates moving toward the start of the line, a
 -- positive @n@ indicates moving toward the end of the line.
 moveByChar
-  :: (MonadEditLine editor, MonadIO (editor tags m), MonadIO m
+  :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
      )
   => Relative CharIndex -> editor tags m ()
-moveByChar = liftEditLine . shiftCursorChk . Relative . charToCount
+moveByChar count = do
+  modifyColumn $ \ column weight ->
+    if count == minBound then 1 :: Absolute CharIndex
+     else if count == maxBound then indexToChar $ charToCount weight
+     else shiftAbsolute column $ min count weight
+  resetTargetColumn
 
 -- | Go to an absolute line number, the first line is 1 (line 0 and below all send the cursor to
 -- line 1), the last line is 'Prelude.maxBound'.
@@ -1892,20 +1968,23 @@ gotoLine
      , Show tags --DEBUG
      )
   => Absolute LineIndex -> editor tags m ()
-gotoLine n = liftEditText $ do
+gotoLine ln = liftEditText $ do
   before <- indexToLine <$> cursorIndex Before
-  moveByLine $ diffAbsolute before n
+  count  <- indexToLine <$> countElems
+  moveByLine $ diffAbsolute before $ max 1 $ min count ln
+  use bufferTargetCol >>= gotoChar
 
 -- | Go to an absolute character (column) number, the first character is 1 (character 0 and below
 -- all send the cursor to column 1), the last line is 'Prelude.maxBound'.
 gotoChar
-  :: (MonadEditLine editor, MonadIO (editor tags m), MonadIO m
+  :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
      )
   => Absolute CharIndex -> editor tags m ()
-gotoChar n = liftEditLine $ do
-  before <- indexToChar <$> cursorIndex Before
-  moveByChar $ diffAbsolute before n
+gotoChar ch = liftEditText $ do
+  modifyColumn $ \ _ weight ->
+    if ch == minBound then 1 else if ch == maxBound then indexToChar $ charToCount weight else ch
+  resetTargetColumn
 
 -- | Insert a single character. If the 'lineBreakPredicate' function evaluates to 'Prelude.True',
 -- meaning the given character is a line breaking character, this function does nothing. To insert
@@ -2157,7 +2236,7 @@ getPosition
   => editor tags m TextLocation
 getPosition = liftEditText $ TextLocation
   <$> (Absolute . LineIndex . (+ 1) <$> use linesAboveCursor)
-  <*> editLine (Absolute . CharIndex . (+ 1) <$> use charsBeforeCursor)
+  <*> use bufferColumn
 
 -- | This function calls 'gotoLine' and then 'gotoChar' to move the cursor to an absolute a line
 -- number and characters (column) number.
@@ -2166,8 +2245,8 @@ gotoPosition
      , Show tags --DEBUG
      )
   => TextLocation -> editor tags m ()
-gotoPosition (TextLocation{theLocationLineIndex=line,theLocationCharIndex=char}) =
-  liftEditText $ gotoLine line >> editLine (gotoChar char)
+gotoPosition (TextLocation{theLocationLineIndex=ln,theLocationCharIndex=ch}) = liftEditText $
+  gotoLine ln >> gotoChar ch
 
 -- | Save the location of the cursor, then evaluate an @editor@ function. After evaluation
 -- completes, restore the location of the cursor (within range, as the location may no longer exist)

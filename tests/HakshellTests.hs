@@ -126,10 +126,10 @@ lineEditorTests = describe "line editor tests" $ do
         mapM_ (uncurry $ uncurry copy) $ [1 ..] `zip` repeat n `zip`
           (take count . fst <$> (tails str `zip` [0 .. len - count]))
   let copy123 = forM_ [1..3] . copyEach
-  let toEnd dir = (,) dir . unpack <$> copyCharsToEnd dir
+  let toEnd dir = editLine $ (,) dir . unpack <$> copyCharsToEnd dir
   let move rel expbef expaft = 
         it ("*** moveByChar ("++show rel++")") $
-        edln buf (moveByChar rel >> (,) <$> toEnd Before <*> toEnd After)
+        ed buf (moveByChar rel >> (,) <$> toEnd Before <*> toEnd After)
         `shouldReturn` ((Before, expbef), (After, expaft))
   ins Before 'A' "A"
   ins After  'F' "AF"
