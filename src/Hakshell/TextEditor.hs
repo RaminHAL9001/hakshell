@@ -236,6 +236,8 @@ import qualified Data.Vector.Generic.Mutable as GMVec
 import qualified Data.Vector.Unboxed.Mutable as UMVec
 import           Data.Word
 
+import Debug.Trace
+
 ----------------------------------------------------------------------------------------------------
 
 -- Programmer notes:
@@ -867,6 +869,11 @@ data LineEditor tags
       -- line editor is made and passed it to some other 'TextEditor'.
     , theCharsBeforeCursor :: !Int
     , theCharsAfterCursor  :: !Int
+    , theLineEditorIsClean :: !Bool
+      -- ^ This is set to 'True' if 'theBufferLineEditor' is a perfect copy of the 'TextLine'
+      -- currently being referred to by the 'currentLineNumber'. If the content of
+      -- 'theBufferLineEditor' has been modified by 'insertChar' or 'deleteChars', or if cursor has
+      -- been moved to a different line, this field is set to 'False'.
     , theCursorBreakSize   :: !Word16
     , theLineEditorTags    :: tags
     }
@@ -898,6 +905,13 @@ cursorBreakSize = lens theCursorBreakSize $ \ a b -> a{ theCursorBreakSize = b }
 -- any function which instantiates 'MonadEditText'.
 lineEditorTags :: Lens' (LineEditor tags) tags
 lineEditorTags = lens theLineEditorTags $ \ a b -> a{ theLineEditorTags = b }
+
+-- | This is set to 'True' if 'theBufferLineEditor' is a perfect copy of the 'TextLine' currently
+-- being referred to by the 'currentLineNumber'. If the content of 'theBufferLineEditor' has been
+-- modified by 'insertChar' or 'deleteChars', or if cursor has been moved to a different line, this
+-- field is set to 'False'.
+lineEditorIsClean :: Lens' (LineEditor tags) Bool
+lineEditorIsClean = lens theLineEditorIsClean $ \ a b -> a{ theLineEditorIsClean = b }
 
 -- | Use this to initialize a new empty 'TextBufferState'. The default 'bufferLineBreaker' is set to
 -- 'lineBreakerNLCR'. A 'TextBufferState' always contains one empty line, but a line must have a @tags@
@@ -952,6 +966,7 @@ newLineEditorIO parent tag = do
     , parentTextEditor     = parent
     , theCharsBeforeCursor = 0
     , theCharsAfterCursor  = 0
+    , theLineEditorIsClean = False
     , theCursorBreakSize   = 0
     , theLineEditorTags    = tag
     }
@@ -1002,6 +1017,7 @@ newLineEditorAt parent loc = liftIO $ flip runEditTextIO parent $ do
       , parentTextEditor     = parent
       , theCharsBeforeCursor = cur
       , theCharsAfterCursor  = strlen - cur - fromIntegral breakSize
+      , theLineEditorIsClean = False
       , theCursorBreakSize   = breakSize
       , theLineEditorTags    = theTextLineTags line
       }
@@ -1924,6 +1940,15 @@ bufferIsEmpty = bufferLineCount >>= \ ln ->
   else if ln <= 0 then return True
   else withCurrentLine $ \ _ line -> return $ textLineWeight line == 0
 
+unlessLineEditorIsClean
+  :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
+     , Show tags --DEBUG
+     )
+  => editor tags m ()
+  -> editor tags m ()
+unlessLineEditorIsClean f = 
+  liftEditText (use $ bufferLineEditor . lineEditorIsClean) >>= (`unless` f)
+
 -- not for export
 modifyColumn
   :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
@@ -1937,6 +1962,10 @@ modifyColumn f = liftEditText $ withCurrentLine $ \ _ line -> do
   let ch     = max 1 $ min (indexToChar weight) $ f oldch (countToChar weight)
   bufferColumn    .= ch
   bufferTargetCol .= ch
+  unlessLineEditorIsClean $ liftEditLine $
+    shiftCursorChk $
+    (\ rel -> trace ("-- | modifyColumn: oldch="++show oldch++", weight="++show weight++", ch="++show ch++"\n-- | shiftCursorChk ("++show rel++")") rel) $ --DEBUG
+    Relative $ charToCount $ diffAbsolute oldch ch
 
 -- not for export
 resetTargetColumn
@@ -1996,7 +2025,10 @@ insertChar
   => RelativeToCursor -> Char -> editor tags m (Relative CharIndex)
 insertChar rel c = liftEditText $ Relative . CharIndex <$> do
   isBreak <- use $ bufferLineBreaker . lineBreakPredicate
-  if isBreak c then return 0 else liftEditLine (pushElem rel c) >> return 1
+  if isBreak c then return 0 else do
+    liftEditLine (pushElem rel c)
+    bufferLineEditor . lineEditorIsClean .= False
+    return 1
 
 -- | This function only deletes characters on the current line, if the cursor is at the start of the
 -- line and you evaluate @'deleteChars' 'Before'@, this function does nothing. This function does
@@ -2009,16 +2041,18 @@ deleteChars
   => Relative CharIndex -> editor tags m (Relative CharIndex)
 deleteChars (Relative (CharIndex n)) =
   liftEditLine $ fmap (Relative . CharIndex) $
-  if n < 0 then do
+  if n < 0 then do -- TODO: de-duplicate
     before <- getElemCount Before
     let count = negate $ min before $ abs n 
     modCount Before $ const $ before + count
+    when (count > 0) $ lineEditorIsClean .= False
     return count
   else if n > 0 then do
     lbrksz <- fromIntegral <$> use cursorBreakSize
     after  <- getElemCount After
     let count = negate $ min n $ max 0 $ after - lbrksz
     modCount After $ const $ after + count
+    when (count > 0) $ lineEditorIsClean .= False
     return count
   else return 0
 
@@ -2082,7 +2116,9 @@ insertString str = liftEditText $ do
   let loop count = seq count . \ case
         []        -> return count
         line:more -> writeLine line >>= flip loop more
-  Relative . CharIndex <$> loop 0 (breaker str)
+  count <- Relative . CharIndex <$> loop 0 (breaker str)
+  when (count > 0) $ bufferLineEditor . lineEditorIsClean .= False
+  return count
 
 -- Not for export: this code shared by 'forLinesInRange' and 'forLines' but requires knowledge of
 -- the 'TextBuffer' internals in order to use, so is not something end users should need to know

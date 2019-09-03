@@ -301,7 +301,7 @@ cursorMotionTests = describe "testing cursor motion" $ testWithGrid $ \ buf -> d
 textDeletionTests :: Spec
 textDeletionTests = describe "text deletion tests" $ testWithGrid $ \ buf -> do
   fakebuf <- runIO $ newIORef gridLines
-  let del at len = it ("deleteCharsWrap ("++show at++") ("++show len++")") $ do
+  let del at len = it ("*** deleteCharsWrap ("++show at++") ("++show len++")") $ do
         grid0 <- liftIO $ readIORef fakebuf
         let grid1 = deleteStrings at len grid0
         liftIO $ writeIORef fakebuf grid1
