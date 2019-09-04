@@ -1947,7 +1947,10 @@ unlessLineEditorIsClean
   => editor tags m ()
   -> editor tags m ()
 unlessLineEditorIsClean f = 
-  liftEditText (use $ bufferLineEditor . lineEditorIsClean) >>= (`unless` f)
+  liftEditText (use $ bufferLineEditor . lineEditorIsClean) >>=
+  (`unless` (
+    trace "-- | lineEditorIsClean -> False" --DEBUG
+    f))
 
 -- not for export
 modifyColumn
@@ -1959,12 +1962,17 @@ modifyColumn
 modifyColumn f = liftEditText $ withCurrentLine $ \ _ line -> do
   oldch <- use bufferColumn
   let weight = textLineWeight line
-  let ch     = max 1 $ min (indexToChar weight) $ f oldch (countToChar weight)
+  let ch     = max 1 $ min (indexToChar weight) $ f oldch $ countToChar weight
   bufferColumn    .= ch
   bufferTargetCol .= ch
   unlessLineEditorIsClean $ liftEditLine $
     shiftCursorChk $
-    (\ rel -> trace ("-- | modifyColumn: oldch="++show oldch++", weight="++show weight++", ch="++show ch++"\n-- | shiftCursorChk ("++show rel++")") rel) $ --DEBUG
+    (\ rel -> flip trace rel $                   --DEBUG
+      "-- | modifyColumn: oldch="++show oldch++  --DEBUG
+      ", weight="++show weight++                 --DEBUG
+      ", ch="++show ch++                         --DEBUG
+      "\n-- | shiftCursorChk ("++show rel++")"   --DEBUG
+    ) $                                          --DEBUG
     Relative $ charToCount $ diffAbsolute oldch ch
 
 -- not for export
@@ -1985,6 +1993,13 @@ moveByChar
   => Relative CharIndex -> editor tags m ()
 moveByChar count = do
   modifyColumn $ \ column weight ->
+    (\ rel -> flip trace rel $                         --DEBUG
+      "-- | moveByChar: modifyColumn <- "++show rel++  --DEBUG
+      " shiftAbsolute (column="++show column++         --DEBUG
+      ") ("++show (min count weight)++                 --DEBUG
+      ") <- min (count="++show count                   --DEBUG
+      ++" weight="++show weight++")"                   --DEBUG
+    ) $                                                --DEBUG
     if count == minBound then 1 :: Absolute CharIndex
      else if count == maxBound then indexToChar $ charToCount weight
      else shiftAbsolute column $ min count weight
@@ -2012,6 +2027,10 @@ gotoChar
   => Absolute CharIndex -> editor tags m ()
 gotoChar ch = liftEditText $ do
   modifyColumn $ \ _ weight ->
+    (\ rel -> flip trace rel $                          --DEBUG
+      "-- | gotoChar: modifyColumn <- "++show rel++     --DEBUG
+      ", indexToChar (charToCount ("++show weight++"))" --DEBUG
+    ) $                                                 --DEBUG
     if ch == minBound then 1 else if ch == maxBound then indexToChar $ charToCount weight else ch
   resetTargetColumn
 

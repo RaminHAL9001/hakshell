@@ -63,25 +63,22 @@ report = liftIO . putStr
 -- they run correctly is tested by other tests.
 lineEditorPreTests :: Spec
 lineEditorPreTests = describe "line editor pre-tests" $ do
-  buf <- runIO $ newTextBuffer defaultTags
-  let instr dir str =
-        it ("insertChar "++show dir++' ':show str) $
-        ed buf (forM_ str (insertChar dir))
-  instr After $ reverse "characters after"
-  instr Before "characters before "
-  let move rel = it ("moveByChar ("++show rel++")") $
-        ed buf (moveByChar rel)
-  let select i count expct =
-        it ("copyCharsRange "++show i++' ':show count++" ---\n") $
-        edln buf (unpack <$> copyCharsRange i count)
-        `shouldReturn` expct
-  select 12 11 "before char"
-  move minBound
-  instr Before "what "
-  move maxBound
-  instr Before " now"
-  move (-20)
-  instr Before "the what now"
+  (buf, instr) <- runIO $ do
+    buf <- newTextBuffer defaultTags
+    let instr dir str = ed buf $ forM_ str $ insertChar dir
+    instr After $ reverse "characters after"
+    instr Before "characters before "
+    return (buf, instr)
+  let move rel = ed buf (moveByChar rel)
+  let select i count = edln buf (unpack <$> copyCharsRange i count)
+  let test rel dir str i count expct =
+        (it $ "*** do{ moveByChar ("++show rel++"); "++
+              "insertChar ("++show dir++") ("++show str++"); "++
+              "copyCharsRange ("++show i++") ("++show count++"); }"
+          ) $ (move rel >> instr dir str >> select i count) `shouldReturn` expct
+  test minBound Before "what "        17 11 "before char"
+  test maxBound Before " now"         25 21 "characters after now"
+  test (-20)    Before "the what now"  1 27 "what characters before the"
 
 -- | The next simplest tests, tests whether 'insertString' and 'gotoPosition' do not crash, it is
 -- not tested whether or not the text inserted is correct. These functions are used during
