@@ -121,7 +121,7 @@ module Hakshell.TextEditor
     EditLine, editLine, insertChar, deleteChars, lineEditorTags, moveByChar,
     copyLineEditorText, copyCharsRange, copyCharsBetween, copyChars, copyCharsToEnd,
     replaceCurrentLine, clearCurrentLine, resetCurrentLine, lineEditorCharCount,
-    newLineEditor, newLineEditorAt, copyLineEditor,
+    newLineEditor, newLineEditorAt, copyLineEditor, -- TODO: getCharIndex, putCharIndex,
 
     -- ** Text Views
     --
@@ -235,8 +235,6 @@ import qualified Data.Vector.Unboxed         as UVec
 import qualified Data.Vector.Generic.Mutable as GMVec
 import qualified Data.Vector.Unboxed.Mutable as UMVec
 import           Data.Word
-
-import Debug.Trace
 
 ----------------------------------------------------------------------------------------------------
 
@@ -1688,7 +1686,9 @@ currentColumnNumber
      , Show tags --DEBUG
      )
   => editor tags m (Absolute CharIndex)
-currentColumnNumber = liftEditText $ editLine $ indexToChar <$> getElemCount Before
+currentColumnNumber = liftEditText $ do
+  clean <- use $ bufferLineEditor . lineEditorIsClean
+  if clean then use bufferColumn else editLine $ indexToChar <$> getElemCount Before
 
 -- | Get the current cursor position.
 currentTextLocation
@@ -1910,16 +1910,21 @@ moveByLine
   => Relative LineIndex -> editor tags m ()
 moveByLine = liftEditText . shiftCursorChk . Relative . lineToCount
 
--- | Evaluate a function on the 'TextLine' currently under the 'currentLineNumber'.
+-- | Evaluate a function on the 'TextLine' currently under the 'currentLineNumber'. This function
+-- throws an exception if the 'TextBuffer' is empty. __NOTE__ that the 'TextBuffer' is considered
+-- empty if there are characters in the 'LineBuffer' which have not been flushed to the empty
+-- 'TextBuffer'.
 withCurrentLine
   :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
      )
   => (Absolute LineIndex -> TextLine tags -> editor tags m a) -> editor tags m a
-withCurrentLine f =
-  liftEditText (currentLineNumber >>= \ ln -> (,) ln <$> getLineIndex ln) >>= \ case
-    (ln, TextLineUndefined) -> liftEditText $ throwError $ LineIndexOutOfRange ln
-    (ln, line@TextLine{})   -> f ln line
+withCurrentLine f = do
+  (ln, line) <- liftEditText $ currentLineNumber >>= \ ln -> (,) ln <$> getLineIndex ln
+  case line of
+    TextLineUndefined -> error $
+      "internal error: "++show ln++" received from 'getLineIndex' points to undefined line"
+    line              -> f ln line
 
 -- | Return the number of lines of text in this buffer.
 bufferLineCount
@@ -1947,33 +1952,7 @@ unlessLineEditorIsClean
   => editor tags m ()
   -> editor tags m ()
 unlessLineEditorIsClean f = 
-  liftEditText (use $ bufferLineEditor . lineEditorIsClean) >>=
-  (`unless` (
-    trace "-- | lineEditorIsClean -> False" --DEBUG
-    f))
-
--- not for export
-modifyColumn
-  :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
-     , Show tags --DEBUG
-     )
-  => (Absolute CharIndex -> Relative CharIndex -> Absolute CharIndex)
-  -> editor tags m ()
-modifyColumn f = liftEditText $ withCurrentLine $ \ _ line -> do
-  oldch <- use bufferColumn
-  let weight = textLineWeight line
-  let ch     = max 1 $ min (indexToChar weight) $ f oldch $ countToChar weight
-  bufferColumn    .= ch
-  bufferTargetCol .= ch
-  unlessLineEditorIsClean $ liftEditLine $
-    shiftCursorChk $
-    (\ rel -> flip trace rel $                   --DEBUG
-      "-- | modifyColumn: oldch="++show oldch++  --DEBUG
-      ", weight="++show weight++                 --DEBUG
-      ", ch="++show ch++                         --DEBUG
-      "\n-- | shiftCursorChk ("++show rel++")"   --DEBUG
-    ) $                                          --DEBUG
-    Relative $ charToCount $ diffAbsolute oldch ch
+  liftEditText (use $ bufferLineEditor . lineEditorIsClean) >>= (`unless` (f))
 
 -- not for export
 resetTargetColumn
@@ -1982,6 +1961,30 @@ resetTargetColumn
      )
   => editor tags m ()
 resetTargetColumn = liftEditText $ use bufferColumn >>= assign bufferTargetCol
+
+-- not for export
+modifyColumn
+  :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
+     , Show tags --DEBUG
+     )
+  => (Absolute CharIndex -> Relative CharIndex -> Absolute CharIndex)
+  -> editor tags m ()
+modifyColumn f = liftEditText $ do
+  oldch <- use bufferColumn
+  clean <- use $ bufferLineEditor . lineEditorIsClean
+  if clean
+   then withCurrentLine $ \ _ line -> do
+    let weight = textLineWeight line
+    let ch     = max 1 $ min (indexToChar weight) $ f oldch $ countToChar weight
+    bufferColumn    .= ch
+    bufferTargetCol .= ch
+   else do
+    ch <- liftEditLine $ do
+      weight <- countElems
+      shiftCursorChk $ Relative $ charToIndex $ f oldch $ countToChar weight
+      indexToChar <$> getElemCount Before
+    bufferColumn    .= ch
+    bufferTargetCol .= ch
 
 -- | Move the cursor to a different character position within the 'bufferLineEditor' by an @n ::
 -- Int@ number of characters. A negative @n@ indicates moving toward the start of the line, a
@@ -1993,13 +1996,6 @@ moveByChar
   => Relative CharIndex -> editor tags m ()
 moveByChar count = do
   modifyColumn $ \ column weight ->
-    (\ rel -> flip trace rel $                         --DEBUG
-      "-- | moveByChar: modifyColumn <- "++show rel++  --DEBUG
-      " shiftAbsolute (column="++show column++         --DEBUG
-      ") ("++show (min count weight)++                 --DEBUG
-      ") <- min (count="++show count                   --DEBUG
-      ++" weight="++show weight++")"                   --DEBUG
-    ) $                                                --DEBUG
     if count == minBound then 1 :: Absolute CharIndex
      else if count == maxBound then indexToChar $ charToCount weight
      else shiftAbsolute column $ min count weight
@@ -2027,10 +2023,6 @@ gotoChar
   => Absolute CharIndex -> editor tags m ()
 gotoChar ch = liftEditText $ do
   modifyColumn $ \ _ weight ->
-    (\ rel -> flip trace rel $                          --DEBUG
-      "-- | gotoChar: modifyColumn <- "++show rel++     --DEBUG
-      ", indexToChar (charToCount ("++show weight++"))" --DEBUG
-    ) $                                                 --DEBUG
     if ch == minBound then 1 else if ch == maxBound then indexToChar $ charToCount weight else ch
   resetTargetColumn
 

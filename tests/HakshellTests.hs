@@ -69,6 +69,8 @@ lineEditorPreTests = describe "line editor pre-tests" $ do
     instr After $ reverse "characters after"
     instr Before "characters before "
     return (buf, instr)
+  -- "characters before characters after"
+  --                    ^
   let move rel = ed buf (moveByChar rel)
   let select i count = edln buf (unpack <$> copyCharsRange i count)
   let test rel dir str i count expct =
@@ -76,9 +78,15 @@ lineEditorPreTests = describe "line editor pre-tests" $ do
               "insertChar ("++show dir++") ("++show str++"); "++
               "copyCharsRange ("++show i++") ("++show count++"); }"
           ) $ (move rel >> instr dir str >> select i count) `shouldReturn` expct
-  test minBound Before "what "        17 11 "before char"
-  test maxBound Before " now"         25 21 "characters after now"
-  test (-20)    Before "the what now"  1 27 "what characters before the"
+  -- "what characters before characters after"
+  --  ^               [         ]
+  test minBound Before "what "      17 11 "before char"
+  -- "what characters before characters after now"
+  --                         [               ^  ]
+  test maxBound Before " now"       24 20 "characters after now"
+  -- "what characters before the other characters after now"
+  --  [                      ^ ]
+  test (-20)    Before "the other "  1 26 "what characters before the"
 
 -- | The next simplest tests, tests whether 'insertString' and 'gotoPosition' do not crash, it is
 -- not tested whether or not the text inserted is correct. These functions are used during

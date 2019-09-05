@@ -1,3 +1,1 @@
 --failure-report=./failure-report.log
---rerun
---rerun-all-on-success
