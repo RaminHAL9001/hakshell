@@ -65,7 +65,7 @@ module Hakshell.TextEditor
     -- 'TextLine' at that address into a 'LineEditor'. You can then edit the text in a 'LineEditor'
     -- by evaluating a function of type 'EditLine' with the 'editLine' function.
 
-    TextLine, emptyTextLine, nullTextLine, textLineWeight, textLineIsUndefined,
+    TextLine, emptyTextLine, nullTextLine, textLineWeight, textLineTop, textLineIsUndefined,
     sliceLine, sliceLineToEnd,
 
     -- *** 'TextLine' lenses
@@ -853,6 +853,11 @@ textLineIsUndefined = \ case { TextLineUndefined -> True; _ -> False; }
 textLineWeight :: TextLine tags -> Int
 textLineWeight line = intSize line - breaksize + min 1 (max 0 breaksize) where
   breaksize = fromIntegral $ theTextLineBreakSize line
+
+-- | Return index of the top-most non-line-breaking character. The size of the string not including
+-- the line breaking characters is equal to the result of this function evaluated by 'charToIndex'.
+textLineTop :: TextLine tags -> Absolute CharIndex
+textLineTop line = indexToChar $ intSize line - (fromIntegral $ theTextLineBreakSize line)
 
 ----------------------------------------------------------------------------------------------------
 
@@ -1945,15 +1950,6 @@ bufferIsEmpty = bufferLineCount >>= \ ln ->
   else if ln <= 0 then return True
   else withCurrentLine $ \ _ line -> return $ textLineWeight line == 0
 
-unlessLineEditorIsClean
-  :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
-     , Show tags --DEBUG
-     )
-  => editor tags m ()
-  -> editor tags m ()
-unlessLineEditorIsClean f = 
-  liftEditText (use $ bufferLineEditor . lineEditorIsClean) >>= (`unless` (f))
-
 -- not for export
 resetTargetColumn
   :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
@@ -1967,21 +1963,22 @@ modifyColumn
   :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
      )
-  => (Absolute CharIndex -> Relative CharIndex -> Absolute CharIndex)
+  => (Absolute CharIndex -> Absolute CharIndex -> Relative CharIndex)
   -> editor tags m ()
 modifyColumn f = liftEditText $ do
-  oldch <- use bufferColumn
   clean <- use $ bufferLineEditor . lineEditorIsClean
+  oldch <- currentColumnNumber
   if clean
    then withCurrentLine $ \ _ line -> do
-    let weight = textLineWeight line
-    let ch     = max 1 $ min (indexToChar weight) $ f oldch $ countToChar weight
+    let top = textLineTop line
+    let ch  = max 1 $ min top $ shiftAbsolute oldch $ f oldch top
     bufferColumn    .= ch
     bufferTargetCol .= ch
    else do
     ch <- liftEditLine $ do
       weight <- countElems
-      shiftCursorChk $ Relative $ charToIndex $ f oldch $ countToChar weight
+      lbrksz <- fromIntegral <$> use cursorBreakSize
+      shiftCursor $ Relative $ charToCount $ f oldch $ indexToChar $ weight - lbrksz
       indexToChar <$> getElemCount Before
     bufferColumn    .= ch
     bufferTargetCol .= ch
@@ -1995,10 +1992,10 @@ moveByChar
      )
   => Relative CharIndex -> editor tags m ()
 moveByChar count = do
-  modifyColumn $ \ column weight ->
-    if count == minBound then 1 :: Absolute CharIndex
-     else if count == maxBound then indexToChar $ charToCount weight
-     else shiftAbsolute column $ min count weight
+  modifyColumn $ \ column top ->
+    if count > 0 then min count $ diffAbsolute column top
+     else if count < 0 then max count $ diffAbsolute column 1
+     else 0
   resetTargetColumn
 
 -- | Go to an absolute line number, the first line is 1 (line 0 and below all send the cursor to
@@ -2022,8 +2019,7 @@ gotoChar
      )
   => Absolute CharIndex -> editor tags m ()
 gotoChar ch = liftEditText $ do
-  modifyColumn $ \ _ weight ->
-    if ch == minBound then 1 else if ch == maxBound then indexToChar $ charToCount weight else ch
+  modifyColumn $ \ column top -> diffAbsolute column $ max 1 $ min top ch
   resetTargetColumn
 
 -- | Insert a single character. If the 'lineBreakPredicate' function evaluates to 'Prelude.True',
