@@ -57,64 +57,15 @@ report = liftIO . putStr
 
 ----------------------------------------------------------------------------------------------------
 
--- | The simplest tests, tests whether 'insetChar' and 'moveByChar' do not crash, it is not tested
--- whether or not the characters inserted are correct. These functions are used during
--- initialization of all other tests, so they at least need be able to run without crashing, whether
--- they run correctly is tested by other tests.
+-- | The most fundamental tests: whether 'insetChar', 'moveByChar', and 'copyCharsRange' do not
+-- crash. These tests operate on a line buffer, but the same vector computations used for the line
+-- buffer are also used for the full text buffer, so ensuring these functions are correct goes more
+-- than half way to ensuring the text editor functions are correct as well. Since other tests make
+-- assumptions that the fundamentally functionalty that is tested here is working correctly in order
+-- for those other tests to initialize their testing environments, these tests are called
+-- "pre-tests."
 lineEditorPreTests :: Spec
 lineEditorPreTests = describe "line editor pre-tests" $ do
-  buf <- runIO $ do --TODO: extract this to let statement, make this it's own test
-    buf <- newTextBuffer defaultTags
-    let instr dir str = ed buf $ forM_ str $ insertChar dir
-    instr After $ reverse "characters after"
-    instr Before "characters before "
-    return buf
-  -- "characters before characters after"
-  --                    ^
-  let pretest rel dir str i count expctPart expctFull = it
-        ("*** pretest ("++show rel++") "++show (str::String)++" -> "++show expctFull) $
-        ( ed buf $ do
-            moveByChar rel
-            forM_ str $ insertChar dir
-            editLine $ (,)
-              <$> (unpack <$> copyLineEditorText)
-              <*> (unpack <$> copyCharsRange i count)
-        ) `shouldReturn` (expctFull, expctPart)
-  pretest minBound Before "what "      17 11
-                        "before char"
-        "what characters before characters after"
-  pretest maxBound Before " now"       24 20
-                               "characters after now"
-        "what characters before characters after now"
-  pretest (-20)    Before "the other "  1 26
-        "what characters before the"
-        "what characters before the other characters after now"
-
--- | The next simplest tests, tests whether 'insertString' and 'gotoPosition' do not crash, it is
--- not tested whether or not the text inserted is correct. These functions are used during
--- initialization of all other tests, so they at least need be able to run without crashing, whether
--- they run correctly is tested by other tests.
-textEditorPreTests :: Spec
-textEditorPreTests = describe "test editor pre-tests" $ do
-  buf <- runIO $ newTextBuffer defaultTags
-  let ins str =
-        it ("insertString " ++ show str) $
-        ed buf (void $ insertString str)
-  let move msg line col = let pos = mkLoc line col in
-        it ("move cursor "++msg++", gotoPosition ("++show pos++")") $
-        ed buf (gotoPosition $ mkLoc line col)
-  ins "one two three\n"
-  ins "four five six\nseven eight nine\nten eleven twelve\n"
-  move        "up" 1  1
-  move      "down" 4 16
-  move "to middle" 2  7
-
--- | This function tests whether 'insertChar', 'moveByChar', and 'copyCharsRange' produce correct
--- results. These tests operate on a line buffer, but the same vector computations used for the line
--- buffer are also used for the full text buffer, so ensuring these functions are correct goes more
--- than half way to ensuring the text editor functions are correct as well.
-lineEditorTests :: Spec
-lineEditorTests = describe "line editor tests" $ do
   buf <- runIO $ newTextBuffer defaultTags
   let ins dir ch expct =
         it ("*** insertChar "++show dir++' ':show ch) $
@@ -172,13 +123,58 @@ lineEditorTests = describe "line editor tests" $ do
   move (-1) "ABCDE" "F"
   copy123 "ABCDEF"
 
-----------------------------------------------------------------------------------------------------
+-- | These tests setup a line editor in a text buffer, and performs a series of steps. Each step
+-- makes some stateful changes to the line editor and checking that the state of the line editor is
+-- exactly the value that is to be expected.
+lineEditorTests :: Spec
+lineEditorTests = describe "line editor, cumultative state update tests" $ 
+  it ("*** insertChar, moveByChar, copyLineEditorText, copyCharsRange") $ do
+    buf <- newTextBuffer defaultTags
+    let instr dir str = ed buf $ forM_ str $ insertChar dir
+    instr After $ reverse "characters after"
+    instr Before "characters before "
+    return buf
+    -- [Initial line buffer state]
+    -- "characters before characters after"
+    --                    ^
+    let test rel dir str i count expctPart expctFull =
+          ( ed buf $ do
+              moveByChar rel
+              forM_ (str :: String) (insertChar dir)
+              editLine $ (,)
+                <$> (unpack <$> copyLineEditorText)
+                <*> (unpack <$> copyCharsRange i count)
+          ) `shouldReturn` (expctFull, expctPart)
+    test minBound Before "what "      17 11
+                      "before char"
+      "what characters before characters after"
+    test maxBound Before " now"       24 20
+                             "characters after now"
+      "what characters before characters after now"
+    test (-20)    Before "the other "  1 26
+      "what characters before the"
+      "what characters before the other characters after now"
 
--- | A wrapper around a list of strings that instantiates the 'Eq' and 'Show' typeclasses so as to
--- produce better output when they are pretty-printed by the Hspec logging function.
-newtype Lines = Lines{ unwrapLines :: [String] } deriving (Eq, Ord)
-instance Show Lines where
-  show (Lines lines) = "\n" ++ (lines >>= (++ "\n") . ("    " ++) . show)
+-- | The next simplest tests, tests whether 'insertString' and 'gotoPosition' do not crash, it is
+-- not tested whether or not the text inserted is correct. These functions are used during
+-- initialization of all other tests, so they at least need be able to run without crashing, whether
+-- they run correctly is tested by other tests.
+textEditorPreTests :: Spec
+textEditorPreTests = describe "text editor pre-tests" $ do
+  buf <- runIO $ newTextBuffer defaultTags
+  let ins str =
+        it ("insertString " ++ show str) $
+        ed buf (void $ insertString str)
+  let move msg line col = let pos = mkLoc line col in
+        it ("move cursor "++msg++", gotoPosition ("++show pos++")") $
+        ed buf (gotoPosition $ mkLoc line col)
+  ins "one two three\n"
+  ins "four five six\nseven eight nine\nten eleven twelve\n"
+  move        "up" 1  1
+  move      "down" 4 16
+  move "to middle" 2  7
+
+----------------------------------------------------------------------------------------------------
 
 selectStrings :: TextLocation -> TextLocation -> [String] -> [String]
 selectStrings a b lines =
@@ -241,6 +237,14 @@ testWithGrid = (>>=) $ runIO $ do
   buf <- newTextBuffer defaultTags
   ed buf $ insertString grid
   return buf
+
+----------------------------------------------------------------------------------------------------
+
+-- | A wrapper around a list of strings that instantiates the 'Eq' and 'Show' typeclasses so as to
+-- produce better output when they are pretty-printed by the Hspec logging function.
+newtype Lines = Lines{ unwrapLines :: [String] } deriving (Eq, Ord)
+instance Show Lines where
+  show (Lines lines) = "\n" ++ (lines >>= (++ "\n") . ("    " ++) . show)
 
 -- | Tests the 'textView' function, which has some arithmetical computations regarding vector slices
 -- with line breaks that are not shared with most other functions, so 'textView' needs it's own
@@ -309,6 +313,9 @@ textDeletionTests :: Spec
 textDeletionTests = describe "text deletion tests" $ testWithGrid $ \ buf -> do
   fakebuf <- runIO $ newIORef gridLines
   let del at len = it ("*** deleteCharsWrap ("++show at++") ("++show len++")") $ do
+        -- TODO: each "del" test depends on the previous test working correctly. This will result in
+        -- later dependent tests failing when the earlier dependent tests have were disabled due to
+        -- having passed in a prior test run.
         grid0 <- liftIO $ readIORef fakebuf
         let grid1 = deleteStrings at len grid0
         liftIO $ writeIORef fakebuf grid1
