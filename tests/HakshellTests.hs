@@ -242,9 +242,17 @@ testWithGrid = (>>=) $ runIO $ do
 
 -- | A wrapper around a list of strings that instantiates the 'Eq' and 'Show' typeclasses so as to
 -- produce better output when they are pretty-printed by the Hspec logging function.
-newtype Lines = Lines{ unwrapLines :: [String] } deriving (Eq, Ord)
+data Lines
+  = Lines
+    { lineTestInfo :: String
+    , unwrapLines  :: [String]
+    }
+instance Eq Lines where
+  a == b = unwrapLines a == unwrapLines b
 instance Show Lines where
-  show (Lines lines) = "\n" ++ (lines >>= (++ "\n") . ("    " ++) . show)
+  show (Lines info lines) =
+    (if null info then "" else "   " ++ info ++ "\n") ++
+    (lines >>= (++ "\n") . ("    | " ++) . show)
 
 -- | Tests the 'textView' function, which has some arithmetical computations regarding vector slices
 -- with line breaks that are not shared with most other functions, so 'textView' needs it's own
@@ -255,8 +263,8 @@ instance Show Lines where
 textViewTests :: Spec
 textViewTests = describe "testing 'textView'" $ testWithGrid $ \ buf -> do
   let vi a b = it ("*** textView ("++showLoc a++") ("++showLoc b++")") $
-        (ed buf $ Lines . fmap fst . textViewToStrings <$> textView a b)
-        `shouldReturn` Lines (selectStrings a b gridLines)
+        ( ed buf $ Lines "" . fmap fst . textViewToStrings <$> textView a b
+        ) `shouldReturn` Lines "" (selectStrings a b gridLines)
   describe ("move cursor to start of buffer 1 1") $ do
     vi (mkLoc  3 25) (mkLoc  6 24)
     vi (mkLoc 14  1) (mkLoc 16 48)
@@ -310,22 +318,21 @@ cursorMotionTests = describe "testing cursor motion" $ testWithGrid $ \ buf -> d
 ----------------------------------------------------------------------------------------------------
 
 textDeletionTests :: Spec
-textDeletionTests = describe "text deletion tests" $ testWithGrid $ \ buf -> do
-  fakebuf <- runIO $ newIORef gridLines
-  let del at len = it ("*** deleteCharsWrap ("++show at++") ("++show len++")") $ do
-        -- TODO: each "del" test depends on the previous test working correctly. This will result in
-        -- later dependent tests failing when the earlier dependent tests have were disabled due to
-        -- having passed in a prior test run.
-        grid0 <- liftIO $ readIORef fakebuf
-        let grid1 = deleteStrings at len grid0
-        liftIO $ writeIORef fakebuf grid1
-        flip shouldReturn (Lines grid1) $ ed buf $ do
-          gotoPosition at
-          deleteCharsWrap len
-          Lines . fmap fst . textViewToStrings <$>
-            textView (mkLoc minBound minBound) (mkLoc maxBound maxBound)
-  del (mkLoc 16 24) (-24)
-  del (mkLoc 16  1)  (24)
-  del (mkLoc 14  1)  (49)
-  del (mkLoc 13 48) (-49)
-  del (mkLoc 12 24) (-49)
+textDeletionTests = describe "text deletion tests" $ testWithGrid $ \ buf ->
+  it "*** deleteCharsWrap tests" $ do
+    fakebuf <- newIORef gridLines
+    let del at len = do
+          let info = "deleteCharsWrap ("++show at++") ("++show len++")"
+          grid0 <- liftIO $ readIORef fakebuf
+          let grid1 = deleteStrings at len grid0
+          liftIO $ writeIORef fakebuf grid1
+          flip shouldReturn (Lines info grid1) $ ed buf $ do
+            gotoPosition at
+            deleteCharsWrap len
+            Lines info . fmap fst . textViewToStrings <$>
+              textView (mkLoc minBound minBound) (mkLoc maxBound maxBound)
+    del (mkLoc 16 24) (-24)
+    del (mkLoc 16  1)  (24)
+    del (mkLoc 14  1)  (49)
+    del (mkLoc 13 48) (-49)
+    del (mkLoc 12 24) (-49)
