@@ -297,9 +297,9 @@ cursorMotionTests = describe "testing cursor motion" $ testWithGrid $ \ buf -> d
         let TextLocation{theLocationLineIndex=line,theLocationCharIndex=char} = loc
             expct = splitAt (charToIndex char) $ gridLines !! lineToIndex line
         in it ("*** gotoPosition ("++show loc++")") $
-           (ed buf $ gotoPosition loc >>
-             (,) <$> getPosition <*> editLine
-             ((,) <$> (unpack <$> copyCharsToEnd Before) <*> (unpack <$> copyCharsToEnd After))
+           ( ed buf $ flushReset (gotoPosition loc) >>
+               (,) <$> getPosition <*> editLine
+               ((,) <$> (unpack <$> copyCharsToEnd Before) <*> (unpack <$> copyCharsToEnd After))
            ) `shouldReturn` (loc, expct)
   go (mkLoc 16 24)
   go (mkLoc 16  8)
