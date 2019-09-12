@@ -265,8 +265,6 @@ import qualified Data.Vector.Generic.Mutable as GMVec
 import qualified Data.Vector.Unboxed.Mutable as UMVec
 import           Data.Word
 
-import Debug.Trace
-
 ----------------------------------------------------------------------------------------------------
 
 -- Programmer notes:
@@ -1210,15 +1208,18 @@ getUnusedSpace :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem) => m In
 getUnusedSpace = subtract <$> countElems <*> getAllocSize
 
 -- Returns a cursor index, although the index may NOT necessarily be pointing to a valid
--- element. This function is defined as the value returned by 'getElemCount' subtracted by 1,
--- because the 'getElemCount' is always pointing at the undefined vector index just after the
--- element that is considered to be "under" the cursor.
+-- element. This function is defined as the value returned by 'getElemCount' subtracted by 1 for
+-- elements before the cursor (because the 'getElemCount' is always pointing at the undefined vector
+-- index just after the element that is considered to be "under" the cursor). The element after the
+-- cursor is the first element after the contiguous gap of undefined elements in the vector. If
+-- there are no elements after the cursor, this function returns the length of the array, which is
+-- an invalid index that may result in a vector index exception.
 cursorIndex
   :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem)
   => RelativeToCursor -> m Int -- line editors and text editor have different cursors
 cursorIndex rel = case rel of
   Before -> subtract 1 <$> getElemCount Before
-  After  -> cursorIndexAfter
+  After  -> subtract <$> getElemCount After <*> getAllocSize
 
 -- Like 'cursorIndex', but evaluates to 'throwLimitErr' if the 'RelativeToCursor' value given is
 -- 'After' and there are no elements after the cursor.
@@ -1229,14 +1230,6 @@ cursorIndexChk rel = do
   siz <- getAllocSize
   i   <- cursorIndex rel
   if i < siz then return i else throwLimitErr rel
-
--- Get the vector index for the element after the cursor, which is the first element after the
--- contiguous gap of undefined elements in the vector. The index returned does not necessarily point
--- to a valid index, particularly when there are no elements after the cursor. If there are no
--- elements after the cursor, this function returns the length of the array, which is an invalid
--- index that may result in a vector index exception.
-cursorIndexAfter :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem) => m Int
-cursorIndexAfter = subtract <$> getElemCount After <*> getAllocSize
 
 -- Get the index within the vector that is associated with the given 'LineIndex'. Bounds checking is
 -- performed.
@@ -1270,7 +1263,7 @@ getVoid
   => m (Maybe (Absolute Int, Absolute Int))
 getVoid = do
   rgn <- (,) <$> (Absolute <$> getElemCount Before)
-             <*> (Absolute . subtract 1 <$> cursorIndexAfter)
+             <*> (Absolute . subtract 1 <$> cursorIndex After)
   return $ guard (uncurry (<=) rgn) >> Just rgn
 
 -- Make a slice of elements relative to the current cursor. A negative argument will take elements
@@ -1288,7 +1281,7 @@ getSlice rel@(Relative count) = do
     return $ GMVec.slice i (abs count) vec
    else if rel > 0
    then do
-    i <- cursorIndexAfter
+    i <- cursorIndex After
     return $ GMVec.slice i count vec
    else return $ GMVec.slice 0 0 vec
 
@@ -1385,7 +1378,7 @@ putElemIndex
      , Show elem --DEBUG
      )
   => Int -> elem -> m ()
-putElemIndex i elem = 
+putElemIndex i elem =
   ((if unsafeMode then GMVec.unsafeWrite else GMVec.write) <$>
     getVector <*> pure i <*> pure elem
   ) >>= liftIO
@@ -1480,7 +1473,7 @@ pushElem
      , Show elem --DEBUG
      )
   => RelativeToCursor -> elem -> m ()
-pushElem rel elem = growVector 1 >> void (modCount rel (+ 1)) >> putElem rel elem
+pushElem rel elem = growVector 1 >> modCount rel (+ 1) >> putElem rel elem
 
 -- Push a vector of elements starting at the index 'Before' (currently on) the cursor, or the index
 -- 'After' the cursor.
@@ -1544,7 +1537,7 @@ shiftCursorChk
      , Show elem --DEBUG
      )
   => Relative Int -> m ()
-shiftCursorChk (Relative count) = trace ("-- | shiftCursorChk "++show count) $
+shiftCursorChk (Relative count) =
   getElemCount (if count <= 0 then Before else After) >>=
   shiftCursor . Relative . ((signum count) *) . min (safeAbs count)
 
@@ -1946,10 +1939,12 @@ flushLineEditor
      )
   => editor tags m (TextLine tags)
 flushLineEditor = liftEditText $ do
-  line <- editLine copyLineEditorText
-  join $ putLineIndex <$> currentLineNumber <*> pure line
-  bufferLineEditor . lineEditorIsClean .= True
-  return line
+  clean <- use $ bufferLineEditor . lineEditorIsClean
+  if clean then currentLineNumber >>= getLineIndex else do
+    line <- editLine copyLineEditor'
+    putElem Before line
+    bufferLineEditor . lineEditorIsClean .= True
+    return line
 
 -- | Evaluate a function on the 'TextLine' currently under the 'currentLineNumber'. This function
 -- throws an exception if the 'TextBuffer' is empty. __NOTE__ that the 'TextBuffer' is considered
@@ -2105,7 +2100,6 @@ gotoLine ln0 = liftEditText $ do
   let ln = lineToIndex ln0
   before <- getElemCount Before
   count  <- countElems
-  traceM $ "-- | gotoLine ("++show ln0++"), before="++show (countToLine before) --DEBUG
   moveByLine $ countToLine $ max 1 (min ln count) - before
   use bufferTargetCol >>= gotoChar
 
@@ -2218,15 +2212,19 @@ insertString str = liftEditText $ do
         if lbrklen >= maxlen
          then error $ "insertString: line break string length is "++show lbrklen++
                 "exceeeds maximum length of "++show maxlen++" characters"
-         else ( editLine $ do
-                  cursorBreakSize .= fromIntegral lbrklen
-                  copyLineEditor' <* (charsBeforeCursor .= 0 >> charsAfterCursor .= 0)
-              ) >>= pushElem Before >> return (strlen + lbrklen)
+         else do
+          line <- editLine $ do
+            cursorBreakSize .= fromIntegral lbrklen
+            copyLineEditor' <* (charsBeforeCursor .= 0 >> charsAfterCursor .= 0)
+          when (lbrklen > 0) $ do
+            pushElem Before line
+            bufferLineEditor . lineEditorIsClean .= True
+          return (strlen + lbrklen)
   let loop count = seq count . \ case
         []        -> return count
         line:more -> writeLine line >>= flip loop more
   count <- Relative . CharIndex <$> loop 0 (breaker str)
-  when (count > 0) $ bufferLineEditor . lineEditorIsClean .= False
+  --editLine copyLineEditor' >>= pushElem Before -- shouldn't be necessary
   return count
 
 -- Not for export: this code shared by 'forLinesInRange' and 'forLines' but requires knowledge of
@@ -2391,7 +2389,6 @@ gotoPosition
      )
   => TextLocation -> editor tags m ()
 gotoPosition (TextLocation{theLocationLineIndex=ln,theLocationCharIndex=ch}) = liftEditText $
-  trace ("-- | gotoPosition ("++show ln++") ("++show ch++")") $ --DEBUG
   gotoLine ln >> gotoChar ch
 
 -- | Save the location of the cursor, then evaluate an @editor@ function. After evaluation
