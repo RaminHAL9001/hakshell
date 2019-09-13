@@ -1431,15 +1431,6 @@ copyRegionChk i0@(Absolute i) count0@(Relative count) =
   else if sum < 0 || sum > siz then throwCountErr count
   else copyRegion i0 count0
 
--- Copy a vector range starting at an 'Absolute' index and moving toward the start ('Before') or
--- the end ('After') of the buffer. This function DOES perform bounds checking.
-copyElemsToEndFrom
-  :: (GMVec.MVector vec elem, MonadEditVec (vec RealWorld elem) m)
-  => Absolute Int -> RelativeToCursor -> m (vec RealWorld elem)
-copyElemsToEndFrom (Absolute i) = \ case
-  Before -> copyRegionChk (Absolute 0) $ Relative $ i + 1
-  After  -> countElems >>= copyRegionChk (Absolute i) . Relative . subtract i
-
 -- Write an element to a vector index, overwriting whatever was there before. __WARNING__: there is
 -- no bounds checking.
 putElemIndex
@@ -2284,7 +2275,7 @@ deleteByUnit
   :: ( MonadIO m
      , Show tags --DEBUG
      ) => Relative CharIndex -> EditText tags m (Relative CharIndex)
-deleteByUnit request = error "TODO: deleteByUnit"
+deleteByUnit _request = error "TODO: deleteByUnit"
 
 -- | This function evaluates the 'lineBreaker' function on the given string, and beginning from the
 -- current cursor position, begins inserting all the lines of text produced by the 'lineBreaker'
