@@ -88,10 +88,11 @@ module Hakshell.TextEditor
     -- type 'EditLine' using the 'editLine' function.
 
     LineEditor,
-    flushReset, reloadLineEditor, reloadLineEditorWith, flushLineEditor,
+    flushRefill, refillLineEditor, refillLineEditorWith, flushLineEditor,
 
     -- *** Working with the content of a 'LineEditor'
-    copyLineEditorText, lineEditorCharCount, clearLineEditor, resetLineEditor,
+    lineEditorCharCount, lineEditorWeight, getLineCharCount, getLineWeight,
+    copyLineEditorText, clearLineEditor, resetLineEditor,
 
     -- *** Creating line editors
     --
@@ -128,13 +129,13 @@ module Hakshell.TextEditor
     -- 'flushLineEditor'. Without "flushing" the characters currently in the 'LineEditor' will not
     -- be saved to the 'TextBuffer' and will be carried around to the 'LineEditor's current
     -- position. After moving to the new line, the 'LineEditor' will not load the content of the new
-    -- line until you evaluate 'reloadLineEditor'.
+    -- line until you evaluate 'refillLineEditor'.
     --
     -- If you want the "normal" text editor behavior, where the 'LineEditor' leaves the characters
     -- currenly being edited on the current line, moves to a new line, and then begins editing the
-    -- characters on that new line, you must evaluate a cursor motion value with 'flushReset'.
+    -- characters on that new line, you must evaluate a cursor motion value with 'flushRefill'.
     --
-    -- There are situations where you may not want to use 'flushReset' to perform a cursor motion, as
+    -- There are situations where you may not want to use 'flushRefill' to perform a cursor motion, as
     -- in when accumulating lines into the 'LineEditor' after each cursor motion.
 
     getPosition, gotoPosition, saveCursorEval, gotoLine, gotoChar,
@@ -708,9 +709,6 @@ data TextBufferState tags
     , theBufferTargetCol   :: !(Absolute CharIndex)
       -- ^ When moving the cursor up and down the 'TextBuffer' (e.g. using 'gotoPosition'), the
       -- cursor should generally remain at the same character column position.
-    , theBufferColumn      :: !(Absolute CharIndex)
-      -- ^ This value is always set to the minimum of 'theBufferTargetCol' and the 'textLineWeight'
-      -- of the 'TextLine' at the current 'cursorIndex'.
     }
 
 data TextEditError
@@ -893,6 +891,17 @@ textLineTop line = indexToChar $ intSize line - (fromIntegral $ theTextLineBreak
 ----------------------------------------------------------------------------------------------------
 
 -- | The current line that is being edited.
+--
+-- A line editor needs to have it's characters flushed to it's parent 'TextBuffer' by the
+-- 'flushLineEditor' in order for the changes in the 'LineEditor' to be applied to the document in
+-- the 'TextBuffer'. The content of a 'LineEditor' can be reverted to the content of the line
+-- currently under the cursor by calling 'refillLineEditor'.
+--
+-- Some cursor motion functions, like 'moveCursor' and 'gotoPosition' automatically evaluate
+-- 'flushLineEditor' before moving the cursor and automatically evaluate 'refillLineEditor' after
+-- moving the cursor. Other cursor motion functions, like 'gotoLine' and 'moveByLine' __DO_NOT__
+-- evaluate 'flushLineEditor' or 'refillLineEditor' at all, allowing you to accumulate 'TextLine's
+-- into the 'LineEditor' as you move it the cursor different lines in the 'TextBuffer'.
 data LineEditor tags
   = LineEditor
     { theLineEditBuffer    :: !(UMVec.IOVector Char)
@@ -911,6 +920,8 @@ data LineEditor tags
     , theCursorBreakSize   :: !Word16
     , theLineEditorTags    :: tags
     }
+
+instance IntSized (LineEditor tags) where { intSize = charToCount . lineEditorCharCount; }
 
 -- Not for export: this buffer is formatted such that characters before the cursror are near index
 -- zero, while characters after the cursor are near the final index.
@@ -982,7 +993,6 @@ newTextBufferState this size tags = do
     , theLinesBelowCursor  = 0
     , theBufferLineEditor  = cur
     , theBufferTargetCol   = 1
-    , theBufferColumn      = 1
     }
 
 -- Use this to initialize a new empty 'LineEditor'. This is usually only handy if you want to
@@ -1016,8 +1026,28 @@ copyLineEditorIO cur = do
   return cur{ theLineEditBuffer = buf }
 
 -- | Determine how many characters have been stored into this buffer.
-lineEditorCharCount :: LineEditor tags -> Int
-lineEditorCharCount cur = theCharsBeforeCursor cur + theCharsAfterCursor cur
+lineEditorCharCount :: LineEditor tags -> Relative CharIndex
+lineEditorCharCount ed = countToChar $ theCharsBeforeCursor ed + theCharsAfterCursor ed
+
+-- | This funcion returns the same value as 'textLineWeight' but for a 'LineEditor'.
+lineEditorWeight :: LineEditor tags -> Relative CharIndex
+lineEditorWeight ed = lineEditorCharCount ed - fromIntegral (theCursorBreakSize ed)
+
+-- | Gets the 'lineEditorCharCount' value for the current 'LineEditor'.
+getLineCharCount
+  :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
+     , Show tags --DEBUG
+     )
+  => editor tags m (Relative CharIndex)
+getLineCharCount = liftEditText $ lineEditorCharCount <$> use bufferLineEditor
+
+-- | Gets the 'lineEditorWeight' value for the current 'LineEditor'.
+getLineWeight
+  :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
+     , Show tags --DEBUG
+     )
+  => editor tags m (Relative CharIndex)
+getLineWeight = liftEditText $ lineEditorWeight <$> use bufferLineEditor
 
 -- | Create a new 'LineEditor' by copying the line under the given 'TextLocation' point. The
 -- 'LineEditor' can be updated with an 'EditLine' function. Note that this function works in any
@@ -1133,11 +1163,6 @@ bufferLineEditor = lens theBufferLineEditor $ \ a b -> a{ theBufferLineEditor = 
 bufferTargetCol :: Lens' (TextBufferState tags) (Absolute CharIndex)
 bufferTargetCol = lens theBufferTargetCol $ \ a b -> a{ theBufferTargetCol = b }
 
--- | This value is always set to the minimum of 'theBufferTargetCol' and the 'textLineWeight' of the
--- 'TextLine' at the current 'cursorIndex'.
-bufferColumn :: Lens' (TextBufferState tags) (Absolute CharIndex)
-bufferColumn = lens theBufferColumn $ \ a b -> a{ theBufferColumn = b }
-
 ----------------------------------------------------------------------------------------------------
 
 -- Line indexing arithmetic
@@ -1231,7 +1256,7 @@ cursorIndexChk
 cursorIndexChk rel = do
   siz <- getAllocSize
   i   <- cursorIndex rel
-  if i < siz then return i else throwLimitErr rel
+  if 0 <= i && i < siz then return i else throwLimitErr rel
 
 -- Get the index within the vector that is associated with the given 'LineIndex'. Bounds checking is
 -- performed.
@@ -1711,25 +1736,24 @@ currentLineNumber
      , Show tags --DEBUG
      )
   => editor tags m (Absolute LineIndex)
-currentLineNumber = liftEditText $ indexToLine <$> getElemCount Before
+currentLineNumber = liftEditText $ indexToLine <$> cursorIndexChk Before
 
 -- | Get the current column number of the cursor.
 currentColumnNumber
-  :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
+  :: (MonadEditLine editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
      )
   => editor tags m (Absolute CharIndex)
-currentColumnNumber = liftEditText $ do
-  clean <- use $ bufferLineEditor . lineEditorIsClean
-  if clean then use bufferColumn else editLine $ indexToChar <$> getElemCount Before
+currentColumnNumber = liftEditLine $ indexToChar <$> getElemCount Before
 
--- | Get the current cursor position.
+-- | Get the current cursor position. This function is identical to 'getPosition'.
 currentTextLocation
   :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
      )
   => editor tags m TextLocation
-currentTextLocation = TextLocation <$> currentLineNumber <*> currentColumnNumber
+currentTextLocation = liftEditText $
+  TextLocation <$> currentLineNumber <*> editLine currentColumnNumber
 
 copyLineEditor'
   :: (MonadIO m
@@ -1842,22 +1866,23 @@ putLineIndex i line = liftEditText $
 -- re-allocate the current line editor buffer unless it is too small to hold all of the characters
 -- in the given 'TextLine', meaning this function only grows the buffer memory allocation, it never
 -- shrinks the memory allocation.
-reloadLineEditor
+refillLineEditor
   :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
      )
   => editor tags m ()
-reloadLineEditor = liftEditText $ getElem Before >>= reloadLineEditorWith
+refillLineEditor = liftEditText $ getElem Before >>= refillLineEditorWith
 
--- | Like 'reloadLineEditor', but replaces the content in the 'bufferLineEditor' with the content in
+-- | Like 'refillLineEditor', but replaces the content in the 'bufferLineEditor' with the content in
 -- a given 'TextLine', rather the content of the current line.
-reloadLineEditorWith
+refillLineEditorWith
   :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
      )
   => TextLine tags -> editor tags m ()
-reloadLineEditorWith = \ case
-  TextLineUndefined -> return ()
+refillLineEditorWith = \ case
+  TextLineUndefined -> error
+    "internal error: evaluated (refillLineEditorWith TextLineUndefined)"
   line              -> liftEditText $ do
     let srcvec = theTextLineString line
     let srclen = intSize srcvec
@@ -1866,19 +1891,24 @@ reloadLineEditorWith = \ case
     cur <- max 0 . min srctop . charToIndex <$> use bufferTargetCol
     editLine $ do
       join $ maybe (pure ()) (void . modVector . const) <$> prepLargerVector srclen
-      targlo <- getLoSlice
-      targhi <- getHiSlice
-      let targlolen = UMVec.length targlo
-      let targhilen = UMVec.length targhi
+      let targlolen = cur
+      let targhilen = srclen - cur
+      -- NOTE: must set before/after cursor count values BEFORE CALLING 'getLoSlice'
+      --       and 'getHiSlice', because we need a slice of the size given here, and
+      --       there is no guarantee that the line editor currently has the correct
+      --       cursor size set to produce the slices of the correct size.
       charsBeforeCursor .= targlolen
       charsAfterCursor  .= targhilen
+      -- NOTE: now we call 'getLoSlice and 'getHiSlice', which should produce slices
+      --       of size 'targlolen' and 'targhilen'.
+      targlo <- getLoSlice
+      targhi <- getHiSlice
       cursorBreakSize   .= lbrksz
       lineEditorTags    .= theTextLineTags line
       liftIO $ do
         let slice = if unsafeMode then UVec.unsafeSlice else UVec.slice
-        when (cur > 0) $ UVec.copy targlo $ slice 0 targlolen srcvec
+        UVec.copy targlo $ slice 0 targlolen srcvec
         UVec.copy targhi $ slice targlolen targhilen srcvec
-    bufferTargetCol   .= indexToChar cur
     bufferLineEditor . lineEditorIsClean .= True
 
 -- | Delete the content of the 'bufferLineEditor' except for the line breaking characters (if any)
@@ -1927,10 +1957,10 @@ copyLineEditor = liftEditText $ use bufferLineEditor >>= liftIO . copyLineEditor
 
 -- | This function copies the current 'LineEditor' state back to the 'TextBuffer', and sets a flag
 -- indicating that the content of the 'LineEditor' and the content of the current line are identical
--- so as to prevent further copying. Note that this function is called automatically by 'flushReset'.
+-- so as to prevent further copying. Note that this function is called automatically by 'flushRefill'.
 --
 -- In situations where you would not evaluate 'moveCursor', 'moveByLine', 'gotoPosition' or
--- 'gotoLine' with the 'flushReset' function, you can choose when to copy the content of the
+-- 'gotoLine' with the 'flushRefill' function, you can choose when to copy the content of the
 -- 'LineEditor' back to the buffer after moving it. This can be done to "move" the content of a line
 -- out of the 'TextBuffer', into the 'LineEditor', and then move the content back into the
 -- 'TextBuffer' at a different location after changing position. This can also be useful after
@@ -1951,14 +1981,14 @@ flushLineEditor = liftEditText $ do
 -- | Evaluate a function on the 'TextLine' currently under the 'currentLineNumber'. This function
 -- throws an exception if the 'TextBuffer' is empty. __NOTE__ that the 'TextBuffer' is considered
 -- empty if there are characters in the 'LineBuffer' which have not been flushed to the empty
--- 'TextBuffer'.
+-- 'TextBuffer' by either 'flushLineEditor' or 'flushRefill'.
 withCurrentLine
   :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
      )
   => (Absolute LineIndex -> TextLine tags -> editor tags m a) -> editor tags m a
 withCurrentLine f = do
-  (ln, line) <- liftEditText $ currentLineNumber >>= \ ln -> (,) ln <$> getLineIndex ln
+  (ln, line) <- liftEditText $ (,) <$> currentLineNumber <*> getElem Before
   case line of
     TextLineUndefined -> error $
       "internal error: "++show ln++" received from 'getLineIndex' points to undefined line"
@@ -1983,81 +2013,68 @@ bufferIsEmpty = bufferLineCount >>= \ ln ->
   else if ln <= 0 then return True
   else withCurrentLine $ \ _ line -> return $ textLineWeight line == 0
 
--- not for export
-resetTargetColumn
-  :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
-     , Show tags
-     )
-  => editor tags m ()
-resetTargetColumn = liftEditText $ use bufferColumn >>= assign bufferTargetCol
-
 ----------------------------------------------------------------------------------------------------
 
 -- not for export
 modifyColumn
-  :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
+  :: (MonadEditLine editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
      )
   => (Absolute CharIndex -> Absolute CharIndex -> Relative CharIndex)
-  -> editor tags m ()
-modifyColumn f = liftEditText $ do
-  clean <- use $ bufferLineEditor . lineEditorIsClean
-  oldch <- currentColumnNumber
-  if clean
-   then withCurrentLine $ \ _ line -> do
-    let top = textLineTop line
-    let ch  = max 1 $ min top $ shiftAbsolute oldch $ f oldch top
-    bufferColumn    .= ch
-    bufferTargetCol .= ch
-   else do
-    ch <- liftEditLine $ do
-      weight <- countElems
-      lbrksz <- fromIntegral <$> use cursorBreakSize
-      shiftCursor $ Relative $ charToCount $ f oldch $ indexToChar $ weight - lbrksz
-      indexToChar <$> getElemCount Before
-    bufferColumn    .= ch
-    bufferTargetCol .= ch
+  -> editor tags m (Absolute CharIndex)
+modifyColumn f = liftEditLine $ do
+  oldch  <- currentColumnNumber
+  weight <- countElems
+  lbrksz <- fromIntegral <$> use cursorBreakSize
+  shiftCursor $ Relative $ charToCount $ f oldch $ indexToChar $ weight - lbrksz
+  indexToChar <$> getElemCount Before
 
 -- | Usually when you move the cursor to a different line using 'gotoPosition', 'gotoLine',
 -- 'moveByLine', or 'moveCursor', you expect the content of the 'LineEditor' to remain on the
 -- current line and you expect the 'LineEditor' will begin editing the line at the new position to
--- where it moved -- but unless you evaluate your cursor motion with the 'flushReset' function, this
+-- where it moved -- but unless you evaluate your cursor motion with the 'flushRefill' function, this
 -- is not the default cursor motion behavior. The 'LineEditor' must be explicitly instructed to
 -- flush it's contents to the current line using 'flushLineEditor', and load the content of the new
--- line after moving using 'reloadLineEditor'.
+-- line after moving using 'refillLineEditor'.
 --
 -- That is precisely what this function call does: it evaluates an @editor@ function (one that
 -- usually evaluates a cursor motion), but before it does, it evaluate 'flushLineEditor', and after
--- evaluating 'flushReset' it evaluates 'reloadLineEditor'.
-flushReset
+-- evaluating 'flushRefill' it evaluates 'refillLineEditor'.
+flushRefill
   :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
      )
   => editor tags m a -> editor tags m a
-flushReset motion = flushLineEditor >> motion <* reloadLineEditor
+flushRefill motion = flushLineEditor >> motion <* refillLineEditor
 
 -- | This function calls 'moveByLine' and then 'moveByChar' to move the cursor by a number of lines
 -- and characters relative to the current cursor position.
 --
--- This function __DOES NOT__ evaluate 'flushLineEditor' or 'reloadLineEditor'.
+-- __WARNING__: This evaluates 'flushLineEditor' before moving the cursor, and evaluates
+-- 'refillLineEditor' after moving the cursor. If you want to move the cursor without flushing and
+-- refilling, use 'gotoLine' or 'moveByLine'. Then once you have decided what to do with the content
+-- of the current line editor, can move the cursor column with 'gotoChar' or 'moveByChar', or set
+-- the new target column with the expression @('bufferTargetCol' 'Control.Lens..=' c)@.
 moveCursor
   :: (MonadEditText editor, MonadEditLine editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
      )
-  => Relative LineIndex -> Relative CharIndex -> editor tags m ()
-moveCursor row col = moveByLine row >> moveByChar col
+  => Relative LineIndex -> Relative CharIndex -> editor tags m TextLocation
+moveCursor row col = TextLocation <$> flushRefill (moveByLine row) <*> moveByChar col
 
 -- | Move the cursor to a different line by an @n :: Int@ number of lines. A negative @n@ indicates
 -- moving the cursor toward the start of the buffer, a positive @n@ indicates moving the cursor
 -- toward the end of the buffer.
 --
--- This function __DOES NOT__ evaluate 'flushLineEditor' or 'reloadLineEditor'.
+-- This function __DOES NOT__ evaluate 'flushLineEditor' or 'refillLineEditor'.
 moveByLine
   :: forall editor tags m . (MonadEditText editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
      )
-  => Relative LineIndex -> editor tags m ()
-moveByLine = liftEditText . shiftCursorChk . Relative . lineToCount
+  => Relative LineIndex -> editor tags m (Absolute LineIndex)
+moveByLine rel = liftEditText $ do
+  liftEditText . shiftCursorChk . Relative . lineToCount $ rel
+  currentLineNumber
 
 -- | Move the cursor to a different character position within the 'bufferLineEditor' by an @n ::
 -- Int@ number of characters. A negative @n@ indicates moving toward the start of the line, a
@@ -2066,18 +2083,19 @@ moveByLine = liftEditText . shiftCursorChk . Relative . lineToCount
 -- This function does not wrap the cursor if motion moves past the end or beginning of the line, to
 -- do this, evaluate 'moveByCharWrap'.
 --
--- This function __DOES NOT__ evaluate 'flushLineEditor' or 'reloadLineEditor'.
+-- This function __DOES NOT__ evaluate 'flushLineEditor' or 'refillLineEditor'.
 moveByChar
   :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
      )
-  => Relative CharIndex -> editor tags m ()
-moveByChar count = do
+  => Relative CharIndex -> editor tags m (Absolute CharIndex)
+moveByChar count = liftEditText $ do
+  cur <- currentColumnNumber
+  bufferTargetCol .= shiftAbsolute cur count
   modifyColumn $ \ column top ->
     if count > 0 then min count $ diffAbsolute column top
-     else if count < 0 then max count $ diffAbsolute column 1
-     else 0
-  resetTargetColumn
+    else if count < 0 then max count $ diffAbsolute column 1
+    else 0
 
 -- | Like 'moveByChar' but will wrap up to the previous line and continue moving on the
 -- previous/next line if the value is large enough to move the cursor past the start\/end of the
@@ -2086,38 +2104,38 @@ moveByCharWrap
   :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
      )
-  => Relative CharIndex -> editor tags m ()
+  => Relative CharIndex -> editor tags m TextLocation
 moveByCharWrap = error "TODO: implement 'moveByCharWrap'"
 
 -- | Go to an absolute line number, the first line is 1 (line 0 and below all send the cursor to
 -- line 1), the last line is 'Prelude.maxBound'.
 --
--- This function __DOES NOT__ evaluate 'flushLineEditor' or 'reloadLineEditor'.
+-- This function __DOES NOT__ evaluate 'flushLineEditor' or 'refillLineEditor'.
 gotoLine
   :: (MonadEditText editor, MonadEditLine editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
      )
-  => Absolute LineIndex -> editor tags m ()
+  => Absolute LineIndex -> editor tags m (Absolute LineIndex)
 gotoLine ln0 = liftEditText $ do
   let ln = lineToIndex ln0
-  before <- getElemCount Before
-  count  <- countElems
-  --traceM $ "gotoLine ("++show ln0++"): ln="++show ln++", before="++show before++", count="++show count
-  moveByLine $ countToLine $ max 0 (min ln count) - before
+  cur   <- cursorIndex Before
+  count <- countElems
+  i <- moveByLine $ countToLine $ max 0 (min ln count) - cur
   use bufferTargetCol >>= gotoChar
+  return i
 
 -- | Go to an absolute character (column) number, the first character is 1 (character 0 and below
 -- all send the cursor to column 1), the last line is 'Prelude.maxBound'.
 --
--- This function __DOES NOT__ evaluate 'flushLineEditor' or 'reloadLineEditor'.
+-- This function __DOES NOT__ evaluate 'flushLineEditor' or 'refillLineEditor'.
 gotoChar
   :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
      )
-  => Absolute CharIndex -> editor tags m ()
+  => Absolute CharIndex -> editor tags m (Absolute CharIndex)
 gotoChar ch = liftEditText $ do
+  bufferTargetCol .= ch
   modifyColumn $ \ column top -> diffAbsolute column $ max 1 $ min top ch
-  resetTargetColumn
 
 ----------------------------------------------------------------------------------------------------
 
@@ -2219,9 +2237,8 @@ insertString str = liftEditText $ do
           line <- editLine $ do
             cursorBreakSize .= fromIntegral lbrklen
             copyLineEditor' <* (charsBeforeCursor .= 0 >> charsAfterCursor .= 0)
-          when (lbrklen > 0) $ do
-            pushElem Before line
-            bufferLineEditor . lineEditorIsClean .= True
+          when (lbrklen > 0) $ pushElem Before line
+          bufferLineEditor . lineEditorIsClean .= (lbrklen > 0)
           return (strlen + lbrklen)
   let loop count = seq count . \ case
         []        -> return count
@@ -2385,14 +2402,18 @@ getPosition = currentTextLocation
 -- | This function calls 'gotoLine' and then 'gotoChar' to move the cursor to an absolute a line
 -- number and characters (column) number.
 --
--- This function __DOES NOT__ evaluate 'flushLineEditor' or 'reloadLineEditor'.
+-- __WARNING__: This evaluates 'flushLineEditor' before moving the cursor, and evaluates
+-- 'refillLineEditor' after moving the cursor. If you want to move the cursor without flushing and
+-- refilling, use 'gotoLine' or 'moveByLine'. Then once you have decided what to do with the content
+-- of the current line editor, can move the cursor column with 'gotoChar' or 'moveByChar', or set
+-- the new target column with the expression @('bufferTargetCol' 'Control.Lens..=' c)@.
 gotoPosition
   :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
      )
-  => TextLocation -> editor tags m ()
+  => TextLocation -> editor tags m TextLocation
 gotoPosition (TextLocation{theLocationLineIndex=ln,theLocationCharIndex=ch}) = liftEditText $
-  gotoLine ln >> gotoChar ch
+  TextLocation <$> flushRefill (gotoLine ln) <*> gotoChar ch
 
 -- | Save the location of the cursor, then evaluate an @editor@ function. After evaluation
 -- completes, restore the location of the cursor (within range, as the location may no longer exist)

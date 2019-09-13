@@ -167,7 +167,7 @@ textEditorPreTests = describe "text editor pre-tests" $ do
         ed buf (void $ insertString str)
   let move msg line col = let pos = mkLoc line col in
         it ("move cursor "++msg++", gotoPosition ("++show pos++")") $
-        ed buf (gotoPosition $ mkLoc line col)
+        ed buf (void $ gotoPosition $ mkLoc line col)
   ins "one two three\n"
   ins "four five six\nseven eight nine\nten eleven twelve\n"
   move        "up" 1  1
@@ -297,9 +297,13 @@ cursorMotionTests = describe "testing cursor motion" $ testWithGrid $ \ buf -> d
         let TextLocation{theLocationLineIndex=line,theLocationCharIndex=char} = loc
             expct = splitAt (charToIndex char) $ gridLines !! lineToIndex line
         in it ("*** gotoPosition ("++show loc++")") $
-           ( ed buf $ flushReset (gotoPosition loc) >>
-               (,) <$> (getPosition <* debugPrintBuffer) <*> editLine
-               ((,) <$> (unpack <$> copyCharsToEnd Before) <*> (unpack <$> copyCharsToEnd After))
+           ( ed buf $ do
+               gotoPosition loc
+               newloc  <- getPosition
+               content <- editLine $ (,)
+                 <$> (unpack <$> copyCharsToEnd Before)
+                 <*> (unpack <$> copyCharsToEnd After)
+               return (newloc, content)
            ) `shouldReturn` (loc, expct)
   go (mkLoc 16 24)
   go (mkLoc 16  8)
