@@ -140,7 +140,7 @@ module Hakshell.TextEditor
 
     getPosition, gotoPosition, saveCursorEval, gotoLine, gotoChar,
 
-    Absolute(..),  LineIndex(..), CharIndex(..), TextLocation(..),
+    Absolute(..),  LineIndex(..), CharIndex(..), TextLocation(..), CharWeight(..), CharStats(..),
     shiftAbsolute, diffAbsolute,
     lineToIndex, charToIndex, indexToLine, indexToChar,
 
@@ -357,6 +357,34 @@ newtype LineIndex = LineIndex Int
 -- needing to write @(LineIndex 1)@ constructor unless you really want to.
 newtype CharIndex = CharIndex Int
   deriving (Eq, Ord, Show, Read, Enum, Num)
+
+-- | When instructing the editor engine to move by or delete a number of logical character positions
+-- (where line breaking characters consisting of two characters are considered a single logical
+-- character, thus the 'textLineWeight' and 'lineEditorWeight' functions), you must specify the
+-- number of logical characters using a value of this type.
+newtype CharWeight = CharWeight Int
+  deriving (Eq, Ord, Show, Read, Enum, Num, Bounded)
+
+-- | This data structure contains information about the number of character positions traversed
+-- during a function evaluation. It is returned by 'moveByCharWrap', 'deleteCharsWrap', and
+-- 'insertString'. It counts both actual characters and "logical characters". A "logical character"
+-- is a unit counted in a way that treats multiple-character line breaks like "\r\n" or "\n\r" as a
+-- single unit. The function 'textLineWeight' and 'lineEditorWeight' return the logical character
+-- counts contained within their respective data structures. If you document is defined such that
+-- all line breaking characters in your document must be "\n", then 'logicalCharCount' will always
+-- be equal to 'actualCharCount'.
+--
+-- For example, if you set the 'TextBuffer's 'bufferLineBreaker' field to 'lineBreakerNLCR':
+-- (@bufferLineBreaker .= lineBreakerNLCR@) and then evaluate 'insertString' on the string
+-- @"\\r\\n\\r\\n\\r\\n"@, the 'insertString' function will return a count of 3 for the
+-- 'logicalCharCount' and a count of 6 for the 'actualCharCount'.
+data CharStats
+  = CharStats
+    { logicalCharCount :: !CharWeight
+      -- ^ This is the number of logical characters inserted\/traversed\/deleted. 
+    , actualCharCount  :: !(Relative CharIndex)
+      -- ^ This is the number of actual characters inserted\/traversed\/deleted.
+    }
 
 instance Bounded (Absolute CharIndex) where
   minBound = Absolute $ CharIndex 1
@@ -1823,7 +1851,7 @@ copyCharsToEnd
   => RelativeToCursor -> EditLine tags m (TextLine tags)
 copyCharsToEnd rel =
   (case rel of { Before -> negate; After -> id; }) <$> getElemCount rel >>=
-  copyChars . countToChar
+  copyChars . countToChar  
 
 -- | Create a 'TextLine' by copying the the characters in the given range from the line under the
 -- cursor.
@@ -2117,7 +2145,7 @@ moveByCharWrap
   :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
      )
-  => Relative CharIndex -> editor tags m TextLocation
+  => CharWeight -> editor tags m TextLocation
 moveByCharWrap = error "TODO: implement 'moveByCharWrap'"
 
 -- | Go to an absolute line number, the first line is 1 (line 0 and below all send the cursor to
@@ -2193,8 +2221,10 @@ deleteChars (Relative (CharIndex n)) =
     return count
   else return 0
 
--- | This function deletes characters starting from the cursor, and if the number of characters to
--- be deleted exceeds the number of characters in the current line, characters are deleted from
+-- | This function deletes characters starting from the cursor and returns the exact number of
+-- characters deleted (not the amount of 'textLineWeight' that was deleted) paired with the
+-- 'CharWeight' of characters that were actually deleted, and if the number of characters to be
+-- deleted exceeds the number of characters in the current line, characters are deleted from
 -- adjacent lines such that the travel of deletion wraps to the end of the prior line or the
 -- beginning of the next line, depending on the direction of travel.
 deleteCharsWrap
