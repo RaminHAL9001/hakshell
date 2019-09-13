@@ -1235,7 +1235,16 @@ getUnusedSpace :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem) => m In
 getUnusedSpace = subtract <$> countElems <*> getAllocSize
 
 -- Returns a cursor index, although the index may NOT necessarily be pointing to a valid
--- element. This function is defined as the value returned by 'getElemCount' subtracted by 1 for
+-- element. Evaluating this function with a value of 'Before' as the argument is the canonical way
+-- of getting the current cursor index, and is used in this way throughout this module, even for
+-- user-facing functions.
+--
+-- However evaluating this function with a value of 'After' as the argument __MUST_NOT__ be used to
+-- return a value from a user-facing function because the this value is an index into the vector
+-- that has no meaning to end-users who should not ever know or care about the actual indicies to
+-- which the logical line indicies are mapped.
+--
+-- This function is defined as the value returned by 'getElemCount' subtracted by 1 for
 -- elements before the cursor (because the 'getElemCount' is always pointing at the undefined vector
 -- index just after the element that is considered to be "under" the cursor). The element after the
 -- cursor is the first element after the contiguous gap of undefined elements in the vector. If
@@ -1248,8 +1257,12 @@ cursorIndex rel = case rel of
   Before -> subtract 1 <$> getElemCount Before
   After  -> subtract <$> getElemCount After <*> getAllocSize
 
--- Like 'cursorIndex', but evaluates to 'throwLimitErr' if the 'RelativeToCursor' value given is
--- 'After' and there are no elements after the cursor.
+-- Like 'cursorIndex', but evaluates to 'throwLimitErr' if the value __returned__ by 'cursorIndex'
+-- is out-of-bounds. __NOTE__ that this function checks the return value, not the input value which
+-- is always valid. The reason for this is because this function is usually used by functions that
+-- get the index after a cursor motion (like 'pushElem' and 'popElem') which want to return a
+-- bounds-checking exception if a value under the cursor is used when the cursor has moved to the
+-- very start or very end of the vector.
 cursorIndexChk
   :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem)
   => RelativeToCursor -> m Int
@@ -1736,7 +1749,7 @@ currentLineNumber
      , Show tags --DEBUG
      )
   => editor tags m (Absolute LineIndex)
-currentLineNumber = liftEditText $ indexToLine <$> cursorIndexChk Before
+currentLineNumber = liftEditText $ indexToLine <$> cursorIndex Before
 
 -- | Get the current column number of the cursor.
 currentColumnNumber
