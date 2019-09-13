@@ -265,6 +265,8 @@ import qualified Data.Vector.Generic.Mutable as GMVec
 import qualified Data.Vector.Unboxed.Mutable as UMVec
 import           Data.Word
 
+import Debug.Trace
+
 ----------------------------------------------------------------------------------------------------
 
 -- Programmer notes:
@@ -1845,7 +1847,7 @@ reloadLineEditor
      , Show tags --DEBUG
      )
   => editor tags m ()
-reloadLineEditor = liftEditText $ currentLineNumber >>= getLineIndex >>= reloadLineEditorWith
+reloadLineEditor = liftEditText $ getElem Before >>= reloadLineEditorWith
 
 -- | Like 'reloadLineEditor', but replaces the content in the 'bufferLineEditor' with the content in
 -- a given 'TextLine', rather the content of the current line.
@@ -1940,7 +1942,7 @@ flushLineEditor
   => editor tags m (TextLine tags)
 flushLineEditor = liftEditText $ do
   clean <- use $ bufferLineEditor . lineEditorIsClean
-  if clean then currentLineNumber >>= getLineIndex else do
+  if clean then getElem Before else do
     line <- editLine copyLineEditor'
     putElem Before line
     bufferLineEditor . lineEditorIsClean .= True
@@ -2100,7 +2102,8 @@ gotoLine ln0 = liftEditText $ do
   let ln = lineToIndex ln0
   before <- getElemCount Before
   count  <- countElems
-  moveByLine $ countToLine $ max 1 (min ln count) - before
+  --traceM $ "gotoLine ("++show ln0++"): ln="++show ln++", before="++show before++", count="++show count
+  moveByLine $ countToLine $ max 0 (min ln count) - before
   use bufferTargetCol >>= gotoChar
 
 -- | Go to an absolute character (column) number, the first character is 1 (character 0 and below
@@ -2371,13 +2374,13 @@ lineIndex = lens theLocationLineIndex $ \ a b -> a{ theLocationLineIndex = b }
 charIndex :: Lens' TextLocation (Absolute CharIndex)
 charIndex = lens theLocationCharIndex $ \ a b -> a{ theLocationCharIndex = b }
 
--- | Get the current position of the cursor.
+-- | Get the current position of the cursor. This function is identical to 'currentTextLocation'.
 getPosition
   :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
      )
   => editor tags m TextLocation
-getPosition = liftEditText $ TextLocation <$> currentLineNumber <*> use bufferColumn
+getPosition = currentTextLocation
 
 -- | This function calls 'gotoLine' and then 'gotoChar' to move the cursor to an absolute a line
 -- number and characters (column) number.
@@ -2400,8 +2403,8 @@ saveCursorEval
      )
   => editor tags m a -> editor tags m a
 saveCursorEval f = do
-  (cur, a) <- (,) <$> getPosition <*> f
-  gotoPosition cur >> return a
+  (cur, a) <- (,) <$> currentLineNumber <*> f
+  liftEditText (gotoLine cur) >> return a
 
 class RelativeToAbsoluteCursor index editor | editor -> index where
   -- | Convert a 'Relative' index (either a 'LineIndex' or 'CharIndex') to an 'Absolute' index.

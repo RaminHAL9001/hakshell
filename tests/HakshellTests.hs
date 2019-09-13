@@ -298,7 +298,7 @@ cursorMotionTests = describe "testing cursor motion" $ testWithGrid $ \ buf -> d
             expct = splitAt (charToIndex char) $ gridLines !! lineToIndex line
         in it ("*** gotoPosition ("++show loc++")") $
            ( ed buf $ flushReset (gotoPosition loc) >>
-               (,) <$> getPosition <*> editLine
+               (,) <$> (getPosition <* debugPrintBuffer) <*> editLine
                ((,) <$> (unpack <$> copyCharsToEnd Before) <*> (unpack <$> copyCharsToEnd After))
            ) `shouldReturn` (loc, expct)
   go (mkLoc 16 24)
