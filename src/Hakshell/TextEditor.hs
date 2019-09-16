@@ -382,9 +382,12 @@ newtype CharUnitCount = CharUnitCount Int
 data CharStats
   = CharStats
     { logicalCharCount :: !CharUnitCount
-      -- ^ This is the number of logical characters inserted\/traversed\/deleted. 
+      -- ^ This is the number of logical characters inserted\/traversed\/deleted. Use this value if
+      -- you need to perform another operation (e.g. a deletion or cursor motion) with the exact
+      -- same number of logical characters.
     , actualCharCount  :: !(Relative CharIndex)
-      -- ^ This is the number of actual characters inserted\/traversed\/deleted.
+      -- ^ This is the number of actual characters inserted\/traversed\/deleted. Use this value if
+      -- you need an accurate accounting of the amount of data has been traversed or altered.
     }
 
 instance Bounded (Absolute CharIndex) where
@@ -2213,7 +2216,7 @@ deleteChars
   => Relative CharIndex -> editor tags m (Relative CharIndex)
 deleteChars (Relative (CharIndex n)) =
   liftEditLine $ fmap (Relative . CharIndex) $
-  if n < 0 then do -- TODO: de-duplicate
+  if n < 0 then do -- TODO: make this code less copy-pastey
     before <- getElemCount Before
     let count = negate $ min before $ abs n 
     modCount Before $ const $ before + count
@@ -2228,6 +2231,7 @@ deleteChars (Relative (CharIndex n)) =
     return count
   else return 0
 
+
 -- | This function deletes the given number of /actual/ characters (as opposed to /virtual/
 -- characters) starting from the cursor and returns the exact number of characters deleted, and if
 -- the number of characters to be deleted exceeds the number of characters in the current line,
@@ -2239,25 +2243,26 @@ deleteChars (Relative (CharIndex n)) =
 deleteCharsWrap
   :: ( MonadIO m
      , Show tags --DEBUG
-     ) => Relative CharIndex -> EditText tags m (Relative CharIndex)
+     )
+  => Relative CharIndex -> EditText tags m (Relative CharIndex) -- TODO: return CharStats
 deleteCharsWrap request =
   if request == 0 then return 0 else
   let direction = if request < 0 then Before else After in
   -- First, delete the chararacters in the line editor, see if that satisfies the request...
   deleteChars request >>= \ delcount ->
-  if safeAbs delcount >= safeAbs request then return delcount else
+  if delcount >= safeAbs request then return delcount else
   -- otherwise ues 'forLines' to delete each line until the request has been satsified.
   fmap snd $ forLines direction (safeAbs request + delcount, delcount) $ \ halt line ->
     get >>= \ st@(request, delcount) ->
     if request <= 0 then halt st else
     let weight = countToChar $ textLineUnitCount line in
-    if weight <= request then
-      put (request - weight, delcount - countToChar (intSize line)) >> return []
+    if weight <= request
+     then put (request - weight, delcount - countToChar (intSize line)) >> return []
      else do
       case direction of
         Before -> do
           let len = countToChar (intSize line) - weight -
-                    fromIntegral (theTextLineBreakSize line) + 1
+                      fromIntegral (theTextLineBreakSize line) + 1
           liftEditLine $ pushElemVec After $
             UVec.slice 0 (charToCount len) $ theTextLineString line
           put (request - weight, delcount - len)
@@ -2274,7 +2279,7 @@ deleteCharsWrap request =
 deleteByUnit
   :: ( MonadIO m
      , Show tags --DEBUG
-     ) => Relative CharIndex -> EditText tags m (Relative CharIndex)
+     ) => CharUnitCount -> EditText tags m CharStats
 deleteByUnit _request = error "TODO: deleteByUnit"
 
 -- | This function evaluates the 'lineBreaker' function on the given string, and beginning from the
@@ -2321,7 +2326,7 @@ forLinesLoop
   -> Int -> RelativeToCursor -> EditText tags m fold
 forLinesLoop fold f count dir = execFoldMapLines (callCC $ loop count) fold where
   loop count halt = if count <= 0 then get else
-    liftEditText (popElem dir) >>= f halt >>= mapM_ (pushElem $ opposite dir) >>
+    liftEditText (popElem dir) >>= f halt >>= mapM_ (pushElem (opposite dir)) >>
     loop (count - 1) halt
 
 -- | This function moves the cursor to the first @'Absolute' 'LineIndex'@ parameter given, then
@@ -2612,8 +2617,11 @@ textView
      )
   => TextLocation -> TextLocation -> editor tags m (TextView tags)
 textView from to = liftEditText $ do
-  (from, to) <- pure (min from to, max from to)
   nmax <- countElems
+  (from, to) <- pure
+    ( min from to & lineIndex %~ max 1
+    , max from to & lineIndex %~ min (indexToLine $ nmax - 1)
+    )
   if nmax <= 0 || from == to then return emptyTextView else do
     let unline = lineToIndex . theLocationLineIndex
     let (lo, hi) = (unline from, unline to)
