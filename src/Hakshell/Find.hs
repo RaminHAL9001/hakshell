@@ -2,6 +2,31 @@
 -- different behavior: 'find' is the most common, which recursively searches a list of directories
 -- piped into it, and the content of each directory is dumped into an output pipe. You can then bind
 -- the result additional filters that accept or reject each entry.
+--
+-- Here is a simple example of how you might perform a search for files in two different
+-- directories, ".\/developer-docs" and ".\/user-manual" for all files named "index.html" or files
+-- named "README.md", with the following 5-line function:
+--
+-- @
+-- 'Hakshell.Pipe.values' [".\/developer-docs", ".\/user-manual"]
+--     $ 'search' 'safe'
+--         ([ 'file' '<>' 'isNamed' "index.html"
+--          , 'file' '<>' 'isNamed' "README.md"] '?->' 'match')
+--     $ return
+-- @
+--
+-- The 'values' above is a function in the "Hakshell.Pipe" module which can pipe a list of values to
+-- the next function in the chain, which is the 'search' function.
+--
+-- The 'search' function is given a higher-order function '?->' which takes a pattern
+-- @['file' '<>' 'isNamed' "index.html", 'file' '<>' 'isNamed' "README.md"]@
+-- and a decision function, 'match'. (Other decision functions are 'noMatch', 'matchPrune', and
+-- 'prune'). The 'search' function will recurse through the directories given by
+-- 'Hakshell.Pipe.values' and passes all files matching the pattern @['file', 'isNamed'
+-- "index.html"]@ and pipes them to the next step in the chain, which is the 'return' function.
+--
+-- With the 'return' function being the final step in the chain, this entire 5-line function will
+-- return all files that match the pattern.
 module Hakshell.Find
   ( -- * Executing a Filesystem Query
 
@@ -58,11 +83,11 @@ module Hakshell.Find
 
     -- * Querying the Filesystem
 
-    FileMatchResult(..), prune, noMatch, matchPrune, match,
+    DecideFileMatch(..), prune, noMatch, matchPrune, match,
 
     -- *** Lenses on 'FileMatchResult's.
 
-    fileMatchStepInto, fileMatchYield, fileMatchResult,
+    fileMatchStepInto, fileMatchYield, decideFileMatch,
 
     -- ** Deciding which files match
     --
@@ -353,8 +378,8 @@ isNamed = fNamePredicate . (==)
 -- control the behavior of the query after a file matches or does not match.
 --
 -- The 'ftest' function
-data FileMatchResult a
-  = FileMatchResult
+data DecideFileMatch a
+  = DecideFileMatch
     { theFileMatchStepInto :: !Bool
       -- ^ If this file match is scrutinizing a directory, the 'search' function must decide whether
       -- to step into this directory (depth first), set this value to tell 'search' whether or not
@@ -368,42 +393,42 @@ data FileMatchResult a
 
 -- | This function is used within a 'FileMatcher' function. Do not output a value, do not step into
 -- this subdirectory if the current match is scrutinizing a subdirectory,
-prune :: Applicative m => m (FileMatchResult a)
-prune = pure $ FileMatchResult False Nothing empty
+prune :: Applicative m => m (DecideFileMatch a)
+prune = pure $ DecideFileMatch False Nothing empty
 
 -- | This function is used within a 'FileMatcher' function. Do not output any value, but do step
 -- into this subdirectory if the current match is scrutinizing a subdirectory. This is the default
 -- behavior for the 'ftest' function.
-noMatch :: Applicative m => m (FileMatchResult a)
-noMatch = pure $ FileMatchResult True Nothing empty
+noMatch :: Applicative m => m (DecideFileMatch a)
+noMatch = pure $ DecideFileMatch True Nothing empty
 
 -- | Output the file being scrutinized, but do not step into this subdirectory if the current match
 -- is scrutinizing a subdirectory.
-matchPrune :: FileMatcher st (FileMatchResult FPath)
-matchPrune = FileMatchResult False Nothing . pure <$> fullPath
+matchPrune :: FileMatcher st (DecideFileMatch FPath)
+matchPrune = DecideFileMatch False Nothing . pure <$> fullPath
 
 -- | Output the file being scrutinized, and do step into this subdirectory if the current match is
 -- scrutinizing a subdirectory.
-match :: FileMatcher st (FileMatchResult FSNode)
-match = FileMatchResult True Nothing . pure <$> fileNode
+match :: FileMatcher st (DecideFileMatch FSNode)
+match = DecideFileMatch True Nothing . pure <$> fileNode
 
 -- | If this file match is scrutinizing a directory, the 'search' function must decide whether to
 -- step into this directory (depth first), set this value to tell 'search' whether or not to do
 -- so. Setting this value to 'False' will prune the directory under scrutiny from recursively being
 -- 'search'ed.
-fileMatchStepInto :: Lens' (FileMatchResult a) Bool
+fileMatchStepInto :: Lens' (DecideFileMatch a) Bool
 fileMatchStepInto = lens theFileMatchStepInto $ \ a b -> a{ theFileMatchStepInto = b }
 
-fileMatchYield :: Lens' (FileMatchResult a) (Pipe a)
+fileMatchYield :: Lens' (DecideFileMatch a) (Pipe a)
 fileMatchYield = lens theFileMatchYield $ \ a b -> a{ theFileMatchYield = b }
 
-fileMatchMaxDepth :: Lens' (FileMatchResult a) (Maybe SearchDepth)
+fileMatchMaxDepth :: Lens' (DecideFileMatch a) (Maybe SearchDepth)
 fileMatchMaxDepth = lens theFileMatchMaxDepth $ \ a b -> a{ theFileMatchMaxDepth = b }
 
 -- | Construct a default 'FileMatch' value, the default behavior is to set the 'fileMatchStepInto'
 -- value to 'True'.
-fileMatchResult :: Pipe a -> FileMatchResult a
-fileMatchResult = FileMatchResult True Nothing
+decideFileMatch :: Pipe a -> DecideFileMatch a
+decideFileMatch = DecideFileMatch True Nothing
 
 ----------------------------------------------------------------------------------------------------
 
@@ -603,12 +628,12 @@ instance MonadPipe (FSFoldMap cr st) where
 data FTest st a
   = FTest
     { fTestPredicate :: [FSNodeTest st]
-    , fTestDecision  :: FileMatcher st (FileMatchResult a)
+    , fTestDecision  :: FileMatcher st (DecideFileMatch a)
     }
   deriving Functor
 infixl 4 `FTest`
 
-(?->) :: [FSNodeTest st] -> FileMatcher st (FileMatchResult a) -> FTest st a
+(?->) :: [FSNodeTest st] -> FileMatcher st (DecideFileMatch a) -> FTest st a
 (?->) = FTest
 infixl 4 ?->
 
@@ -619,7 +644,7 @@ infixl 4 ?->
 -- 'FileMatcher' function, if the 'FSNodeTest' succeeds, evaluate the given 'FileMatcher' action.
 runFTest
   :: FTest st file -> FSearchState st
-  -> FSFoldMap cr st (Maybe (FileMatchResult file), FSearchState st)
+  -> FSFoldMap cr st (Maybe (DecideFileMatch file), FSearchState st)
 runFTest test st = liftIO $ flip runFileMatcher st $ foldr
   (\ p next ->
     ( evalFSNodeTest p >>= flip ifM empty
@@ -671,11 +696,12 @@ safeErr catcher f dir = do
   let loop = liftIO (try $ readDirStream stream) >>= \ case
         Right file ->
           if null file
-          then empty {- ERROR? closeDirStream not called? Test on "/usr/local/share" -}
-          else f dir (pack file) <|> loop
+           then liftIO (try $ closeDirStream stream) >>= \ case
+            Right () -> empty
+            Left err -> catcher dir err
+           else f dir (pack file) <|> loop
         Left   err -> catcher dir err <|> loop
-  FSFoldMap $ ContT $ \ next -> StateT $ \ st ->
-    runFSFoldMap loop next st `finally` closeDirStream stream
+  FSFoldMap $ ContT $ \ next -> StateT $ \ st -> runFSFoldMap loop next st
 
 -- | Same as 'safeErr' except 'IOExceptions' that occur while reading the directory are printed to
 -- 'stderr' and then ignored. This function is simply 'safeErr' with 'defaultMapDirErrHandler'
@@ -700,12 +726,12 @@ fastErr catcher f dir = do
         Left   err -> catcher dir err >>= \ a -> buffer (results <|> pure a) stack
         Right file ->
           if null file then return (results, stack) else buffer results (pack file : stack)
-                        -- TODO: consider using a Vector buffer instead of a list
+      -- TODO: consider using a Vector buffer instead of a list
   let loop = \ case
-        []         -> empty
+        []         -> liftIO (closeDirStream stream) >> empty
         file:stack -> f dir file <|> loop stack
   (results, stack) <- FSFoldMap $ ContT $ \ next -> StateT $ \ st ->
-    runFSFoldMap (buffer empty []) next st `finally` closeDirStream stream
+    runFSFoldMap (buffer empty []) next st
   loop stack <|> yield results
 
 -- | Same as 'safeErr' except 'IOExceptions' that occur while reading the directory are printed to
