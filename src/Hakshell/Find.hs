@@ -544,7 +544,7 @@ fileStatus = viewSearchEnv searchFileStatusLens >>= flip maybe return
 -- | Obtain an 'FSNode' for the current file being scrutinized.
 fileNode :: FileMatcher st FSNode
 fileNode = FSNode
-  <$> (pack . foldr (</>) "" . fmap unpack <$> searchPath)
+  <$> (pack . foldl (flip (</>)) "" . fmap unpack <$> searchPath)
   <*> fileName
   <*> fileStatus
 
@@ -726,7 +726,8 @@ fastErr catcher f dir = do
         Left   err -> catcher dir err >>= \ a -> buffer (results <|> pure a) stack
         Right file ->
           if null file then return (results, stack) else buffer results (pack file : stack)
-      -- TODO: consider using a Vector buffer instead of a list
+      -- TODO: 1. consider using a Vector buffer instead of a list
+      -- TODO: 2. ordering of output directories is unexpected compared to that of 'safeErr'
   let loop = \ case
         []         -> liftIO (closeDirStream stream) >> empty
         file:stack -> f dir file <|> loop stack
