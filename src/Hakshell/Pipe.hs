@@ -163,12 +163,8 @@ instance Traversable Pipe where
   traverse f (Pipe a) = Pipe <$> traverse f a
   sequenceA (Pipe a) = Pipe <$> sequenceA a
 
-instance Semigroup a => Semigroup (Pipe a) where
-  a <> b = (<>) <$> a <*> b
-
-instance Monoid a => Monoid (Pipe a) where
-  mempty = empty
-  mappend a b = mappend <$> a <*> b
+instance Semigroup (Pipe a) where { (Pipe a) <> (Pipe b) = Pipe $ a <> b; }
+instance Monoid (Pipe a) where { mempty = Pipe empty; mappend = (<>); }
 
 class PipeLike thing where { pipe :: thing a -> Pipe a; }
 instance PipeLike [] where { pipe = Pipe . Seq.fromList; }

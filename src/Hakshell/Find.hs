@@ -39,7 +39,7 @@ module Hakshell.Find
     --
     -- A string-like data type for representing filesystem path values.
 
-    FPath(..), pwd,
+    FPath(..), pwd, cd,
 
     -- ** 'FPathList'
     --
@@ -106,6 +106,9 @@ module Hakshell.Find
 
     SearchDepth(..),
 
+    -- * Stream editing
+    sed,
+
   ) where
 
 import           Hakshell.Pipe
@@ -129,7 +132,7 @@ import           System.Directory
 import           System.FilePath( (</>) )
 import           System.IO
 import           System.Posix.Directory
-                 ( openDirStream, readDirStream, closeDirStream
+                 ( openDirStream, readDirStream, closeDirStream, changeWorkingDirectory
                  )
 import           System.Posix.Files
                  ( FileStatus, fileID, getFileStatus
@@ -166,6 +169,9 @@ instance Unpackable FPath where { unpack (FPath vec) = unpack vec; }
 -- | Create an 'FPath' from the current working directory.
 pwd :: IO FPath
 pwd = FPath . pack <$> getCurrentDirectory
+
+cd :: FPath -> IO ()
+cd = changeWorkingDirectory . unpack
 
 ----------------------------------------------------------------------------------------------------
 
@@ -798,3 +804,21 @@ foldMapFS mapDir test st final cont paths = runFSFoldMap
           get >>= flip (searchLoop mapDir test (FSFoldMapHalt halt)) cont . initFSearchState path
       ) >>= yield
   ) return st >>= uncurry final
+
+----------------------------------------------------------------------------------------------------
+
+type SedHalt void m a = Pipe a -> ContT (Pipe a) m void
+
+-- | Stream edit: this function opens a file path and breaks the content of it into lines of
+-- text. You can then apply a function to the lines of text, and either return the line in it's
+-- present form or not.
+sed :: forall void m a . MonadIO m
+    => (SedHalt void m a -> String -> ContT (Pipe a) m (Pipe a)) -> FPath -> m (Pipe a)
+sed f path =
+  liftIO (openFile (unpack path) ReadMode >>= hGetContents) >>= \ content ->
+  runContT (callCC $ \ halt -> loop empty (lines content) halt) return
+  where
+    loop :: MonadIO m => Pipe a -> [String] -> SedHalt void m a -> ContT (Pipe a) m (Pipe a)
+    loop pip0 lns halt = case lns of
+      []      -> return pip0
+      ln:more -> f (halt . mappend pip0) ln >>= \ pip1 -> loop (pip0 <|> pip1) more halt
