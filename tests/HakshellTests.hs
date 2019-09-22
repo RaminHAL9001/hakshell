@@ -206,9 +206,9 @@ dropChars i = if i <= 0 then id else \ case
   "":lines         -> dropChars i lines -- <-- DO NOT subtract 1 from i here.
   (_c:chars):lines -> (dropChars $! i - 1) (chars : lines)
 
-deleteStrings :: TextLocation -> Relative CharIndex -> [String] -> [String]
+deleteStrings :: TextLocation -> CharUnitCount -> [String] -> [String]
 deleteStrings (TextLocation{theLocationLineIndex=line,theLocationCharIndex=char}) len =
-  let count = charToCount len in
+  let count = unwrapCharUnitCount len in
   if count == 0 then id else
     gotoListItem (lineToIndex line) [] $ \ revLines fwdLines ->
     let chidx = charToIndex char in
@@ -335,8 +335,8 @@ textDeletionTests = describe "text deletion tests" $ testWithGrid $ \ buf ->
             deleteCharsWrap len
             Lines info . fmap fst . textViewToStrings <$>
               textView (mkLoc minBound minBound) (mkLoc maxBound maxBound)
-    del (mkLoc 16 24) (-24)
-    del (mkLoc 16  1)  (24)
+    del (mkLoc 16 25) (-24)
+    del (mkLoc 16  1)  (25)
     del (mkLoc 14  1)  (49)
     del (mkLoc 13 48) (-49)
     del (mkLoc 12 24) (-49)

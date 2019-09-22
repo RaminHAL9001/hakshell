@@ -66,7 +66,7 @@ module Hakshell.TextEditor
     -- by evaluating a function of type 'EditLine' with the 'editLine' function.
 
     TextLine, emptyTextLine, nullTextLine, textLineUnitCount,
-    textLineTop, textLineIsUndefined, sliceLine, sliceLineToEnd,
+    textLineTop, textLineIsUndefined, sliceLine, sliceLineToEnd, splitLineAt,
 
     -- *** 'TextLine' lenses
 
@@ -77,8 +77,8 @@ module Hakshell.TextEditor
     -- A 'TextBuffer' can be created with 'newTextBuffer', and then edited by evaluating a function
     -- of type 'EditText' on it with the 'runEditTextIO' function. You typically fill a 'TextBuffer'
     -- with a "String" using 'insertString'. A 'TextBuffer' contains a cursor which you can move
-    -- around using the 'gotoChar', 'moveByChar', and 'moveByUnit' functions. Text is deleted with
-    -- the 'deleteCharsWrap' and 'deleteByUnit' functions.
+    -- around using the 'gotoChar', 'moveByChar', functions. Text is deleted with the
+    -- 'deleteCharsWrap' functions.
 
     TextBuffer, newTextBuffer, copyTextBuffer,
 
@@ -103,7 +103,7 @@ module Hakshell.TextEditor
 
     EditText, runEditTextIO, runEditTextOnCopy,
 
-    insertString, lineBreak, deleteCharsWrap, deleteByUnit,
+    insertString, lineBreak, deleteCharsWrap,
     pushLine, popLine, currentTextLocation, currentLineNumber, currentColumnNumber,
     getLineIndex, putLineIndex, withCurrentLine,
     bufferLineCount, bufferIsEmpty,
@@ -142,12 +142,12 @@ module Hakshell.TextEditor
 
     Absolute(..),  LineIndex(..), CharIndex(..), TextLocation(..),
     CharUnitCount(..), CharStats(..),
-    shiftAbsolute, diffAbsolute,
+    shiftAbsolute, diffAbsolute, unwrapCharUnitCount,
     lineToIndex, charToIndex, indexToLine, indexToChar,
 
     -- *** Moving the cursor relative to the cursor
 
-    moveCursor, moveByLine, moveByChar, moveByCharWrap, moveByUnit,
+    moveCursor, moveByLine, moveByChar, moveByCharWrap,
 
     Relative(..), RelativeToCursor(..),
     RelativeToAbsoluteCursor, -- <- does not export members
@@ -365,15 +365,19 @@ newtype CharIndex = CharIndex Int
 -- of logical characters using a value of this type.
 newtype CharUnitCount = CharUnitCount Int
   deriving (Eq, Ord, Show, Read, Enum, Num, Bounded)
+-- TODO: rename this to 'CursorStepCount' everywhere.
+
+unwrapCharUnitCount :: CharUnitCount -> Int
+unwrapCharUnitCount (CharUnitCount o) = o
 
 -- | This data structure contains information about the number of character positions traversed
 -- during a function evaluation. Values of this type are returned by 'insertString',
--- 'deleteCharsWrap', and 'deleteByUnit'. It counts both actual characters and "logical
--- characters". A "logical character" is a unit counted in a way that treats multiple-character line
--- breaks like "\r\n" or "\n\r" as a single unit. The function 'textLineUnitCount' and
--- 'lineEditorUnitCount' return the logical character counts contained within their respective data
--- structures. If you document is defined such that all line breaking characters in your document
--- must be "\n", then 'logicalCharCount' will always be equal to 'actualCharCount'.
+-- 'deleteCharsWrap'. It counts both actual characters and "logical characters". A "logical
+-- character" is a unit counted in a way that treats multiple-character line breaks like "\r\n" or
+-- "\n\r" as a single unit. The function 'textLineUnitCount' and 'lineEditorUnitCount' return the
+-- logical character counts contained within their respective data structures. If you document is
+-- defined such that all line breaking characters in your document must be "\n", then
+-- 'logicalCharCount' will always be equal to 'actualCharCount'.
 --
 -- For example, if you set the 'TextBuffer's 'bufferLineBreaker' field to 'lineBreakerNLCR':
 -- (@bufferLineBreaker .= lineBreakerNLCR@) and then evaluate 'insertString' on the string
@@ -859,10 +863,29 @@ sliceLineToEnd rel i = \ case
   line -> check $ slice line where
     slice = case rel of
       Before -> sliceLine 0 $ Relative $ CharIndex $ charToIndex i
-      After  -> sliceLine i $ Relative $ CharIndex $ textLineUnitCount line - charToIndex i
+      After  -> sliceLine i $ Relative $ CharIndex $
+                  unwrapCharUnitCount (textLineUnitCount line) - charToIndex i
     check = \ case
       Left  err    -> error $ "sliceLineToEnd: internal error, "++show err
       Right result -> result
+
+splitLineAt
+  ::
+    (Show tags) => --DEBUG
+    Absolute CharIndex -> TextLine tags -> (TextLine tags, TextLine tags)
+splitLineAt i line = case line of
+  TextLineUndefined -> error $ "splitLineAt ("++show i++") on undefined line"
+  _ -> if i >= super then (line, empty) else if i < 1 then (empty, line) else
+    ( TextLine{ theTextLineString = before, theTextLineBreakSize = 0     , theTextLineTags = tags }
+    , TextLine{ theTextLineString = after , theTextLineBreakSize = lbrksz, theTextLineTags = tags }
+    ) where
+      str    = theTextLineString line
+      top    = textLineTop line
+      super  = indexToChar $ UVec.length str
+      tags   = theTextLineTags line
+      empty  = emptyTextLine tags
+      lbrksz = theTextLineBreakSize line
+      (before, after) = UVec.splitAt (charToIndex $ min i $ top + 1) str
 
 -- | Cut the string within a 'TextLine' into a smaller substring.
 sliceLine
@@ -878,7 +901,7 @@ sliceLine i0 reqsiz0 = \ case
         reqsiz = charToCount reqsiz0
         sum    = start + reqsiz
         len    = UVec.length vec
-        weight = textLineUnitCount line
+        weight = unwrapCharUnitCount $ textLineUnitCount line
         start  = min i sum
         top    = max i sum
         lbrksz = fromIntegral $ theTextLineBreakSize line
@@ -911,8 +934,8 @@ textLineIsUndefined = \ case { TextLineUndefined -> True; _ -> False; }
 -- 'textLineUnitCount' metric, which always treats all line breaking characters as a single unit. If
 -- there are no line breaking characters, or if there is only one line breaking character, the
 -- 'textLineUnitCount' is identical to the value given by 'intSize'.
-textLineUnitCount :: TextLine tags -> Int
-textLineUnitCount line = intSize line - breaksize + min 1 (max 0 breaksize) where
+textLineUnitCount :: TextLine tags -> CharUnitCount
+textLineUnitCount line = CharUnitCount $ intSize line - breaksize + min 1 (max 0 breaksize) where
   breaksize = fromIntegral $ theTextLineBreakSize line
 
 -- | Return index of the top-most non-line-breaking character. The size of the string not including
@@ -1062,8 +1085,9 @@ lineEditorCharCount :: LineEditor tags -> Relative CharIndex
 lineEditorCharCount ed = countToChar $ theCharsBeforeCursor ed + theCharsAfterCursor ed
 
 -- | This funcion returns the same value as 'textLineUnitCount' but for a 'LineEditor'.
-lineEditorUnitCount :: LineEditor tags -> Relative CharIndex
-lineEditorUnitCount ed = lineEditorCharCount ed - fromIntegral (theCursorBreakSize ed)
+lineEditorUnitCount :: LineEditor tags -> CharUnitCount
+lineEditorUnitCount ed = CharUnitCount $
+  charToCount (lineEditorCharCount ed) - fromIntegral (theCursorBreakSize ed)
 
 -- | Gets the 'lineEditorCharCount' value for the current 'LineEditor'.
 getLineCharCount
@@ -1078,7 +1102,7 @@ getUnitCount
   :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
      )
-  => editor tags m (Relative CharIndex)
+  => editor tags m CharUnitCount
 getUnitCount = liftEditText $ lineEditorUnitCount <$> use bufferLineEditor
 
 -- | Create a new 'LineEditor' by copying the line under the given 'TextLocation' point. The
@@ -1252,7 +1276,7 @@ getVector = modVector id
 
 -- Returns the number of valid elements on or 'Before' the cursor, or 'After' the cursor.
 getElemCount :: MonadEditVec vec m => RelativeToCursor -> m Int
-getElemCount = flip modCount id
+getElemCount = flip modCount id -- TODO: rename to 'getElemCountFrom'
 
 -- The size of the buffer allocation
 getAllocSize :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem) => m Int
@@ -1260,7 +1284,7 @@ getAllocSize = GMVec.length <$> getVector
 
 -- The number of valid elements in the buffer @('getElemCount' 'Before' + 'getElemCount' 'After')@.
 countElems :: MonadEditVec vec m => m Int
-countElems = (+) <$> getElemCount Before <*> getElemCount After
+countElems = (+) <$> getElemCount Before <*> getElemCount After -- TODO: rename to 'getElemCount'
 
 -- The number of elements in the buffer that are not valid, @(bufAllocSize - bufLineCount)@
 getUnusedSpace :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem) => m Int
@@ -1302,6 +1326,17 @@ cursorIndexChk rel = do
   siz <- getAllocSize
   i   <- cursorIndex rel
   if 0 <= i && i < siz then return i else throwLimitErr rel
+
+-- A predicate checking if the cursor is currently at the beginning or end of the buffer. This is to
+-- be used as a check before evaluating 'popElem' to be sure 'popElem' will not evaluate to an
+-- exception.
+cursorAtEnd
+  :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem)
+  => RelativeToCursor -> m Bool
+cursorAtEnd rel = do
+  siz <- getAllocSize
+  i   <- cursorIndex rel
+  return $ case rel of { Before -> i <= 0; After -> i + 1 >= siz; }
 
 -- Get the index within the vector that is associated with the given 'LineIndex'. Bounds checking is
 -- performed.
@@ -2135,25 +2170,13 @@ moveByChar count = liftEditText $ do
 
 -- | Like 'moveByChar' but will wrap up to the previous line and continue moving on the
 -- previous/next line if the value is large enough to move the cursor past the start\/end of the
--- line. This function will move by counting an /actual/ number of characters (as opposed to a
--- /logical/ number of characters). To move by a logical number of characters, use 'moveByUnit'.
+-- line.
 moveByCharWrap
   :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
      )
-  => Relative CharIndex -> editor tags m TextLocation
-moveByCharWrap = error "TODO: implement 'moveByCharWrap'"
-
--- | Like 'moveByCharWrap' except this function moves by counting the /logical/ number of characters
--- (as opposed to the /actual/ number of characters. This function will also wrap up to the previous
--- line and continue moving onto the previous/next line if the value is large enough to move the
--- cursor past the start\/end of the line.
-moveByUnit
-  :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
-     , Show tags --DEBUG
-     )
   => CharUnitCount -> editor tags m TextLocation
-moveByUnit = error "TODO: implement 'moveByUnit'"
+moveByCharWrap = error "TODO: implement 'moveByCharWrap'"
 
 -- | Go to an absolute line number, the first line is 1 (line 0 and below all send the cursor to
 -- line 1), the last line is 'Prelude.maxBound'.
@@ -2202,6 +2225,41 @@ insertChar rel c = liftEditText $ Relative . CharIndex <$> do
     bufferLineEditor . lineEditorIsClean .= False
     return 1
 
+-- | Overwite all text before or after the cursor with a 'TextLine'. If 'Before', the line breaking
+-- characters from the given 'TextLine' are ignored, if 'After', the line breaking characters for
+-- the current line are overwritten with the line breaking characters of the given 'TextLine'. Pass
+-- a function of two arguments which combines the tags from (1) the current line editor and (2) the
+-- given 'TextLine'.
+overwriteAtCursor
+  :: MonadIO m
+  => RelativeToCursor
+  -> (tags -> tags -> tags)
+  -> TextLine tags
+  -> EditLine tags m ()
+overwriteAtCursor rel concatTags = \ case
+  TextLineUndefined ->
+    error $ "overwriteAtCursor "++show rel++": received undefined TextLine"
+  TextLine
+   { theTextLineString    = line
+   , theTextLineBreakSize = lbrksz
+   , theTextLineTags      = tagsB
+   } -> do
+    modCount rel $ const 0 -- this "deletes" the chars Before/After the cursor
+    count <- countElems
+    alloc <- getAllocSize
+    let linelen  = UVec.length line
+    let adjusted = linelen - case rel of { Before -> fromIntegral lbrksz; After -> 0; }
+    let diffsize = adjusted + count - alloc
+    when (diffsize > 0) $ growVector diffsize -- this resizes the line editor buffer
+    buf   <- use lineEditBuffer -- new (resized) buffer
+    alloc <- getAllocSize       -- new (resized) allocation value
+    liftIO $ case rel of
+      Before -> UVec.copy (UMVec.slice 0 adjusted buf) (UVec.slice 0 adjusted line)
+      After  -> UVec.copy (UMVec.slice (alloc - adjusted) adjusted buf) line
+    cursorBreakSize .= lbrksz
+    lineEditorIsClean .= False
+    lineEditorTags    %= (`concatTags` tagsB)
+
 -- | This function only deletes characters on the current line, if the cursor is at the start of the
 -- line and you evaluate @'deleteChars' 'Before'@, this function does nothing. The sign of the
 -- 'CharIndex' given will determine the direction of travel for the deletion -- negative will delete
@@ -2213,74 +2271,82 @@ deleteChars
   :: (MonadEditLine editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
      )
-  => Relative CharIndex -> editor tags m (Relative CharIndex)
-deleteChars (Relative (CharIndex n)) =
-  liftEditLine $ fmap (Relative . CharIndex) $
+  => CharUnitCount -> editor tags m CharUnitCount
+deleteChars (CharUnitCount n) =
+  liftEditLine $ fmap CharUnitCount $
   if n < 0 then do -- TODO: make this code less copy-pastey
     before <- getElemCount Before
     let count = negate $ min before $ abs n 
     modCount Before $ const $ before + count
-    when (count > 0) $ lineEditorIsClean .= False
+    when (count /= 0) $ lineEditorIsClean .= False
     return count
   else if n > 0 then do
     lbrksz <- fromIntegral <$> use cursorBreakSize
     after  <- getElemCount After
     let count = negate $ min n $ max 0 $ after - lbrksz
     modCount After $ const $ after + count
-    when (count > 0) $ lineEditorIsClean .= False
+    when (count /= 0) $ lineEditorIsClean .= False
     return count
   else return 0
 
-
--- | This function deletes the given number of /actual/ characters (as opposed to /virtual/
--- characters) starting from the cursor and returns the exact number of characters deleted, and if
--- the number of characters to be deleted exceeds the number of characters in the current line,
--- characters are deleted from adjacent lines such that the travel of deletion wraps to the end of
--- the prior line or the beginning of the next line, depending on the direction of travel. The
--- direction of travel is determined by the sign of the 'CharIndex' -- negative to delete moving
--- toward the beginning, positive to delete moving toward the end. To delete by the number of
--- /virtual/ characters (as opposed to the number of /actual/ characters), use 'deleteByUnit'.
+-- | This function deletes the given number of characters starting from the cursor and returns the
+-- exact number of characters deleted, and if the number of characters to be deleted exceeds the
+-- number of characters in the current line, characters are deleted from adjacent lines such that
+-- the travel of deletion wraps to the end of the prior line or the beginning of the next line,
+-- depending on the direction of travel. The direction of travel is determined by the sign of the
+-- 'CharIndex' -- negative to delete moving toward the beginning, positive to delete moving toward
+-- the end. The number of actual characters deleted is always positive.
 deleteCharsWrap
   :: ( MonadIO m
      , Show tags --DEBUG
      )
-  => Relative CharIndex -> EditText tags m (Relative CharIndex) -- TODO: return CharStats
-deleteCharsWrap request =
-  if request == 0 then return 0 else
-  let direction = if request < 0 then Before else After in
+  => CharUnitCount -> EditText tags m (Relative CharIndex, CharUnitCount)
+deleteCharsWrap request@(CharUnitCount req) =
+  if req == 0 then return (0, 0) else
+  let absreq = safeAbs req in
+  let direction = if req < 0 then Before else After in
   -- First, delete the chararacters in the line editor, see if that satisfies the request...
-  deleteChars request >>= \ delcount ->
-  if delcount >= safeAbs request then return delcount else
-  -- otherwise ues 'forLines' to delete each line until the request has been satsified.
-  fmap snd $ forLines direction (safeAbs request + delcount, delcount) $ \ halt line ->
-    get >>= \ st@(request, delcount) ->
-    if request <= 0 then halt st else
-    let weight = countToChar $ textLineUnitCount line in
-    if weight <= request
-     then put (request - weight, delcount - countToChar (intSize line)) >> return []
-     else do
-      case direction of
-        Before -> do
-          let len = countToChar (intSize line) - weight -
-                      fromIntegral (theTextLineBreakSize line) + 1
-          liftEditLine $ pushElemVec After $
-            UVec.slice 0 (charToCount len) $ theTextLineString line
-          put (request - weight, delcount - len)
-        After  -> do
-          liftEditLine $ pushElemVec Before $
-            UVec.slice (charToCount weight) (intSize line - charToCount weight)
-            (theTextLineString line)
-          put (request - weight, delcount - weight)
-      pure <$> liftEditLine copyLineEditorText
-
--- | This function is similar to 'deleteCharsWrap', but will count the 'CharUnitCount' (number of
--- logical characters) to be deleted, rather than the number of actual characters to be deleted, as
--- with 'deleteCharsWrap'.
-deleteByUnit
-  :: ( MonadIO m
-     , Show tags --DEBUG
-     ) => CharUnitCount -> EditText tags m CharStats
-deleteByUnit _request = error "TODO: deleteByUnit"
+  fmap (\ (delcount, satreq) -> (Relative $ CharIndex delcount, CharUnitCount satreq)) $
+  deleteChars request >>= \ (CharUnitCount satreq) ->
+  if abs satreq >= absreq then return (abs satreq, satreq) else
+  -- Otherwise begin the process of deleting multiple lines. First check if we are deleting
+  -- forwards, and if deleting just the line breaking character is enough to satisfy the request.
+  if direction == After && satreq + 1 >= req then cursorAtEnd After >>= \ end -> do
+    -- If the cursor is on the last line of the buffer, just remove the line breaking characters.
+    -- Otherwise, merge the next line with the current line.
+    lbrksz <- editLine $ fromIntegral <$> use cursorBreakSize
+    if end then editLine $ charsAfterCursor .= 0 >> cursorBreakSize .= 0 else
+      popElem After >>= editLine . overwriteAtCursor After const
+    return (satreq + 1 + lbrksz, satreq + min 1 lbrksz)
+  else forLines direction (abs satreq, satreq) $ \ halt line -> do
+    -- Now we know the number of requested character deletions will move at least partially into the
+    -- next line. So let's use 'forLines' to delete each line until the request has been satsified.
+    st@(delcount0, satreq0) <- get
+    -- If the previous iteration succeeded in deleting the requested number of steps, it should have
+    -- preformed any final stateful updates, set the second element of the state to be equal to
+    -- 'req', and then loop. So the first thing we do on each step of the loop is check if the
+    -- number of deleted elements satisfies the request, and if so, we halt...
+    if abs satreq0 == absreq then halt st else do
+    -- ...otherwise we delete more characters.
+      let (CharUnitCount weight) = textLineUnitCount line
+      let satreq = satreq0 + signum satreq0 * weight
+      let delcount = delcount0 + intSize line
+      if abs satreq <= absreq then put (delcount, satreq) else do
+        let (before, after) = splitLineAt (indexToChar $ weight + satreq0 + absreq) line
+        case direction of
+          Before -> do
+            liftEditLine $ overwriteAtCursor Before const before
+            let satreq = satreq0 - unwrapCharUnitCount (textLineUnitCount after)
+            when (satreq /= req) $ error $ --ASSERTION
+              "-- | deleteCharsWrap: satreq="++show satreq++", req="++show req++", should be equal"
+            put (delcount0 + intSize after, satreq)
+          After  -> do
+            liftEditLine $ overwriteAtCursor After const after
+            let satreq = satreq0 + unwrapCharUnitCount (textLineUnitCount before)
+            when (satreq /= req) $ error $ --ASSERTION
+              "-- | deleteCharsWrap: satreq="++show satreq++", req="++show req++", should be equal"
+            put (delcount0 + intSize before, satreq)
+      return []
 
 -- | This function evaluates the 'lineBreaker' function on the given string, and beginning from the
 -- current cursor position, begins inserting all the lines of text produced by the 'lineBreaker'
@@ -2328,6 +2394,16 @@ forLinesLoop fold f count dir = execFoldMapLines (callCC $ loop count) fold wher
   loop count halt = if count <= 0 then get else
     liftEditText (popElem dir) >>= f halt >>= mapM_ (pushElem (opposite dir)) >>
     loop (count - 1) halt
+  -- TODO: Change the behavior and type of this function. The type should produce a monadic function
+  -- that will read the current line from the buffer only when it is evaluated, and otherwise
+  -- performs no read. The function should not pop the current line on every iteration, rather it
+  -- should provide the option of reading the current line to the mapping function, then when the
+  -- mapping function returns, the current line should be popped and discarded and the lines
+  -- returned by the mapping function should be pushed.
+  --
+  -- It might be better to do away with the continuation monad transformer here, and instead provide
+  -- some control symbols that can be returned by the maping function to control what the loop does
+  -- between iterations.
 
 -- | This function moves the cursor to the first @'Absolute' 'LineIndex'@ parameter given, then
 -- evaluate a folding and mapping monadic function over a range of lines specified. If the first
