@@ -215,13 +215,17 @@ deleteStrings (TextLocation{theLocationLineIndex=line,theLocationCharIndex=char}
     gotoListItem chidx "" $ \ revChars fwdChars _c -> -- <-- drop _c, must subtract 1 from count
     if abs count <= chidx then
       if count < 0 then
-        reverse (reverse (drop (negate count - 1) revChars :: String) : revLines :: [String]) ++ (fwdChars :: String) : fwdLines :: [String]
+        reverse (reverse (drop (negate count - 1) revChars :: String) : revLines :: [String]) ++
+        (fwdChars :: String) : fwdLines :: [String]
       else
-        reverse ((reverse revChars :: String) : revLines :: [String]) ++ (drop (count - 1) fwdChars :: String) : fwdLines :: [String]
+        reverse ((reverse revChars :: String) : revLines :: [String]) ++
+        (drop (count - 1) fwdChars :: String) : fwdLines :: [String]
     else if count < 0 then
-      reverse (dropChars (negate $ count + chidx + 1) revLines :: [String]) ++ (fwdChars :: String) : fwdLines :: [String]
+      reverse (dropChars (negate $ count + chidx + 1) revLines :: [String]) ++
+      (fwdChars :: String) : fwdLines :: [String]
     else
-      reverse ((reverse revChars :: String) : revLines :: [String]) ++ (dropChars (count - chidx - 1) fwdLines :: [String]) :: [String]
+      reverse ((reverse revChars :: String) : revLines :: [String]) ++
+      (dropChars (count - chidx - 1) fwdLines :: [String]) :: [String]
 
 gridLines :: [String]
 gridLines = (\ a -> unwords ((\ b -> [a,b]) <$> chars) ++ "\n") <$> chars where
@@ -332,7 +336,11 @@ textDeletionTests = describe "text deletion tests" $ testWithGrid $ \ buf ->
           liftIO $ writeIORef fakebuf grid1
           flip shouldReturn (Lines info grid1) $ ed buf $ do
             gotoPosition at
+            debugPrintBuffer
             deleteCharsWrap len
+            flushLineEditor
+            debugPrintBuffer
+            --ERROR is in 'textView' or 'textViewToStrings'
             Lines info . fmap fst . textViewToStrings <$>
               textView (mkLoc minBound minBound) (mkLoc maxBound maxBound)
     del (mkLoc 16 25) (-24)

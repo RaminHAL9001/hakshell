@@ -1942,7 +1942,9 @@ refillLineEditor
      , Show tags --DEBUG
      )
   => editor tags m ()
-refillLineEditor = liftEditText $ getElem Before >>= refillLineEditorWith
+refillLineEditor =
+  trace ("-- | refillLineEditor") $ --DEBUG
+  liftEditText $ getElem Before >>= refillLineEditorWith
 
 -- | Like 'refillLineEditor', but replaces the content in the 'bufferLineEditor' with the content in
 -- a given 'TextLine', rather the content of the current line.
@@ -1980,6 +1982,7 @@ refillLineEditorWith = \ case
         let slice = if unsafeMode then UVec.unsafeSlice else UVec.slice
         UVec.copy targlo $ slice 0 targlolen srcvec
         UVec.copy targhi $ slice targlolen targhilen srcvec
+    traceM $ "-- | refillLineEditorWith: lineEditorIsClean .= True" --DEBUG
     bufferLineEditor . lineEditorIsClean .= True
 
 -- | Delete the content of the 'bufferLineEditor' except for the line breaking characters (if any)
@@ -2028,14 +2031,16 @@ copyLineEditor = liftEditText $ use bufferLineEditor >>= liftIO . copyLineEditor
 
 -- | This function copies the current 'LineEditor' state back to the 'TextBuffer', and sets a flag
 -- indicating that the content of the 'LineEditor' and the content of the current line are identical
--- so as to prevent further copying. Note that this function is called automatically by 'flushRefill'.
+-- so as to prevent further copying. Note that this function is called automatically by
+-- 'flushRefill'. Ordinarily, you would call 'flushRefill', especially when calling the 'moveByLine'
+-- or 'gotoLine' functions, rather of using this function directly.
 --
--- In situations where you would not evaluate 'moveCursor', 'moveByLine', 'gotoPosition' or
--- 'gotoLine' with the 'flushRefill' function, you can choose when to copy the content of the
--- 'LineEditor' back to the buffer after moving it. This can be done to "move" the content of a line
--- out of the 'TextBuffer', into the 'LineEditor', and then move the content back into the
--- 'TextBuffer' at a different location after changing position. This can also be useful after
--- accumulating the content of several lines of text into the 'LineEditor'.
+-- In situations where you would /not/ evaluate 'moveByLine' or 'gotoLine' with the 'flushRefill'
+-- function, you can choose when to copy the content of the 'LineEditor' back to the buffer after
+-- moving it. This can be done to "move" the content of a line out of the 'TextBuffer', into the
+-- 'LineEditor', and then move the content back into the 'TextBuffer' at a different location after
+-- changing position. This can also be useful after accumulating the content of several lines of
+-- text into the 'LineEditor'.
 flushLineEditor
   :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
@@ -2043,9 +2048,14 @@ flushLineEditor
   => editor tags m (TextLine tags)
 flushLineEditor = liftEditText $ do
   clean <- use $ bufferLineEditor . lineEditorIsClean
+  traceM $ "-- | flushLineEditor: line editor is clean, will not flush." --DEBUG
   if clean then getElem Before else do
     line <- editLine copyLineEditor'
+    i <- cursorIndex Before --DEBUG
+    traceM $ "-- | flushLineEditor: cursorIndex="++show i++ --DEBUG
+             ", puteElem Before (line="++show line++")" --DEBUG
     putElem Before line
+    traceM $ "-- | flushLineEditor: lineEditorIsClean .= True" --DEBUG
     bufferLineEditor . lineEditorIsClean .= True
     return line
 
@@ -2122,10 +2132,14 @@ flushRefill motion = flushLineEditor >> motion <* refillLineEditor
 -- and characters relative to the current cursor position.
 --
 -- __WARNING__: This evaluates 'flushLineEditor' before moving the cursor, and evaluates
--- 'refillLineEditor' after moving the cursor. If you want to move the cursor without flushing and
--- refilling, use 'gotoLine' or 'moveByLine'. Then once you have decided what to do with the content
--- of the current line editor, can move the cursor column with 'gotoChar' or 'moveByChar', or set
--- the new target column with the expression @('bufferTargetCol' 'Control.Lens..=' c)@.
+-- 'refillLineEditor' after moving the cursor. This is necessary because it is impossible to
+-- instruct the 'LineEditor' which character position to move to unless it contains an accurate copy
+-- of the line of the buffer that it is currently editing.
+--
+-- If you want to move the cursor without flushing and refilling, use 'gotoLine' or
+-- 'moveByLine'. Then once you have decided what to do with the content of the current line editor,
+-- can move the cursor column with 'gotoChar' or 'moveByChar', or set the new target column with the
+-- expression @('bufferTargetCol' 'Control.Lens..=' c)@.
 moveCursor
   :: (MonadEditText editor, MonadEditLine editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
@@ -2257,6 +2271,7 @@ overwriteAtCursor rel concatTags = \ case
       Before -> UVec.copy (UMVec.slice 0 adjusted buf) (UVec.slice 0 adjusted line)
       After  -> UVec.copy (UMVec.slice (alloc - adjusted) adjusted buf) line
     cursorBreakSize .= lbrksz
+    traceM $ "-- | overwriteAtCursor: lineEditorIsClean .= False" --DEBUG
     lineEditorIsClean .= False
     lineEditorTags    %= (`concatTags` tagsB)
 
@@ -2278,14 +2293,20 @@ deleteChars (CharUnitCount n) =
     before <- getElemCount Before
     let count = negate $ min before $ abs n 
     modCount Before $ const $ before + count
-    when (count /= 0) $ lineEditorIsClean .= False
+    traceM $ "-- | deleteChars: modCount Before (const ("++show (before + count)++"))" --DEBUG
+    when (count /= 0) $ do
+      traceM $ "-- | deleteChars: count=("++show count++"), lineEditorIsClean .= False" --DEBUG
+      lineEditorIsClean .= False
     return count
   else if n > 0 then do
     lbrksz <- fromIntegral <$> use cursorBreakSize
     after  <- getElemCount After
     let count = negate $ min n $ max 0 $ after - lbrksz
     modCount After $ const $ after + count
-    when (count /= 0) $ lineEditorIsClean .= False
+    traceM $ "-- | deleteChars: modCount Before (const ("++show (after + count)++"))" --DEBUG
+    when (count /= 0) $ do
+      traceM $ "-- | deleteChars: count=("++show count++"), lineEditorIsClean .= False" --DEBUG
+      lineEditorIsClean .= False
     return count
   else return 0
 
@@ -2296,38 +2317,52 @@ deleteChars (CharUnitCount n) =
 -- depending on the direction of travel. The direction of travel is determined by the sign of the
 -- 'CharIndex' -- negative to delete moving toward the beginning, positive to delete moving toward
 -- the end. The number of actual characters deleted is always positive.
+--
+-- __WARNING__: this function will __NOT__ call 'flushLineEditor', because we cannot assume that
+-- committing the 'LineEditor' changes immediately is necessary or desireable, there may be more
+-- edits to be done to the line after the deletion.
 deleteCharsWrap
   :: ( MonadIO m
      , Show tags --DEBUG
      )
   => CharUnitCount -> EditText tags m (Relative CharIndex, CharUnitCount)
 deleteCharsWrap request@(CharUnitCount req) =
+  trace ("-- | deleteCharsWrap ("++show request++")") $ --DEBUG
   if req == 0 then return (0, 0) else
   let absreq = safeAbs req in
   let direction = if req < 0 then Before else After in
-  -- First, delete the chararacters in the line editor, see if that satisfies the request...
   fmap (\ (delcount, satreq) -> (Relative $ CharIndex delcount, CharUnitCount satreq)) $
+  -- First, we must delete some of the the chararacters in the line editor, and see if that
+  -- satisfies the request. If not, we continue to delete items on 'TextLine's around the line
+  -- editor. If the request is satisfied, end right away and DO NOT FLUSH the line editor, becuase
+  -- further edits to the line may yet occur outside of this function.
   deleteChars request >>= \ (CharUnitCount satreq) ->
-  if abs satreq >= absreq then return (abs satreq, satreq) else
-  -- Otherwise begin the process of deleting multiple lines. First check if we are deleting
-  -- forwards, and if deleting just the line breaking character is enough to satisfy the request.
-  if direction == After && satreq + 1 >= req then cursorAtEnd After >>= \ end -> do
+  if abs satreq >= absreq then
+    trace ("-- | deleteCharsWrap: (abs satreq = "++ --DEBUG
+           show (abs satreq)++") >= (absreq = "++show absreq++") -- DONE") $ --DEBUG
+    return (abs satreq, satreq)
+  -- Deleting characters from the line editor did not satisfy the request, but check if we are
+  -- deleting forwards and if deleting just the line breaking character is enough to satisfy the
+  -- request.
+  else if direction == After && satreq + 1 >= req then cursorAtEnd After >>= \ end -> do
     -- If the cursor is on the last line of the buffer, just remove the line breaking characters.
     -- Otherwise, merge the next line with the current line.
     lbrksz <- editLine $ fromIntegral <$> use cursorBreakSize
     if end then editLine $ charsAfterCursor .= 0 >> cursorBreakSize .= 0 else
       popElem After >>= editLine . overwriteAtCursor After const
     return (satreq + 1 + lbrksz, satreq + min 1 lbrksz)
+  -- Here we have established that the number of requested character deletions will move out of the
+  -- line editor and at least partially into the next line. So let's use 'forLines' to delete each
+  -- 'TextLine' until the request has been satsified.
   else forLines direction (abs satreq, satreq) $ \ halt line -> do
-    -- Now we know the number of requested character deletions will move at least partially into the
-    -- next line. So let's use 'forLines' to delete each line until the request has been satsified.
     st@(delcount0, satreq0) <- get
+    traceM $ "-- | deleteCharsWrap:loop: delcount="++show delcount0++", satreq="++show satreq0 --DEBUG
     -- If the previous iteration succeeded in deleting the requested number of steps, it should have
     -- preformed any final stateful updates, set the second element of the state to be equal to
     -- 'req', and then loop. So the first thing we do on each step of the loop is check if the
     -- number of deleted elements satisfies the request, and if so, we halt...
     if abs satreq0 == absreq then halt st else do
-    -- ...otherwise we delete more characters.
+      -- ...otherwise we delete more characters.
       let (CharUnitCount weight) = textLineUnitCount line
       let satreq = satreq0 + signum satreq0 * weight
       let delcount = delcount0 + intSize line
@@ -2392,6 +2427,7 @@ forLinesLoop
   -> Int -> RelativeToCursor -> EditText tags m fold
 forLinesLoop fold f count dir = execFoldMapLines (callCC $ loop count) fold where
   loop count halt = if count <= 0 then get else
+    trace ("-- | forLinesLoop: count="++show count++", popElem "++show dir) $ --DEBUG
     liftEditText (popElem dir) >>= f halt >>= mapM_ (pushElem (opposite dir)) >>
     loop (count - 1) halt
   -- TODO: Change the behavior and type of this function. The type should produce a monadic function
@@ -2545,16 +2581,21 @@ getPosition = currentTextLocation
 -- number and characters (column) number.
 --
 -- __WARNING__: This evaluates 'flushLineEditor' before moving the cursor, and evaluates
--- 'refillLineEditor' after moving the cursor. If you want to move the cursor without flushing and
--- refilling, use 'gotoLine' or 'moveByLine'. Then once you have decided what to do with the content
--- of the current line editor, can move the cursor column with 'gotoChar' or 'moveByChar', or set
--- the new target column with the expression @('bufferTargetCol' 'Control.Lens..=' c)@.
+-- 'refillLineEditor' after moving the cursor. This is necessary because it is impossible to
+-- instruct the 'LineEditor' which character position to move to unless it contains an accurate copy
+-- of the line of the buffer that it is currently editing.
+--
+-- If you want to move the cursor without flushing and refilling, use 'gotoLine' or
+-- 'moveByLine'. Then once you have decided what to do with the content of the current line editor,
+-- can move the cursor column with 'gotoChar' or 'moveByChar', or set the new target column with the
+-- expression @('bufferTargetCol' 'Control.Lens..=' c)@.
 gotoPosition
   :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
      )
   => TextLocation -> editor tags m TextLocation
-gotoPosition (TextLocation{theLocationLineIndex=ln,theLocationCharIndex=ch}) = liftEditText $
+gotoPosition loc@(TextLocation{theLocationLineIndex=ln,theLocationCharIndex=ch}) = liftEditText $
+  trace ("-- | gotoPosition ("++show loc++")") $ --DEBUG
   TextLocation <$> flushRefill (gotoLine ln) <*> gotoChar ch
 
 -- | Save the location of the cursor, then evaluate an @editor@ function. After evaluation
@@ -2693,6 +2734,7 @@ textView
      )
   => TextLocation -> TextLocation -> editor tags m (TextView tags)
 textView from to = liftEditText $ do
+  -- TODO: check for bugs, especially a bug that might be dropping the first line of the buffer.
   nmax <- countElems
   (from, to) <- pure
     ( min from to & lineIndex %~ max 1
