@@ -182,6 +182,12 @@ textEditorPreTests = describe "text editor pre-tests" $ do
 type Zipper a = ([a], [a])
 type ZipperArrow a = Zipper a -> Zipper a
 
+newStringZipper :: String -> Zipper Char
+newStringZipper = (,) ""
+
+zipperToString :: Zipper Char -> String
+zipperToString = snd . moveToStart
+
 swap :: (a, b) -> (b, a)
 swap (a, b) = (b, a)
 
@@ -197,10 +203,26 @@ zBreak p = uncurry loop where
     []   -> (stack, [])
     a:ax -> if p a then (stack, a:ax) else loop (a:stack) ax
 
-zSplitAt :: Int -> ZipperArrow a
-zSplitAt i = if i == 0 then id else \ case
+zNTimes :: Int -> ZipperArrow a -> ZipperArrow a
+zNTimes i f = if i <= 0 then id else \ case
+  (back, []) -> (back, [])
+  st         -> zNTimes (i-1) f $ f st
+
+zStep :: ZipperArrow a
+zStep = \ case
   (back, []   ) -> (back, [])
-  (back, a:fwd) -> zSplitAt (i-1) (a:back, fwd)
+  (back, a:fwd) -> (a:back, fwd)
+
+zSafeTail :: ZipperArrow a
+zSafeTail = \ case
+  (back, []   ) -> (back, [])
+  (back, _:fwd) -> (back, fwd)
+
+zSplitAt :: Int -> ZipperArrow a
+zSplitAt i = zNTimes i zStep
+
+zDrop :: Int -> ZipperArrow a
+zDrop i = zNTimes i zSafeTail
 
 -- | Move all elements from the reverse stack back onto the forward stack.
 moveToStart :: ZipperArrow a
@@ -219,6 +241,21 @@ stepOverLineBreak (back, fwd) = case fwd of
   '\n':fwd      -> ('\n' : back       , fwd)
   fwd           -> (back, fwd)
 
+removeLineBreak :: ZipperArrow Char
+removeLineBreak (back, fwd) = let r = (,) back in case fwd of
+  '\r':'\n':fwd -> r fwd
+  '\n':'\r':fwd -> r fwd
+  '\r':fwd      -> r fwd
+  '\n':fwd      -> r fwd
+  fwd           -> r fwd
+
+deleteCharUnits :: CharUnitCount -> ZipperArrow Char
+deleteCharUnits (CharUnitCount i) = case compare i 0 of
+  EQ -> id
+  GT -> zNTimes i del
+  LT -> reverseZipperArrow $ zNTimes (negate i) del
+  where { del = zSafeTail . removeLineBreak; }
+
 -- | Scan forward to the next line.
 splitToNextLine :: ZipperArrow Char
 splitToNextLine = stepOverLineBreak . zBreak (\ c -> c == '\n' || c == '\r')
@@ -226,6 +263,11 @@ splitToNextLine = stepOverLineBreak . zBreak (\ c -> c == '\n' || c == '\r')
 splitAtLine :: Absolute LineIndex -> ZipperArrow Char
 splitAtLine = loop 0 . lineToIndex where
   loop i targ = if i >= targ then id else loop (i+1) targ . splitToNextLine
+
+zLines :: String -> [String]
+zLines = \ case
+  ""  -> []
+  str -> let (back, fwd) = splitToNextLine $ newStringZipper str in reverse back : zLines fwd
 
 splitAtLocation :: TextLocation -> ZipperArrow Char
 splitAtLocation loc =
@@ -239,58 +281,7 @@ selectStringRange a0 b0 =
       b = b1{ theLocationLineIndex = 1 `shiftAbsolute`
                 (theLocationLineIndex b1 `diffAbsolute` theLocationLineIndex a)
             }
-  in  snd . moveToStart . splitAtLocation b . (,) "" . snd . splitAtLocation a
-
-selectStrings :: TextLocation -> TextLocation -> [String] -> [String]
-selectStrings a b lines =
-  let ( TextLocation{theLocationLineIndex=lineA0,theLocationCharIndex=charA0},
-        TextLocation{theLocationLineIndex=lineB0,theLocationCharIndex=charB0}
-       ) = (min a b, max a b)
-      lineA = lineToIndex lineA0
-      lineB = lineToIndex lineB0
-      charA = charToIndex charA0
-      charB = charToIndex charB0
-      final = \ case
-        []         -> []
-        [line]     -> [take charB line]
-        line:lines -> line : final lines
-  in  case take (lineB - lineA + 1) $ drop (max 0 lineA) $ lines of
-        []         -> []
-        [line]     -> let (lo, hi) = (min charA charB, max charA charB) in
-                        [take (hi - lo) $ drop lo line]
-        line:lines -> drop charA line : final lines
-
-gotoListItem :: Int -> [a] -> ([a] -> [a] -> a -> b) -> [a] -> b
-gotoListItem i rev f = \ case
-  []    -> error $ "bug in test code: (gotoListItem "++show i++"), index is out of bounds"
-  a:fwd -> if i <= 0 then f rev fwd a else (gotoListItem $! i - 1) (a : rev) f fwd
-
-dropChars :: Int -> [String] -> [String]
-dropChars i = if i <= 0 then id else \ case
-  []               -> []
-  "":lines         -> dropChars i lines -- <-- DO NOT subtract 1 from i here.
-  (_c:chars):lines -> (dropChars $! i - 1) (chars : lines)
-
-deleteStrings :: TextLocation -> CharUnitCount -> [String] -> [String]
-deleteStrings (TextLocation{theLocationLineIndex=line,theLocationCharIndex=char}) len =
-  let count = unwrapCharUnitCount len in
-  if count == 0 then id else
-    gotoListItem (lineToIndex line) [] $ \ revLines fwdLines ->
-    let chidx = charToIndex char in
-    gotoListItem chidx "" $ \ revChars fwdChars _c -> -- <-- drop _c, must subtract 1 from count
-    if abs count <= chidx then
-      if count < 0 then
-        reverse (reverse (drop (negate count - 1) revChars :: String) : revLines :: [String]) ++
-        (fwdChars :: String) : fwdLines :: [String]
-      else
-        reverse ((reverse revChars :: String) : revLines :: [String]) ++
-        (drop (count - 1) fwdChars :: String) : fwdLines :: [String]
-    else if count < 0 then
-      reverse (dropChars (negate $ count + chidx + 1) revLines :: [String]) ++
-      (fwdChars :: String) : fwdLines :: [String]
-    else
-      reverse ((reverse revChars :: String) : revLines :: [String]) ++
-      (dropChars (count - chidx - 1) fwdLines :: [String]) :: [String]
+  in  zipperToString . splitAtLocation b . newStringZipper . snd . splitAtLocation a
 
 gridLines :: [String]
 gridLines = (\ a -> unwords ((\ b -> [a,b]) <$> chars) ++ "\n") <$> chars where
@@ -314,14 +305,14 @@ testWithGrid = (>>=) $ runIO $ do
 data Lines
   = Lines
     { lineTestInfo :: String
-    , unwrapLines  :: [String]
+    , unwrapLines  :: String
     }
 instance Eq Lines where
   a == b = unwrapLines a == unwrapLines b
 instance Show Lines where
-  show (Lines info lines) =
+  show (Lines info str) =
     (if null info then "" else "   " ++ info ++ "\n") ++
-    (lines >>= (++ "\n") . ("    | " ++) . show)
+    (zLines str >>= (++ "\n") . ("    | " ++) . show)
 
 -- | Tests the 'textView' function, which has some arithmetical computations regarding vector slices
 -- with line breaks that are not shared with most other functions, so 'textView' needs it's own
@@ -332,8 +323,8 @@ instance Show Lines where
 textViewTests :: Spec
 textViewTests = describe "testing 'textView'" $ testWithGrid $ \ buf -> do
   let vi a b = it ("*** textView ("++showLoc a++") ("++showLoc b++")") $
-        ( ed buf $ Lines "" . fmap fst . textViewToStrings <$> textView a b
-        ) `shouldReturn` Lines "" (selectStrings a b gridLines)
+        ( ed buf $ Lines "" . (>>= fst) . textViewToStrings <$> textView a b
+        ) `shouldReturn` Lines "" (selectStringRange a b $ newStringZipper grid)
   describe ("move cursor to start of buffer 1 1") $ do
     vi (mkLoc  3 25) (mkLoc  6 24)
     vi (mkLoc 14  1) (mkLoc 16 48)
@@ -393,12 +384,14 @@ cursorMotionTests = describe "testing cursor motion" $ testWithGrid $ \ buf -> d
 textDeletionTests :: Spec
 textDeletionTests = describe "text deletion tests" $ testWithGrid $ \ buf ->
   it "*** deleteCharsWrap tests" $ do
-    fakebuf <- newIORef gridLines
+    fakebuf <- newIORef grid
     let del at len = do
           let info = "deleteCharsWrap ("++show at++") ("++show len++")"
-          grid0 <- liftIO $ readIORef fakebuf
-          let grid1 = deleteStrings at len grid0
-          liftIO $ writeIORef fakebuf grid1
+          (_grid0, grid1) <- liftIO $ do
+            grid0 <- readIORef fakebuf
+            modifyIORef fakebuf $
+              zipperToString . deleteCharUnits len . splitAtLocation at . newStringZipper
+            (,) grid0 <$> readIORef fakebuf
           flip shouldReturn (Lines info grid1) $ ed buf $ do
             gotoPosition at
             debugPrintBuffer
@@ -406,7 +399,7 @@ textDeletionTests = describe "text deletion tests" $ testWithGrid $ \ buf ->
             flushLineEditor
             debugPrintBuffer
             --ERROR is in 'textView' or 'textViewToStrings'
-            Lines info . fmap fst . textViewToStrings <$>
+            Lines info . (>>= fst) . textViewToStrings <$>
               textView (mkLoc minBound minBound) (mkLoc maxBound maxBound)
     del (mkLoc 16 25) (-24)
     del (mkLoc 16  1)  (25)
