@@ -278,10 +278,14 @@ selectStringRange :: TextLocation -> TextLocation -> Zipper Char -> String
 selectStringRange a0 b0 =
   let a = min a0 b0
       b1 = max a0 b0
-      b = b1{ theLocationLineIndex = 1 `shiftAbsolute`
-                (theLocationLineIndex b1 `diffAbsolute` theLocationLineIndex a)
+      line = theLocationLineIndex
+      char = theLocationCharIndex
+      b = b1{ theLocationLineIndex =
+                1 `shiftAbsolute` (line a `diffAbsolute` line b1)
+            , theLocationCharIndex = if line a /= line b1 then char b1 else
+                1 `shiftAbsolute` (char a `diffAbsolute` char b1)
             }
-  in  zipperToString . splitAtLocation b . newStringZipper . snd . splitAtLocation a
+  in  reverse . fst . splitAtLocation b . newStringZipper . snd . splitAtLocation a
 
 gridLines :: [String]
 gridLines = (\ a -> unwords ((\ b -> [a,b]) <$> chars) ++ "\n") <$> chars where
