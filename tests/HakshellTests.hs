@@ -218,6 +218,10 @@ zSafeTail = \ case
   (back, []   ) -> (back, [])
   (back, _:fwd) -> (back, fwd)
 
+-- | Only evaluate the 'ZipperArrow' if the forward stack is not null
+zNotNull :: ZipperArrow a -> ZipperArrow a
+zNotNull f st = if null $ snd st then st else f st
+
 zSplitAt :: Int -> ZipperArrow a
 zSplitAt i = zNTimes i zStep
 
@@ -262,7 +266,7 @@ splitToNextLine = stepOverLineBreak . zBreak (\ c -> c == '\n' || c == '\r')
 
 splitAtLine :: Absolute LineIndex -> ZipperArrow Char
 splitAtLine = loop 0 . lineToIndex where
-  loop i targ = if i >= targ then id else loop (i+1) targ . splitToNextLine
+  loop i targ = if i >= targ then id else zNotNull $ loop (i+1) targ . splitToNextLine
 
 zLines :: String -> [String]
 zLines = \ case
@@ -330,6 +334,7 @@ textViewTests = describe "testing 'textView'" $ testWithGrid $ \ buf -> do
         ( ed buf $ Lines "" . (>>= fst) . textViewToStrings <$> textView a b
         ) `shouldReturn` Lines "" (selectStringRange a b $ newStringZipper grid)
   describe ("move cursor to start of buffer 1 1") $ do
+    vi minBound      maxBound
     vi (mkLoc  3 25) (mkLoc  6 24)
     vi (mkLoc 14  1) (mkLoc 16 48)
     vi (mkLoc  1  1) (mkLoc  3 48)
@@ -398,11 +403,8 @@ textDeletionTests = describe "text deletion tests" $ testWithGrid $ \ buf ->
             (,) grid0 <$> readIORef fakebuf
           flip shouldReturn (Lines info grid1) $ ed buf $ do
             gotoPosition at
-            debugPrintBuffer
             deleteCharsWrap len
             flushLineEditor
-            debugPrintBuffer
-            --ERROR is in 'textView' or 'textViewToStrings'
             Lines info . (>>= fst) . textViewToStrings <$>
               textView (mkLoc minBound minBound) (mkLoc maxBound maxBound)
     del (mkLoc 16 25) (-24)

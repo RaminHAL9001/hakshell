@@ -2552,6 +2552,10 @@ data TextLocation
     }
   deriving (Eq, Ord)
 
+instance Bounded TextLocation where
+  minBound = TextLocation{ theLocationLineIndex = minBound, theLocationCharIndex = minBound }
+  maxBound = TextLocation{ theLocationLineIndex = maxBound, theLocationCharIndex = maxBound }
+
 instance Show TextLocation where
   show (TextLocation
         { theLocationLineIndex=(Absolute (LineIndex line))
@@ -2736,28 +2740,26 @@ textView
 textView from to = liftEditText $ do
   -- TODO: check for bugs, especially a bug that might be dropping the first line of the buffer.
   nmax <- countElems
+  let clampLine = max 1 . min (indexToLine $ nmax - 1)
   (from, to) <- pure
-    ( min from to & lineIndex %~ max 1
-    , max from to & lineIndex %~ min (indexToLine $ nmax - 1)
+    ( min from to & lineIndex %~ clampLine
+    , max from to & lineIndex %~ clampLine
     )
   traceM $ "-- | textView ("++show from++") ("++show to++"), countElems -> "++show nmax
   if nmax <= 0 || from == to then return emptyTextView else do
     let unline = lineToIndex . theLocationLineIndex
     let (lo, hi) = (unline from, unline to)
-    traceM $ "-- | textView: copyRegionChk (Absolute "++ --DEBUG
-                   show lo++") (Relative "++show (1 + hi - lo)++")" --DEBUG
     newvec <- copyRegionChk (Absolute lo) $ Relative $ 1 + hi - lo
-    elem0  <- liftIO $ MVec.read newvec 0 --DEBUG
-    traceM $ "-- | textView: (newvec ! 0) -> "++show elem0 --DEBUG
     let top = MVec.length newvec - 1
-    let unchar len lbrksz = max 0 . min (len - lbrksz + 1) . charToIndex . theLocationCharIndex
+    let unchar len lbrksz = min (len - lbrksz + 1) . charToIndex .
+          max 1 . theLocationCharIndex
     let onvec i f = liftIO $ MVec.read newvec i >>= MVec.write newvec i . \ case
           line@TextLine{}   ->
             let vec      = line ^. textLineString
                 veclen   = UVec.length vec
                 lbrksz   = fromIntegral $ theTextLineBreakSize line
-                (i, len) = f veclen lbrksz
-            in  line & textLineString %~ UVec.slice i len
+                (j, len) = f veclen lbrksz
+            in  line & textLineString %~ UVec.slice j len
           TextLineUndefined -> error $
             "textView: trimmed vector contains undefined line at index "++show i
     onvec top $ \ len lbrksz -> (0, unchar len lbrksz to) 
