@@ -176,6 +176,71 @@ textEditorPreTests = describe "text editor pre-tests" $ do
 
 ----------------------------------------------------------------------------------------------------
 
+-- | A list that is intended to be split at some point. The split is encoded as a tuple, with a list
+-- scanned elements are stacked in reversed order in the 'fst' of the tuple and unscanned elements
+-- are left in forward order in the 'snd' of the tuple.
+type Zipper a = ([a], [a])
+type ZipperArrow a = Zipper a -> Zipper a
+
+swap :: (a, b) -> (b, a)
+swap (a, b) = (b, a)
+
+-- | Apply a 'ZipperArrow' in the reverse direction, i.e. flip the 'fst' and 'snd' element of the
+-- input, then apply the given 'ZipperArrow', then flip 'fst' and 'snd' of the output.
+reverseZipperArrow :: ZipperArrow a -> ZipperArrow a
+reverseZipperArrow f = swap . f . swap
+
+-- | Like 'Data.List.break' but on a 'Zipper'.
+zBreak :: (a -> Bool) -> ZipperArrow a
+zBreak p = uncurry loop where
+  loop stack = \ case
+    []   -> (stack, [])
+    a:ax -> if p a then (stack, a:ax) else loop (a:stack) ax
+
+zSplitAt :: Int -> ZipperArrow a
+zSplitAt i = if i == 0 then id else \ case
+  (back, []   ) -> (back, [])
+  (back, a:fwd) -> zSplitAt (i-1) (a:back, fwd)
+
+-- | Move all elements from the reverse stack back onto the forward stack.
+moveToStart :: ZipperArrow a
+moveToStart = \ case
+  ([]  , bx) -> ([], bx)
+  (a:ax, bx) -> moveToStart (ax, a:bx)
+
+moveToEnd :: ZipperArrow a
+moveToEnd = reverseZipperArrow moveToStart
+
+stepOverLineBreak :: ZipperArrow Char
+stepOverLineBreak (back, fwd) = case fwd of
+  '\r':'\n':fwd -> ('\n' : '\r' : back, fwd)
+  '\n':'\r':fwd -> ('\r' : '\n' : back, fwd)
+  '\r':fwd      -> ('\r' : back       , fwd)
+  '\n':fwd      -> ('\n' : back       , fwd)
+  fwd           -> (back, fwd)
+
+-- | Scan forward to the next line.
+splitToNextLine :: ZipperArrow Char
+splitToNextLine = stepOverLineBreak . zBreak (\ c -> c == '\n' || c == '\r')
+
+splitAtLine :: Absolute LineIndex -> ZipperArrow Char
+splitAtLine = loop 0 . lineToIndex where
+  loop i targ = if i >= targ then id else loop (i+1) targ . splitToNextLine
+
+splitAtLocation :: TextLocation -> ZipperArrow Char
+splitAtLocation loc =
+  zSplitAt (charToIndex $ theLocationCharIndex loc) .
+  splitAtLine (theLocationLineIndex loc)
+
+selectStringRange :: TextLocation -> TextLocation -> Zipper Char -> String
+selectStringRange a0 b0 =
+  let a = min a0 b0
+      b1 = max a0 b0
+      b = b1{ theLocationLineIndex = 1 `shiftAbsolute`
+                (theLocationLineIndex b1 `diffAbsolute` theLocationLineIndex a)
+            }
+  in  snd . moveToStart . splitAtLocation b . (,) "" . snd . splitAtLocation a
+
 selectStrings :: TextLocation -> TextLocation -> [String] -> [String]
 selectStrings a b lines =
   let ( TextLocation{theLocationLineIndex=lineA0,theLocationCharIndex=charA0},
