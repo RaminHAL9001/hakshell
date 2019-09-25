@@ -2362,6 +2362,15 @@ forwardDeleteLineBreak mergeNext = do
     , actualCharCount  = negate $ Relative $ CharIndex after
     }
 
+deleteAllChars
+  :: ( MonadIO m
+     , Show tags --DEBUG
+     )
+  => RelativeToCursor -> EditText tags m CharStats
+deleteAllChars = \ case
+  Before -> error "TODO: deleteAllChars Before"
+  After  -> error "TODO: deleteAllChars After"
+
 -- | This function deletes the given number of characters starting from the cursor and returns the
 -- exact number of characters deleted, and if the number of characters to be deleted exceeds the
 -- number of characters in the current line, characters are deleted from adjacent lines such that
@@ -2380,18 +2389,20 @@ deleteCharsWrap
   => CharUnitCount -> EditText tags m CharStats
 deleteCharsWrap request =
   trace ("-- | deleteCharsWrap ("++show request++")") $ --DEBUG
-  if request == 0 then return mempty else
   let direction = if request < 0 then Before else After in
-  -- First, we must delete some of the the chararacters in the line editor, and see if that
-  -- satisfies the request. If not, we continue to delete items on 'TextLine's around the line
-  -- editor. If the request is satisfied, end right away and DO NOT FLUSH the line editor, becuase
-  -- further edits to the line may yet occur outside of this function.
-  deleteChars request >>= \ st0 ->
+  if request == 0 then return mempty
+  -- First, if we can prove that the 'request' is not a 'minBound' or 'maxBound' value, we can use
+  -- 'abs' rather than 'safeAbs' throughout the rest of this function.
+  else if request >= maxBound || request <= minBound then deleteAllChars direction
+  -- The first change we must make is to delete some of the the chararacters in the line editor, and
+  -- see if that satisfies the request. If not, we continue to delete items on 'TextLine's around
+  -- the line editor.
+  else deleteChars request >>= \ st0 ->
   let satreq = logicalCharCount st0 in
   trace ("-- | deleteCharsWrap: satreq="++show satreq) $
-  if abs satreq >= safeAbs request then
+  if abs satreq >= abs request then
     trace ("-- | deleteCharsWrap: (abs satreq = "++ --DEBUG
-           show (abs satreq)++") >= (safeAbs req = "++show (safeAbs request)++") -- DONE") $ --DEBUG
+           show (abs satreq)++") >= (abs req = "++show (abs request)++") -- DONE") $ --DEBUG
     return st0
   -- Deleting characters from the line editor did not satisfy the request, but check if we are
   -- deleting forwards and if deleting just the line breaking character is enough to satisfy the
@@ -2423,9 +2434,9 @@ deleteCharsWrap request =
               { logicalCharCount = signum request * weight
               , actualCharCount  = countToChar $ negate $ intSize line
               }
-        if abs (logicalCharCount st) <= safeAbs request then put st else do
+        if abs (logicalCharCount st) <= abs request then put st else do
           let (before, after) = flip splitLineAt line $ shiftAbsolute 1 $ countToChar $
-                unwrapCharUnitCount $ abs (logicalCharCount st0) - safeAbs request + weight
+                unwrapCharUnitCount $ abs (logicalCharCount st0) - abs request + weight
           case direction of
             Before -> do
               liftEditLine $ overwriteAtCursor Before const before
