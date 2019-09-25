@@ -36,6 +36,7 @@ dependencies:
 - lens
 - linear
 - mtl
+- parsers
 - primitive
 - process
 - semigroups
@@ -76,6 +77,7 @@ library:
   - Hakshell.String
   - Hakshell.Struct
   - Hakshell.TextEditor
+  - Hakshell.TextEditor.Parser
   - Hakshell.UTFUnit
   - Hakshell.Pipe
   - Hakshell.Find
