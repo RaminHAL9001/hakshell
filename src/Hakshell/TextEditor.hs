@@ -314,25 +314,65 @@ import Debug.Trace
 
 ----------------------------------------------------------------------------------------------------
 
+-- Used by 'newTextBuffer' as a parameter to 'newTextBufferState'.
+defaultInitBufferSize :: Int
+defaultInitBufferSize = 512
+
 -- Any vector operations that have a safe (bounds-chekced) version and an unsafe version will be
 -- switched to the unsafe version when this constant is set to True.
 unsafeMode :: Bool
 unsafeMode = False
 
--- -- I create let bindings for lenses often, so I often need the 'cloneLens' function. It is very
--- -- convenient to shorten the name to 'cl'.
--- cl :: ALens s t a b -> Lens s t a b
--- cl = cloneLens
-
--- Used by 'newTextBuffer' as a parameter to 'newTextBufferState'.
-defaultInitBufferSize :: Int
-defaultInitBufferSize = 512
+-- Set this to 'True' to install additional checks throughout this module, especially after having
+-- made a change to any functino that manipulates mutable arrays.
+enableAssertions :: Bool
+enableAssertions = True
 
 -- Overflow-safe absolute value function. Many programming language compilers have unintuitive
 -- behavior when evaluating the expresion @(abs minBound)@ due to integer overflow, GHC also suffers
 -- from this problem
 safeAbs :: (Ord n, Num n, Bounded n) => n -> n
 safeAbs n = if n >= 0 then n else negate $ if n == minBound then n + 1 else n
+
+----------------------------------------------------------------------------------------------------
+
+-- An assertion system.
+
+assert :: String -> String -> Bool -> r -> r
+assert funcName msg fact = if not enableAssertions || fact then id else const $ error $
+  "\n-- | "++funcName++": assertion "++msg++" failed"
+
+--assertM :: Monad m => String -> String -> Bool -> m ()
+--assertM funcName msg fact = assert funcName msg fact $ pure ()
+
+assertOp :: String -> (String, a) -> (String, a -> b -> Bool) -> (String, b) -> r -> r
+assertOp funcName (aName, a) (opName, op) (bName, b) =
+  assert funcName ('(' : aName ++ ' ' : opName ++ ' ' : bName ++ ")") (op a b)
+
+assertOpM :: Monad m => String -> (String, a) -> (String, a -> b -> Bool) -> (String, b) -> m ()
+assertOpM funcName a op b = assertOp funcName a op b $ pure ()
+
+-- | Show a showable value along with it's name, pass this as an argument to 'assertOp'.
+inspect :: Show a => String -> a -> (String, a)
+inspect name a = if null name then (show a, a) else ('(' : name ++ '=' : show a ++ ")", a)
+
+eq :: Eq a => (String, a -> a -> Bool)
+eq = ("==", (==))
+
+--ne :: Eq a => (String, a -> a -> Bool)
+--ne = ("/=", (/=))
+
+--gt :: Ord a => (String, a -> a -> Bool)
+--gt = ("<", (<))
+
+--ge :: Ord a => (String, a -> a -> Bool)
+--ge = ("<=", (<=))
+
+lt :: Ord a => (String, a -> a -> Bool)
+lt = ("<", (<))
+
+--le :: Ord a => (String, a -> a -> Bool)
+--le = (">=", (>=))
 
 ----------------------------------------------------------------------------------------------------
 
@@ -1397,10 +1437,14 @@ getSlice rel@(Relative count) = do
   if rel < 0
    then do
     i <- getRelative rel
+    assertOpM "getSlice"
+      (inspect "i + abs count" $ i+abs count) lt (inspect "length vec" $ GMVec.length vec)
     return $ GMVec.slice i (abs count) vec
    else if rel > 0
    then do
     i <- cursorIndex After
+    assertOpM "getSlice"
+      (inspect "i + count" $ i+count) lt (inspect "length vec" $ GMVec.length vec)
     return $ GMVec.slice i count vec
    else return $ GMVec.slice 0 0 vec
 
@@ -2060,12 +2104,15 @@ flushLineEditor
   => editor tags m (TextLine tags)
 flushLineEditor = liftEditText $ do
   clean <- use $ bufferLineEditor . lineEditorIsClean
-  traceM $ "-- | flushLineEditor: line editor is clean, will not flush." --DEBUG
-  if clean then getElem Before else do
+  if clean
+   then
+    trace ("-- | flushLineEditor: line editor is clean, will not flush.") $ --DEBUG
+    getElem Before 
+   else do
     line <- editLine copyLineEditor'
     i <- cursorIndex Before --DEBUG
     traceM $ "-- | flushLineEditor: cursorIndex="++show i++ --DEBUG
-             ", puteElem Before (line="++show line++")" --DEBUG
+             ", putElem Before (line="++show line++")" --DEBUG
     putElem Before line
     traceM $ "-- | flushLineEditor: lineEditorIsClean .= True" --DEBUG
     bufferLineEditor . lineEditorIsClean .= True
@@ -2394,9 +2441,8 @@ deleteCharsWrap request =
   -- First, if we can prove that the 'request' is not a 'minBound' or 'maxBound' value, we can use
   -- 'abs' rather than 'safeAbs' throughout the rest of this function.
   else if request >= maxBound || request <= minBound then deleteAllChars direction
-  -- The first change we must make is to delete some of the the chararacters in the line editor, and
-  -- see if that satisfies the request. If not, we continue to delete items on 'TextLine's around
-  -- the line editor.
+  -- The first change we must make is to delete some of the the chararacters in the 'LineEditor',
+  -- and see if that satisfies the request.
   else deleteChars request >>= \ st0 ->
   let satreq = logicalCharCount st0 in
   trace ("-- | deleteCharsWrap: satreq="++show satreq) $
@@ -2408,14 +2454,13 @@ deleteCharsWrap request =
   -- deleting forwards and if deleting just the line breaking character is enough to satisfy the
   -- request.
   else if direction == After && satreq + 1 >= request then
-    -- If the cursor is on the last line of the buffer, just remove the line breaking characters.
-    -- Otherwise, merge the next line with the current line.
+    -- Deleting the line break will satisfy the requset. We will do that and merge the next line
+    -- into the 'LineEditor', if there even is a next line.
     (st0 <>) <$> forwardDeleteLineBreak True
   else do
-    -- Here we have established that the number of requested character deletions will move out of
-    -- the line editor and at least partially into the next line. First, if we are deleting forward,
-    -- delete the final line breaking character from the line editor, but don't bother merging the
-    -- next line into the line editor yet.
+    -- We have established that the number of requested character deletions will require removing
+    -- all or part of adjacent lines. If we are deleting forward, delete the final line breaking
+    -- character from the line editor, but DO NOT merge the next line into the 'LineEditor'.
     st0 <- if direction == After then (st0 <>) <$> forwardDeleteLineBreak False else pure st0
     traceM $ "-- | deleteCharsWrap: forLines "++show direction++" "++show(abs satreq, satreq)
     -- Now let's use 'forLines' to delete each 'TextLine' until the request has been satsified.
@@ -2434,32 +2479,24 @@ deleteCharsWrap request =
               { logicalCharCount = signum request * weight
               , actualCharCount  = countToChar $ negate $ intSize line
               }
+        -- If the request is still more than the entire current line, delete the line and loop...
         if abs (logicalCharCount st) <= abs request then put st else do
+          -- ...otherwise, we need to delete part of the current line and merge the remainder into
+          -- the 'LineEditor'.
           let (before, after) = flip splitLineAt line $ shiftAbsolute 1 $ countToChar $
                 unwrapCharUnitCount $ abs (logicalCharCount st0) - abs request + weight
-          case direction of
-            Before -> do
-              liftEditLine $ overwriteAtCursor Before const before
-              let st = st0 <>
-                    CharStats
-                    { logicalCharCount = negate $ textLineUnitCount before
-                    , actualCharCount  = countToChar $ negate $ intSize before
-                    } 
-              when (logicalCharCount st /= request) $ error $ --ASSERTION
-                "\n-- | deleteCharsWrap: logicalCharCount="++show (logicalCharCount st)++
-                ", req="++show request++", should be equal"
-              put st
-            After  -> do
-              liftEditLine $ overwriteAtCursor After const after
-              let st = st0 <>
-                    CharStats
-                    { logicalCharCount = textLineUnitCount after
-                    , actualCharCount  = countToChar $ negate $ intSize after
-                    }
-              when (logicalCharCount st /= request) $ error $ --ASSERTION
-                "\n-- | deleteCharsWrap: logicalCharCount="++show (logicalCharCount st)++
-                ", req="++show request++", should be equal"
-              put st
+          let (keep, delete, sign) = case direction of
+                Before -> (before, after, negate)
+                After  -> (after, before, id)
+          liftEditLine $ overwriteAtCursor direction const keep
+          let st = st0 <>
+                CharStats
+                { logicalCharCount = sign $ textLineUnitCount delete
+                , actualCharCount  = countToChar $ negate $ intSize delete
+                } 
+          assertOpM "deleteCharsWrap"
+            (inspect "logicalCharCount" $ logicalCharCount st) eq (inspect "request" request)
+          put st
         return []
 
 -- | This function evaluates the 'lineBreaker' function on the given string, and beginning from the
