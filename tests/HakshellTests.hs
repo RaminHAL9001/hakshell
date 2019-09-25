@@ -253,8 +253,8 @@ removeLineBreak (back, fwd) = let r = (,) back in case fwd of
   '\n':fwd      -> r fwd
   fwd           -> r fwd
 
-deleteCharUnits :: CharUnitCount -> ZipperArrow Char
-deleteCharUnits (CharUnitCount i) = case compare i 0 of
+deleteCharUnits :: TextCursorSpan -> ZipperArrow Char
+deleteCharUnits (TextCursorSpan i) = case compare i 0 of
   EQ -> id
   GT -> zNTimes i del
   LT -> reverseZipperArrow $ zNTimes (negate i) del

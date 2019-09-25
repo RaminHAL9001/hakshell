@@ -65,7 +65,7 @@ module Hakshell.TextEditor
     -- 'TextLine' at that address into a 'LineEditor'. You can then edit the text in a 'LineEditor'
     -- by evaluating a function of type 'EditLine' with the 'editLine' function.
 
-    TextLine, emptyTextLine, nullTextLine, textLineUnitCount,
+    TextLine, emptyTextLine, nullTextLine, textLineCursorSpan,
     textLineTop, textLineIsUndefined, sliceLine, sliceLineToEnd, splitLineAt,
 
     -- *** 'TextLine' lenses
@@ -141,8 +141,8 @@ module Hakshell.TextEditor
     getPosition, gotoPosition, saveCursorEval, gotoLine, gotoChar,
 
     Absolute(..),  LineIndex(..), CharIndex(..), TextLocation(..),
-    CharUnitCount(..), CharStats(..),
-    shiftAbsolute, diffAbsolute, unwrapCharUnitCount,
+    TextCursorSpan(..), CharStats(..),
+    shiftAbsolute, diffAbsolute, unwrapTextCursorSpan,
     lineToIndex, charToIndex, indexToLine, indexToChar,
 
     -- *** Moving the cursor relative to the cursor
@@ -403,47 +403,51 @@ newtype CharIndex = CharIndex Int
 -- (where line breaking characters consisting of two characters are considered a single logical
 -- character, thus the 'textLineUnit' and 'lineEditorUnit' functions), you must specify the number
 -- of logical characters using a value of this type.
-newtype CharUnitCount = CharUnitCount Int
+newtype TextCursorSpan = TextCursorSpan Int
   deriving (Eq, Ord, Show, Read, Enum, Num, Bounded)
--- TODO: rename this to 'CursorStepCount' everywhere.
+-- TODO: rename this to 'TextCursorSpan' everywhere.
 
-unwrapCharUnitCount :: CharUnitCount -> Int
-unwrapCharUnitCount (CharUnitCount o) = o
+unwrapTextCursorSpan :: TextCursorSpan -> Int
+unwrapTextCursorSpan (TextCursorSpan o) = o
 
 -- | This data structure contains information about the number of character positions traversed
 -- during a function evaluation. Values of this type are returned by 'insertString',
--- 'deleteCharsWrap'. It counts both actual characters and "logical characters". A "logical
--- character" is a unit counted in a way that treats multiple-character line breaks like "\r\n" or
--- "\n\r" as a single unit. The function 'textLineUnitCount' and 'lineEditorUnitCount' return the
--- logical character counts contained within their respective data structures. If you document is
--- defined such that all line breaking characters in your document must be "\n", then
--- 'logicalCharCount' will always be equal to 'actualCharCount'.
+-- 'deleteCharsWrap', or 'moveByCharWrap'. It counts both actual UTF characters and "cursor steps".
+-- A "cursor step" is a unit counted in a way that treats multiple-character line breaks like "\r\n"
+-- or "\n\r" as a single unit. The function 'textLineCursorSpan' and 'lineEditorUnitCount' return
+-- the logical character counts contained within their respective data structures. If you document
+-- is defined such that all line breaking characters in your document must be "\n", then
+-- 'cursorStepCount' will always be equal to 'deltaCharCount'.
 --
 -- For example, if you set the 'TextBuffer's 'bufferLineBreaker' field to 'lineBreakerNLCR':
 -- (@bufferLineBreaker .= lineBreakerNLCR@) and then evaluate 'insertString' on the string
 -- @"\\r\\n\\r\\n\\r\\n"@, the 'insertString' function will return a count of 3 for the
--- 'logicalCharCount' and a count of 6 for the 'actualCharCount'.
+-- 'cursorStepCount' and a count of 6 for the 'deltaCharCount'.
 data CharStats
   = CharStats
-    { logicalCharCount :: !CharUnitCount
-      -- ^ This is the number of logical characters inserted\/traversed\/deleted. Use this value if
-      -- you need to perform another operation (e.g. a deletion or cursor motion) with the exact
-      -- same number of logical characters.
-    , actualCharCount  :: !(Relative CharIndex)
-      -- ^ This is the number of actual characters inserted\/traversed\/deleted. Use this value if
-      -- you need an accurate accounting of the amount of data has been traversed or altered.
+    { cursorStepCount :: !TextCursorSpan
+      -- ^ When an 'TextBuffer' stateful operation produces a value of this type, it is an
+      -- indication of the minimum number of cursor movements that would have had to been made by an
+      -- end user pressing keyboard keys (e.g. pressing the right-arrow to perform a traversal) in
+      -- order to replicate the stateful operation. The biggest difference between this number and
+      -- the 'deltaCharCount' is that line breaks are always considered a single cursor step,
+      -- regardless of how many characters comprise the line break.
+    , deltaCharCount  :: !(Relative CharIndex)
+      -- ^ This is the number of UTF characters inserted\/deleted, a positive value indicates
+      -- insertion, a negative value indicates deletion. Use this value if you need an accurate
+      -- accounting of the amount of data has been changed.
     }
   deriving Show
 
 instance Semigroup CharStats where
-  (<>) (CharStats{logicalCharCount=csA,actualCharCount=dcA})
-       (CharStats{logicalCharCount=csB,actualCharCount=dcB}) = CharStats
-         { logicalCharCount = csA + csB
-         , actualCharCount  = dcA + dcB
+  (<>) (CharStats{cursorStepCount=csA,deltaCharCount=dcA})
+       (CharStats{cursorStepCount=csB,deltaCharCount=dcB}) = CharStats
+         { cursorStepCount = csA + csB
+         , deltaCharCount  = dcA + dcB
          }
 
 instance Monoid CharStats where
-  mempty = CharStats{ logicalCharCount = 0, actualCharCount = 0 }
+  mempty = CharStats{ cursorStepCount = 0, deltaCharCount = 0 }
   mappend = (<>)
 
 instance Bounded (Absolute CharIndex) where
@@ -916,7 +920,7 @@ sliceLineToEnd rel i = \ case
     slice = case rel of
       Before -> sliceLine 0 $ Relative $ CharIndex $ charToIndex i
       After  -> sliceLine i $ Relative $ CharIndex $
-                  unwrapCharUnitCount (textLineUnitCount line) - charToIndex i
+                  unwrapTextCursorSpan (textLineCursorSpan line) - charToIndex i
     check = \ case
       Left  err    -> error $ "sliceLineToEnd: internal error, "++show err
       Right result -> result
@@ -953,7 +957,7 @@ sliceLine i0 reqsiz0 = \ case
         reqsiz = charToCount reqsiz0
         sum    = start + reqsiz
         len    = UVec.length vec
-        weight = unwrapCharUnitCount $ textLineUnitCount line
+        weight = unwrapTextCursorSpan $ textLineCursorSpan line
         start  = min i sum
         top    = max i sum
         lbrksz = fromIntegral $ theTextLineBreakSize line
@@ -973,21 +977,25 @@ sliceLine i0 reqsiz0 = \ case
 textLineIsUndefined :: TextLine tags -> Bool
 textLineIsUndefined = \ case { TextLineUndefined -> True; _ -> False; }
 
--- | The weight of a 'TextLine' is essentially the number of unit characters the 'TextLine'
--- contains, which most of the time is exactly equal to the vector length of 'theTextLineString',
--- but not always. In some cases, a 'TextLine' has multiple line break characters, especially on the
--- Windows operating system in which a line break contains two characters: @"\\n\\r"@. However when
--- using a text editor on such an operating system, pressing the backspace key on the keyboard when
--- at the start of the line will wrap the deletion operation to the previous line, deleting all
--- newline characters in a single key press. Thus the two characters @"\\n\\r"@ have a weight of 1
--- key press.
+-- | The 'TextCursorSpan' of a 'TextLine' is essentially the number of steps it would take for an
+-- end-user to step the cursor over every element in the 'TextLine', including an optional line
+-- break at the end which is computed as a single step regardless of how many UTF characters
+-- actually comprise the line break. Most of the time 'textLineCursorSpan' is exactly equal to the
+-- vector length of 'theTextLineString', but not always.
+--
+-- In some cases, a 'TextLine' has multiple line break characters, especially on the Windows
+-- operating system in which a line break contains two characters: @"\\n\\r"@. However when using a
+-- text editor on such an operating system, pressing the backspace key on the keyboard when at the
+-- start of the line will wrap the deletion operation to the previous line, deleting all newline
+-- characters in a single key press. Thus the two characters @"\\n\\r"@ have a cursor span of 1 key
+-- press.
 --
 -- This text editor engine accommodates arbitrary line break character sequences by providing this
--- 'textLineUnitCount' metric, which always treats all line breaking characters as a single unit. If
+-- 'textLineCursorSpan' metric, which always treats all line breaking characters as a single unit. If
 -- there are no line breaking characters, or if there is only one line breaking character, the
--- 'textLineUnitCount' is identical to the value given by 'intSize'.
-textLineUnitCount :: TextLine tags -> CharUnitCount
-textLineUnitCount line = CharUnitCount $ intSize line - breaksize + min 1 (max 0 breaksize) where
+-- 'textLineCursorSpan' is identical to the value given by 'intSize'.
+textLineCursorSpan :: TextLine tags -> TextCursorSpan
+textLineCursorSpan line = TextCursorSpan $ intSize line - breaksize + min 1 (max 0 breaksize) where
   breaksize = fromIntegral $ theTextLineBreakSize line
 
 -- | Return index of the top-most non-line-breaking character. The size of the string not including
@@ -1136,9 +1144,9 @@ copyLineEditorIO cur = do
 lineEditorCharCount :: LineEditor tags -> Relative CharIndex
 lineEditorCharCount ed = countToChar $ theCharsBeforeCursor ed + theCharsAfterCursor ed
 
--- | This funcion returns the same value as 'textLineUnitCount' but for a 'LineEditor'.
-lineEditorUnitCount :: LineEditor tags -> CharUnitCount
-lineEditorUnitCount ed = CharUnitCount $
+-- | This funcion returns the same value as 'textLineCursorSpan' but for a 'LineEditor'.
+lineEditorUnitCount :: LineEditor tags -> TextCursorSpan
+lineEditorUnitCount ed = TextCursorSpan $
   charToCount (lineEditorCharCount ed) - fromIntegral (theCursorBreakSize ed)
 
 -- | Gets the 'lineEditorCharCount' value for the current 'LineEditor'.
@@ -1154,7 +1162,7 @@ getUnitCount
   :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
      )
-  => editor tags m CharUnitCount
+  => editor tags m TextCursorSpan
 getUnitCount = liftEditText $ lineEditorUnitCount <$> use bufferLineEditor
 
 -- | Create a new 'LineEditor' by copying the line under the given 'TextLocation' point. The
@@ -2151,7 +2159,7 @@ bufferIsEmpty
 bufferIsEmpty = bufferLineCount >>= \ ln ->
   if ln > 1 then return False
   else if ln <= 0 then return True
-  else withCurrentLine $ \ _ line -> return $ textLineUnitCount line == 0
+  else withCurrentLine $ \ _ line -> return $ textLineCursorSpan line == 0
 
 ----------------------------------------------------------------------------------------------------
 
@@ -2248,7 +2256,7 @@ moveByCharWrap
   :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
      )
-  => CharUnitCount -> editor tags m TextLocation
+  => TextCursorSpan -> editor tags m TextLocation
 moveByCharWrap = error "TODO: implement 'moveByCharWrap'"
 
 -- | Go to an absolute line number, the first line is 1 (line 0 and below all send the cursor to
@@ -2352,12 +2360,12 @@ deleteChars
   :: (MonadEditLine editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
      )
-  => CharUnitCount -> editor tags m CharStats
-deleteChars req@(CharUnitCount n) =
+  => TextCursorSpan -> editor tags m CharStats
+deleteChars req@(TextCursorSpan n) =
   let done count = return
         CharStats
-        { logicalCharCount = signum req * CharUnitCount count
-        , actualCharCount  = Relative $ CharIndex $ negate count
+        { cursorStepCount = signum req * TextCursorSpan count
+        , deltaCharCount  = Relative $ CharIndex $ negate count
         }
   in liftEditLine $
   if n < 0 then do -- TODO: make this code less copy-pastey
@@ -2405,8 +2413,8 @@ forwardDeleteLineBreak mergeNext = do
         "-- | forwardDeleteLineBreak: cursorAtEnd -> "++show end --DEBUG
       ) --DEBUG
   return CharStats
-    { logicalCharCount = CharUnitCount $ after - lbrksz + 1
-    , actualCharCount  = negate $ Relative $ CharIndex after
+    { cursorStepCount = TextCursorSpan $ after - lbrksz + 1
+    , deltaCharCount  = negate $ Relative $ CharIndex after
     }
 
 deleteAllChars
@@ -2433,7 +2441,7 @@ deleteCharsWrap
   :: ( MonadIO m
      , Show tags --DEBUG
      )
-  => CharUnitCount -> EditText tags m CharStats
+  => TextCursorSpan -> EditText tags m CharStats
 deleteCharsWrap request =
   trace ("-- | deleteCharsWrap ("++show request++")") $ --DEBUG
   let direction = if request < 0 then Before else After in
@@ -2444,7 +2452,7 @@ deleteCharsWrap request =
   -- The first change we must make is to delete some of the the chararacters in the 'LineEditor',
   -- and see if that satisfies the request.
   else deleteChars request >>= \ st0 ->
-  let satreq = logicalCharCount st0 in
+  let satreq = cursorStepCount st0 in
   trace ("-- | deleteCharsWrap: satreq="++show satreq) $
   if abs satreq >= abs request then
     trace ("-- | deleteCharsWrap: (abs satreq = "++ --DEBUG
@@ -2471,31 +2479,31 @@ deleteCharsWrap request =
       -- preformed any final stateful updates, set the second element of the state to be equal to
       -- 'req', and then loop. So the first thing we do on each step of the loop is check if the
       -- number of deleted elements satisfies the request, and if so, we halt...
-      if logicalCharCount st0 == request then halt st0 else do
+      if cursorStepCount st0 == request then halt st0 else do
         -- ...otherwise we delete more characters.
-        let weight = textLineUnitCount line
+        let weight = textLineCursorSpan line
         let st = st0 <>
               CharStats
-              { logicalCharCount = signum request * weight
-              , actualCharCount  = countToChar $ negate $ intSize line
+              { cursorStepCount = signum request * weight
+              , deltaCharCount  = countToChar $ negate $ intSize line
               }
         -- If the request is still more than the entire current line, delete the line and loop...
-        if abs (logicalCharCount st) <= abs request then put st else do
+        if abs (cursorStepCount st) <= abs request then put st else do
           -- ...otherwise, we need to delete part of the current line and merge the remainder into
           -- the 'LineEditor'.
           let (before, after) = flip splitLineAt line $ shiftAbsolute 1 $ countToChar $
-                unwrapCharUnitCount $ abs (logicalCharCount st0) - abs request + weight
+                unwrapTextCursorSpan $ abs (cursorStepCount st0) - abs request + weight
           let (keep, delete, sign) = case direction of
                 Before -> (before, after, negate)
                 After  -> (after, before, id)
           liftEditLine $ overwriteAtCursor direction const keep
           let st = st0 <>
                 CharStats
-                { logicalCharCount = sign $ textLineUnitCount delete
-                , actualCharCount  = countToChar $ negate $ intSize delete
+                { cursorStepCount = sign $ textLineCursorSpan delete
+                , deltaCharCount  = countToChar $ negate $ intSize delete
                 } 
           assertOpM "deleteCharsWrap"
-            (inspect "logicalCharCount" $ logicalCharCount st) eq (inspect "request" request)
+            (inspect "cursorStepCount" $ cursorStepCount st) eq (inspect "request" request)
           put st
         return []
 
