@@ -118,10 +118,10 @@ module Hakshell.TextEditor
     copyCharsRange, copyCharsBetween, copyChars, copyCharsToEnd,
     -- TODO: getCharIndex, putCharIndex,
 
-    -- *** Error Data Type
+    -- ** Error Data Type
 
     TextEditError(..),
-
+    
     -- ** Moving the Cursor
     --
     -- __IMPORTANT__: when moving the cursor around using 'gotoPosition' or similar functions, the
@@ -153,6 +153,10 @@ module Hakshell.TextEditor
     RelativeToAbsoluteCursor, -- <- does not export members
     relativeToAbsolute, relativeLine, relativeChar, lineIndex, charIndex,
     lineToCount, charToCount, countToLine, countToChar,
+
+    -- *** Checking the validity of indicies
+    AnyLineIndex(..), validateLineIndex, lineIndexIsValid,
+    validateGetLineIndex, testLocation, validateLocation, locationIsValid,
 
     -- ** Text Views
     --
@@ -363,16 +367,16 @@ eq = ("==", (==))
 --ne = ("/=", (/=))
 
 --gt :: Ord a => (String, a -> a -> Bool)
---gt = ("<", (<))
+--gt = (">", (>))
 
---ge :: Ord a => (String, a -> a -> Bool)
---ge = ("<=", (<=))
+ge :: Ord a => (String, a -> a -> Bool)
+ge = (">=", (>=))
 
-lt :: Ord a => (String, a -> a -> Bool)
-lt = ("<", (<))
+--lt :: Ord a => (String, a -> a -> Bool)
+--lt = ("<", (<))
 
---le :: Ord a => (String, a -> a -> Bool)
---le = (">=", (>=))
+le :: Ord a => (String, a -> a -> Bool)
+le = ("<=", (<=))
 
 ----------------------------------------------------------------------------------------------------
 
@@ -804,7 +808,8 @@ data TextBufferState tags
     }
 
 data TextEditError
-  = TextEditError       !StrictBytes
+  = BufferIsEmpty
+  | TextEditError       !StrictBytes
   | EndOfLineBuffer     !RelativeToCursor
   | EndOfCharBuffer     !RelativeToCursor
   | LineIndexOutOfRange !(Absolute LineIndex)
@@ -964,13 +969,17 @@ sliceLine i0 reqsiz0 = \ case
         (slicsz, newlbrksz) =
           if top > len - lbrksz then (len - start, fromIntegral lbrksz) else (abs reqsiz, 0)
     in  if sum < 0 || sum > weight
-         then Left $
-           if start < 0 || start >= weight
-           then CharIndexOutOfRange i0
-           else CharCountOutOfRange reqsiz0
-         else Right $ if sum == i then emptyTextLine $ theTextLineTags line else line
-          & (textLineString .~ UVec.slice start slicsz vec)
-          . (textLineBreakSize .~ newlbrksz)
+          then Left $
+            if start < 0 || start >= weight
+            then CharIndexOutOfRange i0
+            else CharCountOutOfRange reqsiz0
+          else
+            assertOp "sliceLine" (inspect "slicesz" slicsz) ge ("", 0) $
+            assertOp "sliceLine" (inspect "slicesz" slicsz) le ("top", top) $
+            assertOp "sliceLine" (inspect "start+slicesz" $ start+slicsz) le ("top", top) $
+            Right $ if sum == i then emptyTextLine $ theTextLineTags line else line
+            & (textLineString .~ UVec.slice start slicsz vec)
+            . (textLineBreakSize .~ newlbrksz)
 
 -- | Evaluates to True if the 'TextLine' is undefined. An undefined 'TextLine' is different from an
 -- empty string, it is similar to the 'Prelude.Nothing' constructor.
@@ -1441,18 +1450,19 @@ getSlice
   :: (MonadEditVec (mvec st elem) m, GMVec.MVector mvec elem)
   => Relative Int -> m (mvec st elem)
 getSlice rel@(Relative count) = do
+  traceM $ "-- | getSlice "++show rel --DEBUG
   vec <- getVector
   if rel < 0
    then do
     i <- getRelative rel
     assertOpM "getSlice"
-      (inspect "i + abs count" $ i+abs count) lt (inspect "length vec" $ GMVec.length vec)
+      (inspect "i + abs count" $ i+abs count) le (inspect "length vec" $ GMVec.length vec)
     return $ GMVec.slice i (abs count) vec
    else if rel > 0
    then do
     i <- cursorIndex After
     assertOpM "getSlice"
-      (inspect "i + count" $ i+count) lt (inspect "length vec" $ GMVec.length vec)
+      (inspect "i + count" $ i+count) le (inspect "length vec" $ GMVec.length vec)
     return $ GMVec.slice i count vec
    else return $ GMVec.slice 0 0 vec
 
@@ -1474,6 +1484,7 @@ getVoidSlice
   :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem)
   => Relative Int -> m (Maybe (vec st elem))
 getVoidSlice (Relative count) = do
+  traceM $ "-- | getVoidSlice "++show count --DEBUG
   vec <- getVector
   vsp <- getVoid
   return $ vsp <&> \ (Absolute lo, Absolute hi) ->
@@ -1506,13 +1517,13 @@ copyRegion (Absolute i) (Relative count) = if count == 0 then liftIO $ GMVec.new
   let siz = abs count
   oldvec <- getVector
   before <- getElemCount Before
+  traceM $ "-- | copyRegion (Absolute "++show i++") (Relative "++show count++"), siz="++show siz --DEBUG
   if lo >= before
    then do
     i <- getAbsolute $ Absolute lo
     liftIO $ GMVec.clone $ GMVec.slice i siz oldvec
    else if hi < before
-   then do
-    liftIO $ GMVec.clone $ GMVec.slice lo siz oldvec
+   then liftIO $ GMVec.clone $ GMVec.slice lo siz oldvec
    else do
     let sublen = before - lo
     lovec  <- getSlice $ Relative $ negate sublen
@@ -1619,6 +1630,7 @@ growVector increase = if increase <= 0 then return () else
   countElems >>= \ count -> prepLargerVector (count + increase) >>= \ case
     Nothing     -> return ()
     Just newvec -> do
+      traceM $ "-- | growVector" --DEBUG
       oldbef <- getLoSlice
       oldaft <- getHiSlice
       modVector $ const newvec
@@ -1673,6 +1685,7 @@ shiftCursor
      )
   => Relative Int -> m ()
 shiftCursor (Relative count) =
+  trace ("-- | shiftCursor "++show count) $ --DEBUG
   if count == 0 then return () else getVoid >>= \ case
     Nothing -> done
     Just ~(Absolute lo, Absolute hi) ->
@@ -1680,6 +1693,7 @@ shiftCursor (Relative count) =
       else if count == -1 then popElem Before >>= pushElem After
       else do
         vec  <- getVector
+        traceM $ "-- | shiftCursor: getSlice "++show count --DEBUG
         from <- getSlice (Relative count)
         let slice = if unsafeMode then GMVec.unsafeSlice else GMVec.slice
         let to = vec &
@@ -1711,6 +1725,7 @@ freezeVector
     )
   => m (vec elem)
 freezeVector = do
+  traceM $ "-- | freezeVector" --DEBUG
   newvec <- countElems >>= newVector
   bef <- getLoSlice
   aft <- getHiSlice
@@ -1803,6 +1818,7 @@ copyVec oldVec before after = do
   let len   = GMVec.length oldVec
   let upper = len - after
   let slice = if unsafeMode then GMVec.unsafeSlice else GMVec.slice
+  traceM $ "-- | copyVec: before="++show before++", after="++show after --DEBUG
   newVec <- GMVec.new len
   when (before > 0) $ GMVec.copy (slice     0 before newVec) (slice     0 before oldVec)
   when (after  > 0) $ GMVec.copy (slice upper  after newVec) (slice upper  after oldVec)
@@ -1854,6 +1870,141 @@ lineToCount (Relative (LineIndex i)) = i
 
 charToCount :: Relative CharIndex -> Int
 charToCount (Relative (CharIndex i)) = i
+
+-- | This function checks if a 'LineIndex' is valid. It first checks if the given index is an
+-- extreme value, 'minBound' or 'maxBound', and returns an in-bounds index at the begninning or end
+-- (respectively) of the valid range. If the value is in bounds or an extreme value, this function
+-- returns 'True' along with a non-extreme, valid index value. If the index is out of bounds and not
+-- an extreme value, this function returns 'False' along with an in-bound index value nearest to the
+-- given index value.
+--
+-- If the 'TextBuffer' is completely empty, and 'flushLineEditor' has not been evaluated since the
+-- 'TextBuffer' was first created or since it has been emptied, then this function throws a
+-- 'BufferIsEmpty' exception.
+--
+-- This function can be used with either a @('Relative' 'LineIndex')@ or an
+-- @('Absolute' 'LineIndex')@.
+class AnyLineIndex i where
+  throwOutOfRangeIndex :: (MonadIO m , MonadError TextEditError m) => i -> m void
+  testLineIndex
+    :: (MonadIO m
+       , Show tags --DEBUG
+       )
+    => i -> EditText tags m (Bool, Absolute LineIndex)
+  -- TODO: use 'textLineIndex' or 'validateLineIndex' in all public APIs that use indicies.
+
+instance AnyLineIndex (Absolute LineIndex) where
+  throwOutOfRangeIndex = throwError . LineIndexOutOfRange
+  testLineIndex i0 = countElems >>= \ count ->
+    let i = lineToIndex i0 in if count == 0 then throwError BufferIsEmpty else
+    return $
+    if      i0 == minBound then (True, indexToLine 0)
+    else if i0 == maxBound then (True, indexToLine $ count - 1)
+    else if i  >= count    then (False, indexToLine $ count - 1)
+    else if i  <  0        then (False, 1)
+    else                        (True, i0)
+
+instance AnyLineIndex (Relative LineIndex) where
+  throwOutOfRangeIndex = throwError . LineCountOutOfRange
+  testLineIndex = relativeToAbsolute >=> testLineIndex
+
+-- | Like 'textLineIndex', but throws a 'LineIndexOutOfRange' exception if the given 'LineIndex' is
+-- out of bounds.
+validateLineIndex
+  :: (MonadIO m, AnyLineIndex i
+     , Show tags --DEBUG
+     )
+  => i -> EditText tags m (Absolute LineIndex)
+validateLineIndex i0 = testLineIndex i0 >>= \ (ok, i) ->
+  if ok then return i else throwOutOfRangeIndex i0
+
+-- | Like 'validateLineIndex', but rather than throwing an exception, simply returns 'False' if an
+-- exception would have been thrown, and returns 'True' otherwise.
+lineIndexIsValid
+  :: (MonadIO m, AnyLineIndex i
+     , Show tags --DEBUG
+     )
+  => i -> EditText tags m Bool
+lineIndexIsValid = (`catchError` (const $ return False)) . fmap fst . testLineIndex
+
+-- | Evaluates 'validateLineIndex' on a given 'LineIndex', and if no exceptions are thrown, also
+-- dereferences the index, returning the 'TextLine' stored at the given valid index.
+validateGetLineIndex
+  :: (MonadIO m, AnyLineIndex i
+     , Show tags --DEBUG
+     )
+  => i -> EditText tags m (Absolute LineIndex, TextLine tags)
+validateGetLineIndex = validateLineIndex >=> \ i ->
+  (,) i <$> (getAbsolute (Absolute $ lineToIndex i) >>= getElemIndex)
+
+-- | Tests the validity of the 'lineIndex' of a given 'TextLocation' using 'testLineIndex', and if
+-- the 'lineIndex' is valid, also tests if the 'charIndex' is valid. This function only throws an
+-- exception if the 'TextBuffer' is empty. "Extreme" indicies (e.g. 'minBound' or 'maxBound') are
+-- also considered to be valid index values, and are mapped to their nearest respective valid
+-- 'TextLocation' values, and returned as a valid, non-extreme 'TextLocation' value.
+--
+-- You should pattern match on the value returned by this function using a case statement. The
+-- following patterns indicate the degree to which the given 'TextLocation' was valid:
+--
+-- @
+--  do loc <- 'testLocation' _some_location_
+--     case result of
+--       (Left loc) ->
+--           ... indicates that the 'lineIndex' of the given 'TextLocation' was INVALID, and @loc@
+--               is the 'TextLocation' value for the nearest valid 'TextLocation' value...
+-- 
+--       (Right (textln, valid)) ->
+--           ... indicates that the 'lineIndex' of the given 'TextLocation' is VALID, and
+--               "textln" is bound to the 'TextLine' at that given 'LineIndex'.
+-- 
+--           case valid of
+--               (False, index) ->
+--                   ... indicates that the 'charIndex' of the given 'TextLocation is INVALID,
+--                       and "index" is the 'TextLocation' value nearest to the given
+--                       invalid 'TextLocation' value.
+--
+--               (True, index)  ->
+--                   ... indicates that the given 'TextLocation' is VALID, and "index" is the
+--                       non-extreme valid 'TextLocation' that could be validated.
+-- @
+testLocation
+  :: (MonadIO m
+     , Show tags --DEBUG
+     )
+  => TextLocation -> EditText tags m (Either TextLocation (TextLine tags, (Bool, TextLocation)))
+testLocation loc = do
+  (ok, linum) <- testLineIndex $ loc ^. lineIndex
+  loc <- pure (loc & lineIndex .~ linum)
+  if not ok then return $ Left loc else do
+    textln <- getAbsolute (Absolute $ lineToIndex linum) >>= getElemIndex
+    let valid = indexToChar $ intSize textln - fromIntegral (textln ^. textLineBreakSize)
+    let i     = loc ^. charIndex
+    return $ Right $ (,) textln $ second (($ loc) . (charIndex .~)) $
+      if i == maxBound      then (True , valid)
+      else if i == minBound then (True , 1)
+      else if i >  valid    then (False, valid)
+      else if i <  0        then (False, 1)
+      else                       (True , i)
+
+-- | Like 'testLocation', but evaluates to an exception if the 'TextLocation' is invalid.
+validateLocation
+  :: (MonadIO m
+     , Show tags --DEBUG
+     )
+  => TextLocation -> EditText tags m (TextLocation, TextLine tags)
+validateLocation loc0 = testLocation loc0 >>= \ case
+  Left{}  -> throwError $ LineIndexOutOfRange $ loc0 ^. lineIndex
+  Right (textln, (ok, loc)) -> if ok then return (loc, textln) else
+    throwError $ CharIndexOutOfRange $ loc0 ^. charIndex
+
+-- | Like 'validateLocation' but rather than throwing an exception, returns 'Nothing'. If the
+-- location is valid, the 'TextLine' at the valid 'TextLocation' is returned as a 'Just' value.
+locationIsValid
+  :: (MonadIO m
+     , Show tags --DEBUG
+     )
+  => TextLocation -> EditText tags m (Maybe (TextLine tags))
+locationIsValid = (`catchError` (const $ return Nothing)) . fmap (Just . snd) . validateLocation
 
 ----------------------------------------------------------------------------------------------------
 
@@ -1926,6 +2077,8 @@ copyChars
      )
   => Relative CharIndex -> EditLine tags m (TextLine tags)
 copyChars rel = do
+  traceM $ "-- | copyChars "++show rel                    --DEBUG
+  traceM $ "-- | copyChars: getSliceChk ("++show rel++")" --DEBUG
   slice <- getSliceChk (Relative $ charToCount rel) >>= liftIO . UVec.freeze
   break <- relativeToAbsolute rel >>= pointContainsLineBreak
   lbrk  <- use cursorBreakSize
@@ -1944,6 +2097,7 @@ copyCharsToEnd
      )
   => RelativeToCursor -> EditLine tags m (TextLine tags)
 copyCharsToEnd rel =
+  trace ("-- | copyCharsToEnd ("++show rel++")") $ --DEBUG
   (case rel of { Before -> negate; After -> id; }) <$> getElemCount rel >>=
   copyChars . countToChar  
 
@@ -2026,6 +2180,7 @@ refillLineEditorWith = \ case
     let lbrksz = theTextLineBreakSize line
     let srctop = srclen - fromIntegral lbrksz
     cur <- max 0 . min srctop . charToIndex <$> use bufferTargetCol
+    traceM $ "-- | refillLineEditorWith "++show line++": cur="++show cur --DEBUG
     editLine $ do
       join $ maybe (pure ()) (void . modVector . const) <$> prepLargerVector srclen
       let targlolen = cur
@@ -2038,13 +2193,16 @@ refillLineEditorWith = \ case
       charsAfterCursor  .= targhilen
       -- NOTE: now we call 'getLoSlice and 'getHiSlice', which should produce slices
       --       of size 'targlolen' and 'targhilen'.
+      traceM $ "-- | refillLineEditorWith: targlolen="++show targlolen++", targhilen="++show targhilen --DEBUG
       targlo <- getLoSlice
       targhi <- getHiSlice
       cursorBreakSize   .= lbrksz
       lineEditorTags    .= theTextLineTags line
       liftIO $ do
         let slice = if unsafeMode then UVec.unsafeSlice else UVec.slice
+        traceM $ "-- | refillLineEditorWith: UVec.slice 0 "++show targlolen --DEBUG
         UVec.copy targlo $ slice 0 targlolen srcvec
+        traceM $ "-- | refillLineEditorWith: UVec.slice "++show targlolen++" "++show targhilen --DEBUG
         UVec.copy targhi $ slice targlolen targhilen srcvec
     traceM $ "-- | refillLineEditorWith: lineEditorIsClean .= True" --DEBUG
     bufferLineEditor . lineEditorIsClean .= True
@@ -2174,6 +2332,7 @@ modifyColumn f = liftEditLine $ do
   oldch  <- currentColumnNumber
   weight <- countElems
   lbrksz <- fromIntegral <$> use cursorBreakSize
+  traceM $ "-- | modifyColumn" --DEBUG
   shiftCursor $ Relative $ charToCount $ f oldch $ indexToChar $ weight - lbrksz
   indexToChar <$> getElemCount Before
 
@@ -2338,9 +2497,9 @@ overwriteAtCursor rel concatTags line = case line of
     when (diffsize > 0) $ growVector diffsize -- this resizes the line editor buffer
     buf   <- use lineEditBuffer -- new (resized) buffer
     alloc <- getAllocSize       -- new (resized) allocation value
-    traceM $ "-- | overwriteAtCursor "++show rel++" "++show line++
-              ": count="++show count++", adjusted="++show adjusted++
-              ", diffsize="++show diffsize++", (alloc-adjusted)="++show(alloc-adjusted)
+    traceM $ "-- | overwriteAtCursor "++show rel++" "++show line++                      --DEBUG
+              ": count="++show count++", adjusted="++show adjusted++                    --DEBUG
+              ", diffsize="++show diffsize++", (alloc-adjusted)="++show(alloc-adjusted) --DEBUG
     liftIO $ case rel of
       Before -> UVec.copy (UMVec.slice 0 adjusted buf) (UVec.slice 0 adjusted line)
       After  -> UVec.copy (UMVec.slice (alloc - adjusted) adjusted buf) line
@@ -2453,7 +2612,7 @@ deleteCharsWrap request =
   -- and see if that satisfies the request.
   else deleteChars request >>= \ st0 ->
   let satreq = cursorStepCount st0 in
-  trace ("-- | deleteCharsWrap: satreq="++show satreq) $
+  trace ("-- | deleteCharsWrap: satreq="++show satreq) $ --DEBUG
   if abs satreq >= abs request then
     trace ("-- | deleteCharsWrap: (abs satreq = "++ --DEBUG
            show (abs satreq)++") >= (abs req = "++show (abs request)++") -- DONE") $ --DEBUG
@@ -2470,7 +2629,7 @@ deleteCharsWrap request =
     -- all or part of adjacent lines. If we are deleting forward, delete the final line breaking
     -- character from the line editor, but DO NOT merge the next line into the 'LineEditor'.
     st0 <- if direction == After then (st0 <>) <$> forwardDeleteLineBreak False else pure st0
-    traceM $ "-- | deleteCharsWrap: forLines "++show direction++" "++show(abs satreq, satreq)
+    traceM $ "-- | deleteCharsWrap: forLines "++show direction++" "++show(abs satreq, satreq) --DEBUG
     -- Now let's use 'forLines' to delete each 'TextLine' until the request has been satsified.
     forLines direction st0 $ \ halt line -> do
       st0 <- get
@@ -2637,6 +2796,7 @@ lineBreak
      )
   => RelativeToCursor -> editor tags m ()
 lineBreak rel = liftEditText $ do
+  traceM $ "-- | lineBreak "++show rel --DEBUG
   breaker <- use bufferLineBreaker
   let lbrk     = breaker ^. defaultLineBreak
   let lbrkSize = fromIntegral $ intSize lbrk
@@ -2828,6 +2988,7 @@ textViewAppend appendTags
   TextView{textViewCharCount=countB,textViewVector=vecB} = TextView
     { textViewCharCount = countA + countB
     , textViewVector = let { lenA = Vec.length vecA; lenB = Vec.length vecB; } in
+        trace ("-- | textViewAppend") $ --DEBUG
         if lenA == 0 then vecB else
         if lenB == 0 then vecA else Vec.create
           (do let lastA  = vecA Vec.! (lenA - 1)
@@ -2863,6 +3024,8 @@ textView
      )
   => TextLocation -> TextLocation -> editor tags m (TextView tags)
 textView from to = liftEditText $ do
+  from <- pure $ min from to
+  to   <- pure $ max from to
   nmax <- countElems
   let clampLine = max 1 . min (indexToLine $ nmax - 1)
   (from, to) <- pure
@@ -2870,29 +3033,47 @@ textView from to = liftEditText $ do
     , max from to & lineIndex %~ clampLine
     )
   if nmax <= 0 || from == to then return emptyTextView else do
+    -- Compute the range of lines to copy.
     let unline = lineToIndex . theLocationLineIndex
     let (lo, hi) = (unline from, unline to)
+    traceM $ "-- | textView (from="++show from++") (to="++         --DEBUG
+             show to++"), lo="++show lo++", hi="++show hi++        --DEBUG
+             ", copyRegionChk "++show lo++" "++show (1 + hi - lo)  --DEBUG
+    -- Check the bounds of the character position on the first and last lines.
     newvec <- copyRegionChk (Absolute lo) $ Relative $ 1 + hi - lo
     let top = MVec.length newvec - 1
     let unchar len lbrksz = min (len - lbrksz + 1) . charToIndex .
           max 1 . theLocationCharIndex
-    let onvec i f = liftIO $ MVec.read newvec i >>= MVec.write newvec i . \ case
+    let onvec i getSliceBounds = liftIO $ MVec.read newvec i >>= MVec.write newvec i . \ case
           line@TextLine{}   ->
             let vec      = line ^. textLineString
                 veclen   = UVec.length vec
                 lbrksz   = fromIntegral $ theTextLineBreakSize line
-                (j, len) = f veclen lbrksz
-            in  line & textLineString %~ UVec.slice j len
+                (j, len) = getSliceBounds veclen lbrksz
+            in
+                trace ("-- | textView: getSliceBounds for line "++show i++" -> "++show (j,len)) --DEBUG
+                (line & textLineString %~ UVec.slice j len
+                  . (\ v -> flip trace v $ "-- | textView: length of vector on line "++show i++ --DEBUG
+                      " = "++show (UVec.length v))  --DEBUG
+                )
           TextLineUndefined -> error $
             "textView: trimmed vector contains undefined line at index "++show i
+    traceM $ "-- | textView: trim line 0 and line "++show top++"..." --DEBUG
+    -- TODO: FIX BUG:
+    --     The first or final element of text view is might be an empty vector.
+    --     These need to be removed.
     onvec top $ \ len lbrksz -> (0, unchar len lbrksz to) 
     onvec 0   $ \ len lbrksz -> let i = unchar len lbrksz from in (i, len - i)
     let freeze = liftIO . if unsafeMode then Vec.unsafeFreeze else Vec.freeze
     newvec <- freeze newvec
-    return TextView
-      { textViewCharCount = sum $ intSize <$> Vec.toList newvec
-      , textViewVector    = newvec
-      }
+    let view =
+          TextView
+          { textViewCharCount = sum $ intSize <$> Vec.toList newvec
+          , textViewVector    = newvec
+          }
+    debugPrintView view
+    traceM $ "-- | textView: DONE"
+    return view
 
 -- | Like 'textView', creates a new text view, but rather than taking two 'TextLocation's to delimit
 -- the range, takes two @('Absolute' 'LineIndex')@ values to delimit the range.
