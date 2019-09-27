@@ -403,13 +403,12 @@ newtype LineIndex = LineIndex Int
 newtype CharIndex = CharIndex Int
   deriving (Eq, Ord, Show, Read, Enum, Num)
 
--- | When instructing the editor engine to move by or delete a number of logical character positions
--- (where line breaking characters consisting of two characters are considered a single logical
--- character, thus the 'textLineUnit' and 'lineEditorUnit' functions), you must specify the number
--- of logical characters using a value of this type.
+-- | When instructing the editor engine to move by or delete a number of cursor positions (where
+-- line breaking characters consisting of two characters are considered a single cursor position,
+-- thus the 'moveByCharWrap' or 'deleteCharsWrap' functions), you must specify the number of cursor
+-- positions to move or delete using a value of this type.
 newtype TextCursorSpan = TextCursorSpan Int
   deriving (Eq, Ord, Show, Read, Enum, Num, Bounded)
--- TODO: rename this to 'TextCursorSpan' everywhere.
 
 unwrapTextCursorSpan :: TextCursorSpan -> Int
 unwrapTextCursorSpan (TextCursorSpan o) = o
@@ -1977,7 +1976,7 @@ testLocation loc = do
   loc <- pure (loc & lineIndex .~ linum)
   if not ok then return $ Left loc else do
     textln <- getAbsolute (Absolute $ lineToIndex linum) >>= getElemIndex
-    let valid = indexToChar $ intSize textln - fromIntegral (textln ^. textLineBreakSize)
+    let valid = indexToChar $ unwrapTextCursorSpan $ textLineCursorSpan textln
     let i     = loc ^. charIndex
     return $ Right $ (,) textln $ second (($ loc) . (charIndex .~)) $
       if i == maxBound      then (True , valid)
