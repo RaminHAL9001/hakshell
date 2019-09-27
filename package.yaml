@@ -72,6 +72,7 @@ ghc-options:
 
 library:
   source-dirs: src
+  ghc-options: -O0
   exposed-modules:
   - Hakshell
   - Hakshell.String
