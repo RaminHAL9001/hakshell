@@ -3067,7 +3067,7 @@ textView
   => TextLocation -> TextLocation -> editor tags m (TextView tags)
 textView from to = liftEditText $ do
   (from, loline) <- validateLocation $ min from to
-  (to,  _hiline) <- validateLocation $ max from to
+  (to,   hiline) <- validateLocation $ max from to
   if (from ^. lineIndex) == (to ^. lineIndex) then return $
     let numchars = diffAbsolute (from ^. charIndex) (to ^. charIndex) in TextView
       { textViewCharCount = charToCount numchars
@@ -3079,11 +3079,10 @@ textView from to = liftEditText $ do
     -- Compute the range of lines to copy.
     let top = lineToCount $ diffAbsolute (to ^. lineIndex) (from ^. lineIndex)
     newvec <- copyRegion (Absolute $ lineToIndex $ from ^. lineIndex) (Relative $ top + 1)
-    let onVec i f = GMVec.read newvec i >>= GMVec.write newvec i . f
     let freeze = liftIO . if unsafeMode then Vec.unsafeFreeze else Vec.freeze
     newvec <- liftIO $ do
-      onVec 0   $ snd . splitLineAt (from ^. charIndex)
-      onVec top $ fst . splitLineAt (to   ^. charIndex)
+      GMVec.write newvec 0   $ snd $ splitLineAt (from ^. charIndex) loline
+      GMVec.write newvec top $ fst $ splitLineAt (to   ^. charIndex) hiline
       freeze newvec
     let view = --DEBUG
           TextView
