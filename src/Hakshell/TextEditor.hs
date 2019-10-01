@@ -1544,7 +1544,6 @@ getVoidSlice
   :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem)
   => Relative Int -> m (Maybe (vec st elem))
 getVoidSlice (Relative count) = do
-  traceM $ "-- | getVoidSlice "++show count --DEBUG
   vec <- (,) "getVector" <$> getVector
   vsp <- getVoid
   return $ vsp <&> \ (Absolute lo, Absolute hi) ->
@@ -1692,7 +1691,6 @@ growVector increase = if increase <= 0 then return () else
   countElems >>= \ count -> prepLargerVector (count + increase) >>= \ case
     Nothing     -> return ()
     Just newvec -> do
-      traceM $ "-- | growVector" --DEBUG
       oldbef <- getLoSlice
       oldaft <- getHiSlice
       modVector $ const newvec
@@ -1747,7 +1745,6 @@ shiftCursor
      )
   => Relative Int -> m ()
 shiftCursor (Relative count) =
-  trace ("-- | shiftCursor "++show count) $ --DEBUG
   if count == 0 then return () else getVoid >>= \ case
     Nothing -> done
     Just ~(Absolute lo, Absolute hi) ->
@@ -1755,15 +1752,19 @@ shiftCursor (Relative count) =
       else if count == -1 then popElem Before >>= pushElem After
       else do
         vec  <- getVector
-        traceM $ "-- | shiftCursor: getSlice "++show count --DEBUG
         from <- getSlice (Relative count)
         let to = vec &
-              if      count > 1 then asrtMSlice UnsafeOp "shiftCursor" (asrtShow "lo" lo) (asrtShow "count" count) . (,) "getVector"
-              else if count < 1 then asrtMSlice UnsafeOp "shiftCursor" (asrtShow "hi+count+1" $ hi + count + 1) (asrtShow "negate count" $ negate count) . (,) "getVector"
+              if      count > 1 then asrtMSlice UnsafeOp this
+                (asrtShow "lo" lo)
+                (asrtShow "count" count) . (,) "getVector"
+              else if count < 1 then asrtMSlice UnsafeOp this
+                (asrtShow "hi+count+1" $ hi + count + 1)
+                (asrtShow "negate count" $ negate count) . (,) "getVector"
               else error "shiftCursor: internal error, this should never happen"
         liftIO $ GMVec.move to from
         done
     where
+      this = "shiftCursor"
       done = void $ modCount Before (+ count) >> modCount After (subtract count)
 
 -- Like 'shiftCursor' but performs bounds checking. This function does not throw an out-of-range
@@ -1878,7 +1879,6 @@ copyVec oldVec0 before after = do
   let oldVec = ("oldVec", oldVec0)
   let len   = GMVec.length $ snd oldVec
   let upper = ("len-after", len - after)
-  traceM $ "-- | copyVec: before="++show before++", after="++show after --DEBUG
   newVec <- (,) "newVec" <$> GMVec.new len
   when (before > 0) $ GMVec.copy
     (asrtMSlice UnsafeOp this     (asrtShow "" 0) (asrtShow "before" before) newVec)
@@ -1960,8 +1960,7 @@ class AnyLineIndex i where
 instance AnyLineIndex (Absolute LineIndex) where
   throwOutOfRangeIndex = throwError . LineIndexOutOfRange
   testLineIndex i0 = countElems >>= \ count ->
-    let i = lineToIndex i0 in if count == 0 then throwError BufferIsEmpty else
-    return $
+    let i = lineToIndex i0 in if count == 0 then throwError BufferIsEmpty else return $
     if      i0 == minBound then (True, indexToLine 0)
     else if i0 == maxBound then (True, indexToLine $ count - 1)
     else if i  >= count    then (False, indexToLine $ count - 1)
@@ -2163,8 +2162,6 @@ copyChars
      )
   => Relative CharIndex -> EditLine tags m (TextLine tags)
 copyChars rel = do
-  traceM $ "-- | copyChars "++show rel                    --DEBUG
-  traceM $ "-- | copyChars: getSliceChk ("++show rel++")" --DEBUG
   slice <- getSliceChk (Relative $ charToCount rel) >>= liftIO . UVec.freeze
   break <- relativeToAbsolute rel >>= pointContainsLineBreak
   lbrk  <- use cursorBreakSize
@@ -2183,7 +2180,6 @@ copyCharsToEnd
      )
   => RelativeToCursor -> EditLine tags m (TextLine tags)
 copyCharsToEnd rel =
-  trace ("-- | copyCharsToEnd ("++show rel++")") $ --DEBUG
   (case rel of { Before -> negate; After -> id; }) <$> getElemCount rel >>=
   copyChars . countToChar  
 
@@ -2246,9 +2242,7 @@ refillLineEditor
      , Show tags --DEBUG
      )
   => editor tags m ()
-refillLineEditor =
-  trace ("-- | refillLineEditor") $ --DEBUG
-  liftEditText $ getElem Before >>= refillLineEditorWith
+refillLineEditor = liftEditText $ getElem Before >>= refillLineEditorWith
 
 -- | Like 'refillLineEditor', but replaces the content in the 'bufferLineEditor' with the content in
 -- a given 'TextLine', rather the content of the current line.
@@ -2267,7 +2261,6 @@ refillLineEditorWith = \ case
     let lbrksz = theTextLineBreakSize line
     let srctop = srclen - fromIntegral lbrksz
     cur <- max 0 . min srctop . charToIndex <$> use bufferTargetCol
-    traceM $ "-- | refillLineEditorWith "++show line++": cur="++show cur --DEBUG
     editLine $ do
       join $ maybe (pure ()) (void . modVector . const) <$> prepLargerVector srclen
       let targlolen = cur
@@ -2280,14 +2273,19 @@ refillLineEditorWith = \ case
       charsAfterCursor  .= targhilen
       -- NOTE: now we call 'getLoSlice and 'getHiSlice', which should produce slices
       --       of size 'targlolen' and 'targhilen'.
-      traceM $ "-- | refillLineEditorWith: targlolen="++show targlolen++", targhilen="++show targhilen --DEBUG
       targlo <- getLoSlice
       targhi <- getHiSlice
       cursorBreakSize   .= lbrksz
       lineEditorTags    .= theTextLineTags line
       liftIO $ do
-        UVec.copy targlo $ asrtSlice UnsafeOp this (asrtShow "" 0) (asrtShow "length targlo" targlolen) ("srcvec", srcvec)
-        UVec.copy targhi $ asrtSlice UnsafeOp this (asrtShow "length targlo" targlolen) (asrtShow "length targhi" targhilen) ("srcvec", srcvec)
+        UVec.copy targlo $ asrtSlice UnsafeOp this
+          (asrtShow "" 0)
+          (asrtShow "length targlo" targlolen)
+          ("srcvec", srcvec)
+        UVec.copy targhi $ asrtSlice UnsafeOp this
+          (asrtShow "length targlo" targlolen)
+          (asrtShow "length targhi" targhilen)
+          ("srcvec", srcvec)
     bufferLineEditor . lineEditorIsClean .= True
 
 -- | Delete the content of the 'bufferLineEditor' except for the line breaking characters (if any)
@@ -2354,16 +2352,10 @@ flushLineEditor
 flushLineEditor = liftEditText $ do
   clean <- use $ bufferLineEditor . lineEditorIsClean
   if clean
-   then
-    trace ("-- | flushLineEditor: line editor is clean, will not flush.") $ --DEBUG
-    getElem Before 
+   then getElem Before 
    else do
     line <- editLine copyLineEditor'
-    i <- cursorIndex Before --DEBUG
-    traceM $ "-- | flushLineEditor: cursorIndex="++show i++ --DEBUG
-             ", putElem Before (line="++show line++")" --DEBUG
     putElem Before line
-    traceM $ "-- | flushLineEditor: lineEditorIsClean .= True" --DEBUG
     bufferLineEditor . lineEditorIsClean .= True
     return line
 
@@ -2415,7 +2407,6 @@ modifyColumn f = liftEditLine $ do
   oldch  <- currentColumnNumber
   weight <- countElems
   lbrksz <- fromIntegral <$> use cursorBreakSize
-  traceM $ "-- | modifyColumn" --DEBUG
   shiftCursor $ Relative $ charToCount $ f oldch $ indexToChar $ weight - lbrksz
   indexToChar <$> getElemCount Before
 
@@ -2581,9 +2572,6 @@ overwriteAtCursor rel concatTags line = case line of
     when (diffsize > 0) $ growVector diffsize -- this resizes the line editor buffer
     buf   <- use lineEditBuffer -- new (resized) buffer
     alloc <- getAllocSize       -- new (resized) allocation value
-    traceM $ "-- | overwriteAtCursor "++show rel++" "++show line++                      --DEBUG
-              ": count="++show count++", adjusted="++show adjusted++                    --DEBUG
-              ", diffsize="++show diffsize++", (alloc-adjusted)="++show(alloc-adjusted) --DEBUG
     liftIO $ case rel of
       Before -> UVec.copy
         (asrtMSlice SafeOp this (asrtShow "" 0) (asrtShow "adjusted" adjusted) ("lineEditBuffer", buf))
@@ -2592,7 +2580,6 @@ overwriteAtCursor rel concatTags line = case line of
         (asrtMSlice SafeOp this (asrtShow "alloc-adjusted" $ alloc - adjusted) (asrtShow "adjusted" adjusted) ("buf", buf))
         line
     cursorBreakSize .= lbrksz
-    traceM $ "-- | overwriteAtCursor: lineEditorIsClean .= False" --DEBUG
     lineEditorIsClean .= False
     lineEditorTags    %= (`concatTags` tagsB)
 
@@ -2619,20 +2606,14 @@ deleteChars req@(TextCursorSpan n) =
     before <- getElemCount Before
     let count = negate $ min before $ abs n 
     modCount Before $ const $ before + count
-    traceM $ "-- | deleteChars: modCount Before (const ("++show (before + count)++"))" --DEBUG
-    when (count /= 0) $ do
-      traceM $ "-- | deleteChars: count=("++show count++"), lineEditorIsClean .= False" --DEBUG
-      lineEditorIsClean .= False
+    when (count /= 0) $ lineEditorIsClean .= False
     done count
   else if n > 0 then do
     lbrksz <- fromIntegral <$> use cursorBreakSize
     after  <- getElemCount After
     let count = negate $ min n $ max 0 $ after - lbrksz
     modCount After $ const $ after + count
-    traceM $ "-- | deleteChars: modCount After (const ("++show (after + count)++"))" --DEBUG
-    when (count /= 0) $ do
-      traceM $ "-- | deleteChars: count=("++show count++"), lineEditorIsClean .= False" --DEBUG
-      lineEditorIsClean .= False
+    when (count /= 0) $ lineEditorIsClean .= False
     done count
   else done 0
 
@@ -2656,9 +2637,6 @@ forwardDeleteLineBreak mergeNext = do
   when mergeNext $
     cursorAtEnd After >>=
     (`unless` (popElem After >>= editLine . overwriteAtCursor After const))
-    . (\ end -> flip trace end $ --DEBUG
-        "-- | forwardDeleteLineBreak: cursorAtEnd -> "++show end --DEBUG
-      ) --DEBUG
   return CharStats
     { cursorStepCount = TextCursorSpan $ after - lbrksz + 1
     , deltaCharCount  = negate $ Relative $ CharIndex after
@@ -2970,7 +2948,6 @@ gotoPosition
      )
   => TextLocation -> editor tags m TextLocation
 gotoPosition loc@(TextLocation{theLocationLineIndex=ln,theLocationCharIndex=ch}) = liftEditText $
-  trace ("-- | gotoPosition ("++show loc++")") $ --DEBUG
   TextLocation <$> flushRefill (gotoLine ln) <*> gotoChar ch
 
 -- | Save the location of the cursor, then evaluate an @editor@ function. After evaluation
@@ -3112,9 +3089,9 @@ textView
      , Show tags --DEBUG
      )
   => TextLocation -> TextLocation -> editor tags m (TextView tags)
-textView from to = liftEditText $ do
-  (from, loline) <- validateLocation $ min from to
-  (to,   hiline) <- validateLocation $ max from to
+textView from0 to0 = liftEditText $ do
+  (from, loline) <- validateLocation $ min from0 to0
+  (to,   hiline) <- validateLocation $ max from0 to0
   if (from ^. lineIndex) == (to ^. lineIndex) then return $
     let numchars = diffAbsolute (from ^. charIndex) (to ^. charIndex) in TextView
       { textViewCharCount = charToCount numchars
@@ -3131,14 +3108,10 @@ textView from to = liftEditText $ do
       GMVec.write newvec 0   $ snd $ splitLineAt (from ^. charIndex) loline
       GMVec.write newvec top $ fst $ splitLineAt (to   ^. charIndex) hiline
       freeze newvec
-    let view = --DEBUG
-          TextView
-          { textViewCharCount = sum $ intSize <$> Vec.toList newvec
-          , textViewVector    = newvec
-          }
-    debugPrintView view --DEBUG
-    traceM $ "-- | textView: DONE" --DEBUG
-    return view
+    return TextView
+      { textViewCharCount = sum $ intSize <$> Vec.toList newvec
+      , textViewVector    = newvec
+      }
 
 -- | Like 'textView', creates a new text view, but rather than taking two 'TextLocation's to delimit
 -- the range, takes two @('Absolute' 'LineIndex')@ values to delimit the range.
