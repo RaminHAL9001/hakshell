@@ -264,7 +264,7 @@ import           Control.Monad.Reader
 import           Control.Monad.State
 import           Control.Monad.State.Class
 
-import           Data.Semigroup
+--import           Data.Semigroup
 import qualified Data.Vector                 as Vec
 import qualified Data.Vector.Generic         as GVec
 import qualified Data.Vector.Mutable         as MVec
@@ -344,41 +344,77 @@ safeAbs n = if n >= 0 then n else negate $ if n == minBound then n + 1 else n
 
 -- An assertion system.
 
-assert :: String -> String -> Bool -> r -> r
-assert funcName msg fact = if not enableAssertions || fact then id else const $ error $
-  "\n-- | "++funcName++": assertion "++msg++" failed"
+-- Check that 'Assertion's are true. If one or more 'Assertion's are false, report which ones are
+-- false.
+assert :: FunctionName -> [Assertion] -> r -> r
+assert funcName tests a =
+  if not enableAssertions || and (checkAssertion <$> tests) then a else error $ 
+  "-- | "++funcName++": ASSERTION FAILED\n"++
+  unlines (("-- | " ++) <$> (tests >>= reportAssertion))
 
---assertM :: Monad m => String -> String -> Bool -> m ()
---assertM funcName msg fact = assert funcName msg fact $ pure ()
+type FunctionName = String
 
-assertOp :: String -> (String, a) -> (String, a -> b -> Bool) -> (String, b) -> r -> r
-assertOp funcName (aName, a) (opName, op) (bName, b) =
-  assert funcName ('(' : aName ++ ' ' : opName ++ ' ' : bName ++ ")") (op a b)
+type LabeledValue a = (String, a)
 
-assertOpM :: Monad m => String -> (String, a) -> (String, a -> b -> Bool) -> (String, b) -> m ()
-assertOpM funcName a op b = assertOp funcName a op b $ pure ()
+data Assertion = Info String | Assertion String Bool
 
--- | Show a showable value along with it's name, pass this as an argument to 'assertOp'.
-inspect :: Show a => String -> a -> (String, a)
-inspect name a = if null name then (show a, a) else ('(' : name ++ '=' : show a ++ ")", a)
+data UseSafeOp = UnsafeOp | SafeOp
+  deriving (Eq, Ord, Show)
 
-eq :: Eq a => (String, a -> a -> Bool)
-eq = ("==", (==))
+checkAssertion :: Assertion -> Bool
+checkAssertion = \ case { Info{} -> True; Assertion _ ok -> ok; }
 
---ne :: Eq a => (String, a -> a -> Bool)
---ne = ("/=", (/=))
+reportAssertion :: Assertion -> [String]
+reportAssertion = \ case { Info msg -> [msg]; Assertion msg ok -> if ok then [] else [msg]; }
 
---gt :: Ord a => (String, a -> a -> Bool)
---gt = (">", (>))
+type AsrtGSlice vec = Int -> Int -> vec -> vec
 
---ge :: Ord a => (String, a -> a -> Bool)
---ge = (">=", (>=))
+asrtGSlice
+  :: (vec -> Int) -> AsrtGSlice vec -> AsrtGSlice vec
+  -> UseSafeOp -> FunctionName -> AsrtGSlice vec
+asrtGSlice length safe unsafe safety funcName i siz vec = let len = length vec in assert funcName
+  [ asrtShow ""  0 `le` asrtShow "i" i
+  , asrtShow "i" i `le` asrtShow "veclength" len
+  , asrtShow ""  0 `le` asrtShow "i+siz" (i+siz)
+  , asrtShow "i+siz" (i+siz) `le` asrtShow "veclength" len
+  ]
+  (if not unsafeMode || safety == SafeOp then safe i siz vec else unsafe i siz vec)
 
---lt :: Ord a => (String, a -> a -> Bool)
---lt = ("<", (<))
+asrtSlice :: GVec.Vector vec elem => UseSafeOp -> FunctionName -> AsrtGSlice (vec elem)
+asrtSlice = asrtGSlice GVec.length GVec.slice GVec.unsafeSlice
 
-le :: Ord a => (String, a -> a -> Bool)
-le = ("<=", (<=))
+asrtMSlice
+  :: (GMVec.MVector vec elem)
+  => UseSafeOp -> FunctionName -> Int -> Int -> vec st elem -> vec st elem
+asrtMSlice = asrtGSlice GMVec.length GMVec.slice GMVec.unsafeSlice
+
+type AssertCompare a = LabeledValue a -> LabeledValue a -> Assertion
+
+asrtCompare :: String -> (a -> a -> Bool) -> AssertCompare a
+asrtCompare compareName compare (lblA, a) (lblB, b) =
+  Assertion ('(' : lblA ++ ' ' : compareName ++ ' ' : lblB ++ ")") (compare a b)
+
+asrtShow :: Show a => String -> a -> LabeledValue a
+asrtShow varName val = if null varName then (show val, val) else
+  ('(' : varName ++ '=' : show val ++ ")", val)
+
+eq :: Eq a => AssertCompare a
+eq = asrtCompare "==" (==)
+
+ne :: Ord a => AssertCompare a
+ne = asrtCompare "/=" (/=)
+
+gt :: Ord a => AssertCompare a
+gt = asrtCompare ">"  (>)
+
+ge :: Ord a => AssertCompare a
+ge = asrtCompare ">=" (>=)
+
+lt :: Ord a => AssertCompare a
+lt = asrtCompare "<"  (<)
+
+le :: Ord a => AssertCompare a
+le = asrtCompare "<=" (<=)
 
 ----------------------------------------------------------------------------------------------------
 
@@ -933,8 +969,8 @@ sliceLineToEnd rel i = \ case
 
 splitLineAt
   ::
-    (Show tags) => --DEBUG
-    Absolute CharIndex -> TextLine tags -> (TextLine tags, TextLine tags)
+    (Show tags) --DEBUG
+  => Absolute CharIndex -> TextLine tags -> (TextLine tags, TextLine tags)
 splitLineAt i line = case line of
   TextLineUndefined -> error $ "splitLineAt ("++show i++") on undefined line"
   _ -> if i >= super then (line, empty) else if i < 1 then (empty, line) else
@@ -980,7 +1016,7 @@ sliceLine i0 reqsiz0 = \ case
             else CharCountOutOfRange reqsiz0
           else
             Right $ if sum == i then emptyTextLine $ theTextLineTags line else line
-            & (textLineString .~ UVec.slice start slicsz vec)
+            & (textLineString .~ asrtSlice SafeOp "sliceLine" start slicsz vec)
             . (textLineBreakSize .~ newlbrksz)
    -- TODO: redefine this function in terms of 'testCharIndex'.
    --
@@ -992,7 +1028,7 @@ sliceLineNoChk
   ::
     (Show tags)
   => Absolute CharIndex -> Relative CharIndex -> TextLine tags -> TextLine tags
-sliceLineNoChk i req line = line & textLineString %~ UVec.slice (charToIndex i)
+sliceLineNoChk i req line = line & textLineString %~ asrtSlice SafeOp "sliceLineNoChk" (charToIndex i)
   ( if indexIsOnLineBreak line i && req == 1
     then fromIntegral $ line ^. textLineBreakSize
     else charToCount req
@@ -1215,9 +1251,9 @@ newLineEditorAt parent loc = liftIO $ flip runEditTextIO parent $ do
     let buflen = head $ takeWhile (< strlen) $ iterate (* 2) 1024
     buf <- liftIO $ UMVec.new buflen
     UVec.copy (UMVec.slice 0 cur buf)
-              (UVec.slice 0 cur str) 
+              (asrtSlice SafeOp "newLineEditorAt" 0 cur str) 
     UVec.copy (UMVec.slice (buflen - cur + strlen) (cur - strlen) buf)
-              (UVec.slice cur (strlen - cur) str)
+              (asrtSlice SafeOp "newLineEditorAt" cur (strlen - cur) str)
     return LineEditor
       { theLineEditBuffer    = buf
       , parentTextEditor     = parent
@@ -1467,21 +1503,16 @@ getSlice
   :: (MonadEditVec (mvec st elem) m, GMVec.MVector mvec elem)
   => Relative Int -> m (mvec st elem)
 getSlice rel@(Relative count) = do
-  traceM $ "-- | getSlice "++show rel --DEBUG
   vec <- getVector
   if rel < 0
-   then do
-    i <- getRelative rel
-    assertOpM "getSlice"
-      (inspect "i + abs count" $ i+abs count) le (inspect "length vec" $ GMVec.length vec)
-    return $ GMVec.slice i (abs count) vec
-   else if rel > 0
-   then do
-    i <- cursorIndex After
-    assertOpM "getSlice"
-      (inspect "i + count" $ i+count) le (inspect "length vec" $ GMVec.length vec)
-    return $ GMVec.slice i count vec
-   else return $ GMVec.slice 0 0 vec
+    then do
+      i <- getRelative rel
+      return $ asrtMSlice SafeOp "getSlice" i (abs count) vec
+    else if rel > 0
+    then do
+      i <- cursorIndex After
+      return $ asrtMSlice SafeOp "getSlice" i count vec
+    else return $ GMVec.slice 0 0 vec
 
 -- Like 'getSlice' but performs bounds checking.
 getSliceChk
@@ -1506,10 +1537,10 @@ getVoidSlice (Relative count) = do
   vsp <- getVoid
   return $ vsp <&> \ (Absolute lo, Absolute hi) ->
    if count < 0
-   then GMVec.slice (hi + count) (abs count) vec
+   then asrtMSlice SafeOp "getVoidSlice" (hi + count) (abs count) vec
    else if count > 0
-   then GMVec.slice lo count vec
-   else GMVec.slice 0 0 vec
+   then asrtMSlice SafeOp "getVoidSlice" lo count vec
+   else asrtMSlice SafeOp "getVoidSlice" 0 0 vec
 
 -- Obtain a slice (using 'getSlice') for the portion of the vector containing elements before or on
 -- the current cursor.
@@ -1538,17 +1569,17 @@ copyRegion (Absolute i) (Relative count) = if count == 0 then liftIO $ GMVec.new
   if lo >= before
    then do
     i <- getAbsolute $ Absolute lo
-    liftIO $ GMVec.clone $ GMVec.slice i siz oldvec
+    liftIO $ GMVec.clone $ asrtMSlice SafeOp "copyRegion" i siz oldvec
    else if hi < before
-   then liftIO $ GMVec.clone $ GMVec.slice lo siz oldvec
+   then liftIO $ GMVec.clone $ asrtMSlice SafeOp "copyRegion" lo siz oldvec
    else do
     let sublen = before - lo
     lovec  <- getSlice $ Relative $ negate sublen
     hivec  <- getSlice $ Relative $ hi - before
     newvec <- newVector siz
     let copy  = (.) liftIO . if unsafeMode then GMVec.unsafeCopy else GMVec.copy
-    copy (GMVec.slice 0 sublen newvec) lovec
-    copy (GMVec.slice sublen (siz - sublen) newvec) hivec
+    copy (asrtMSlice SafeOp "copyRegion" 0 sublen newvec) lovec
+    copy (asrtMSlice SafeOp "copyRegion" sublen (siz - sublen) newvec) hivec
     return newvec
 
 -- Like 'copyRegion', but performs bounds checking.
@@ -1712,10 +1743,9 @@ shiftCursor (Relative count) =
         vec  <- getVector
         traceM $ "-- | shiftCursor: getSlice "++show count --DEBUG
         from <- getSlice (Relative count)
-        let slice = if unsafeMode then GMVec.unsafeSlice else GMVec.slice
         let to = vec &
-              if      count > 1 then slice lo count
-              else if count < 1 then slice (hi + count + 1) (negate count)
+              if      count > 1 then asrtMSlice UnsafeOp "shiftCursor" lo count
+              else if count < 1 then asrtMSlice UnsafeOp "shiftCursor" (hi + count + 1) (negate count)
               else error "shiftCursor: internal error, this should never happen"
         liftIO $ GMVec.move to from
         done
@@ -1742,14 +1772,12 @@ freezeVector
     )
   => m (vec elem)
 freezeVector = do
-  traceM $ "-- | freezeVector" --DEBUG
   newvec <- countElems >>= newVector
   bef <- getLoSlice
   aft <- getHiSlice
-  let slice = if unsafeMode then GMVec.unsafeSlice else GMVec.slice
   liftIO $ do
-    GMVec.copy (slice 0 (GMVec.length bef) newvec) bef
-    GMVec.copy (slice (GMVec.length bef) (GMVec.length aft) newvec) aft
+    GMVec.copy (asrtMSlice UnsafeOp "freezeVector" 0 (GMVec.length bef) newvec) bef
+    GMVec.copy (asrtMSlice UnsafeOp "freezeVector" (GMVec.length bef) (GMVec.length aft) newvec) aft
     GVec.unsafeFreeze newvec
 
 ----------------------------------------------------------------------------------------------------
@@ -1834,11 +1862,14 @@ copyVec
 copyVec oldVec before after = do
   let len   = GMVec.length oldVec
   let upper = len - after
-  let slice = if unsafeMode then GMVec.unsafeSlice else GMVec.slice
   traceM $ "-- | copyVec: before="++show before++", after="++show after --DEBUG
   newVec <- GMVec.new len
-  when (before > 0) $ GMVec.copy (slice     0 before newVec) (slice     0 before oldVec)
-  when (after  > 0) $ GMVec.copy (slice upper  after newVec) (slice upper  after oldVec)
+  when (before > 0) $ GMVec.copy
+    (asrtMSlice UnsafeOp "copyVec"     0 before newVec)
+    (asrtMSlice UnsafeOp "copyVec"     0 before oldVec)
+  when (after  > 0) $ GMVec.copy
+    (asrtMSlice UnsafeOp "copyVec" upper  after newVec)
+    (asrtMSlice UnsafeOp "copyVec" upper  after oldVec)
   return newVec
 
 -- | Push a 'TextLine' before or after the cursor. This function does not effect the content of the
@@ -2238,11 +2269,10 @@ refillLineEditorWith = \ case
       cursorBreakSize   .= lbrksz
       lineEditorTags    .= theTextLineTags line
       liftIO $ do
-        let slice = if unsafeMode then UVec.unsafeSlice else UVec.slice
-        traceM $ "-- | refillLineEditorWith: UVec.slice 0 "++show targlolen --DEBUG
-        UVec.copy targlo $ slice 0 targlolen srcvec
-        traceM $ "-- | refillLineEditorWith: UVec.slice "++show targlolen++" "++show targhilen --DEBUG
-        UVec.copy targhi $ slice targlolen targhilen srcvec
+        traceM $ "-- | refillLineEditorWith: asrtSlice 0 "++show targlolen --DEBUG
+        UVec.copy targlo $ asrtSlice UnsafeOp "refillLineEditorWith" 0 targlolen srcvec
+        traceM $ "-- | refillLineEditorWith: asrtSlice "++show targlolen++" "++show targhilen --DEBUG
+        UVec.copy targhi $ asrtSlice UnsafeOp "refillLineEditorWith" targlolen targhilen srcvec
     traceM $ "-- | refillLineEditorWith: lineEditorIsClean .= True" --DEBUG
     bufferLineEditor . lineEditorIsClean .= True
 
@@ -2527,6 +2557,7 @@ overwriteAtCursor rel concatTags line = case line of
    , theTextLineBreakSize = lbrksz
    , theTextLineTags      = tagsB
    } -> do
+    let this = "overwriteAtCursor"
     modCount rel $ const 0 -- this "deletes" the chars Before/After the cursor
     count <- countElems
     alloc <- getAllocSize
@@ -2540,8 +2571,12 @@ overwriteAtCursor rel concatTags line = case line of
               ": count="++show count++", adjusted="++show adjusted++                    --DEBUG
               ", diffsize="++show diffsize++", (alloc-adjusted)="++show(alloc-adjusted) --DEBUG
     liftIO $ case rel of
-      Before -> UVec.copy (UMVec.slice 0 adjusted buf) (UVec.slice 0 adjusted line)
-      After  -> UVec.copy (UMVec.slice (alloc - adjusted) adjusted buf) line
+      Before -> UVec.copy
+        (asrtMSlice SafeOp this 0 adjusted buf)
+        (asrtSlice SafeOp this 0 adjusted line)
+      After  -> UVec.copy
+        (asrtMSlice SafeOp this (alloc - adjusted) adjusted buf)
+        line
     cursorBreakSize .= lbrksz
     traceM $ "-- | overwriteAtCursor: lineEditorIsClean .= False" --DEBUG
     lineEditorIsClean .= False
@@ -2700,8 +2735,6 @@ deleteCharsWrap request =
                 { cursorStepCount = sign $ textLineCursorSpan delete
                 , deltaCharCount  = countToChar $ negate $ intSize delete
                 } 
-          assertOpM "deleteCharsWrap"
-            (inspect "cursorStepCount" $ cursorStepCount st) eq (inspect "request" request)
           put st
         return []
 
@@ -2845,7 +2878,7 @@ lineBreak rel = liftEditText $ do
       cursor <- use bufferLineEditor
       let vec = cursor ^. lineEditBuffer
       let cur = cursor ^. charsBeforeCursor
-      str <- liftIO $! UVec.freeze $! UMVec.slice 0 cur vec
+      str <- liftIO $! UVec.freeze $! asrtMSlice SafeOp "lineBreak" 0 cur vec
       pushLine Before $ TextLine
         { theTextLineTags      = cursor ^. lineEditorTags
         , theTextLineString    = str
@@ -2858,7 +2891,7 @@ lineBreak rel = liftEditText $ do
       let len = UMVec.length vec
       let cur = cursor ^. charsAfterCursor
       when (cur > 0) $ do
-        str <- liftIO $! UVec.freeze $! UMVec.slice (len - cur) cur vec
+        str <- liftIO $! UVec.freeze $! asrtMSlice SafeOp "lineBreak" (len - cur) cur vec
         pushLine After $ TextLine
           { theTextLineTags      = cursor ^. lineEditorTags
           , theTextLineString    = str
@@ -3044,8 +3077,8 @@ textViewAppend appendTags
                     , theTextLineTags = appendTags (theTextLineTags lastA) (theTextLineTags firstB)
                     , theTextLineBreakSize = theTextLineBreakSize firstB
                     }
-              let listA = Vec.toList $ Vec.slice 0 (lenA - 1) vecA
-              let listB = Vec.toList $ Vec.slice 1 (lenB - 1) vecB
+              let listA = Vec.toList $ asrtSlice SafeOp "textViewAppend" 0 (lenA - 1) vecA
+              let listB = Vec.toList $ asrtSlice SafeOp "textViewAppend" 1 (lenB - 1) vecB
               let (size, list) = if theTextLineBreakSize lastA > 0
                     then (lenAB, listA ++ lastA : firstB : listB)
                     else (lenAB - 1, listA ++ lineAB : listB)
