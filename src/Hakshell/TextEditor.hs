@@ -3124,7 +3124,7 @@ textView from to = liftEditText $ do
     to <- if to ^. charIndex > 1 then pure to else
       fst <$> validateLocation (to & (lineIndex -~ 1) . (charIndex .~ maxBound))
     -- Compute the range of lines to copy.
-    let top = lineToCount $ diffAbsolute (to ^. lineIndex) (from ^. lineIndex)
+    let top = lineToCount $ diffAbsolute (from ^. lineIndex) (to ^. lineIndex)
     newvec <- copyRegion (Absolute $ lineToIndex $ from ^. lineIndex) (Relative $ top + 1)
     let freeze = liftIO . if unsafeMode then Vec.unsafeFreeze else Vec.freeze
     newvec <- liftIO $ do
