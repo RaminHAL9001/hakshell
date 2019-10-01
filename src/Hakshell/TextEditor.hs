@@ -3118,7 +3118,7 @@ textView from to = liftEditText $ do
   if (from ^. lineIndex) == (to ^. lineIndex) then return $
     let numchars = diffAbsolute (from ^. charIndex) (to ^. charIndex) in TextView
       { textViewCharCount = charToCount numchars
-      , textViewVector = Vec.singleton $ sliceLineNoChk (to ^. charIndex) numchars loline
+      , textViewVector = Vec.singleton $ sliceLineNoChk (from ^. charIndex) numchars loline
       }
   else do
     to <- if to ^. charIndex > 1 then pure to else
