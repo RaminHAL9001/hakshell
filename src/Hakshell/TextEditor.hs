@@ -351,6 +351,7 @@ assert funcName tests a =
   if not enableAssertions || and (checkAssertion <$> tests) then a else error $ 
   "-- | "++funcName++": ASSERTION FAILED\n"++
   unlines (("-- | " ++) <$> (tests >>= reportAssertion))
+{-# INLINE assert #-}
 
 type FunctionName = String
 
@@ -377,20 +378,51 @@ asrtGSlice length safe unsafe safety funcName i siz vec =
   let len = (\ lbl -> "(length "++lbl++")") *** length $ vec  in
   let top = ('(' : fst i ++ fst siz ++ ")", snd i + snd siz) in
   assert funcName
-    [asrtShow "" 0 `le` i, i `le` len, asrtShow "" 0 `le` top, top `le` len]
+    [asrtZero `le` i, i `le` len, asrtZero `le` top, top `le` len]
     ((if not unsafeMode || safety == SafeOp then safe else unsafe) (snd i) (snd siz) (snd vec))
+{-# INLINE asrtGSlice #-}
 
 asrtSlice
   :: GVec.Vector vec elem
   => UseSafeOp -> FunctionName
   -> LabeledValue Int -> LabeledValue Int -> LabeledValue (vec elem) -> vec elem
 asrtSlice = asrtGSlice GVec.length GVec.slice GVec.unsafeSlice
+{-# INLINE asrtSlice #-}
 
 asrtMSlice
   :: (GMVec.MVector vec elem)
   => UseSafeOp -> FunctionName
   -> LabeledValue Int -> LabeledValue Int -> LabeledValue (vec st elem) -> vec st elem
 asrtMSlice = asrtGSlice GMVec.length GMVec.slice GMVec.unsafeSlice
+{-# INLINE asrtMSlice #-}
+
+asrtGReadWrite
+  :: (GMVec.MVector vec elem)
+  => (vec st elem -> Int)
+  -> (vec st elem -> Int -> rw)
+  -> (vec st elem -> Int -> rw)
+  -> UseSafeOp -> FunctionName
+  -> LabeledValue (vec st elem) -> LabeledValue Int -> rw
+asrtGReadWrite length safe unsafe safety funcName vec i =
+  let len = (\ lbl -> "(length "++lbl++")") *** length $ vec in
+  assert funcName
+    [asrtZero `le` i, i `lt` len]
+    ((if not unsafeMode || safety == SafeOp then safe else unsafe) (snd vec) (snd i))
+{-# INLINE asrtGReadWrite #-}
+
+asrtMRead
+  :: (PrimMonad m, GMVec.MVector vec elem)
+  => UseSafeOp -> FunctionName
+  -> LabeledValue (vec (PrimState m) elem) -> LabeledValue Int -> m elem
+asrtMRead = asrtGReadWrite GMVec.length GMVec.read GMVec.unsafeRead
+{-# INLINE asrtMRead #-}
+
+asrtMWrite
+  :: (PrimMonad m, GMVec.MVector vec elem)
+  => UseSafeOp -> FunctionName
+  -> LabeledValue (vec (PrimState m) elem) -> LabeledValue Int -> elem -> m ()
+asrtMWrite = asrtGReadWrite GMVec.length GMVec.write GMVec.unsafeWrite
+{-# INLINE asrtMWrite #-}
 
 type AssertCompare a = LabeledValue a -> LabeledValue a -> Assertion
 
@@ -402,23 +434,29 @@ asrtShow :: Show a => String -> a -> LabeledValue a
 asrtShow varName val = if null varName then (show val, val) else
   ('(' : varName ++ '=' : show val ++ ")", val)
 
-eq :: Eq a => AssertCompare a
-eq = asrtCompare "==" (==)
+--eq :: Eq a => AssertCompare a
+--eq = asrtCompare "==" (==)
 
-ne :: Ord a => AssertCompare a
-ne = asrtCompare "/=" (/=)
+--ne :: Ord a => AssertCompare a
+--ne = asrtCompare "/=" (/=)
 
-gt :: Ord a => AssertCompare a
-gt = asrtCompare ">"  (>)
+--gt :: Ord a => AssertCompare a
+--gt = asrtCompare ">"  (>)
 
-ge :: Ord a => AssertCompare a
-ge = asrtCompare ">=" (>=)
+--ge :: Ord a => AssertCompare a
+--ge = asrtCompare ">=" (>=)
 
 lt :: Ord a => AssertCompare a
 lt = asrtCompare "<"  (<)
 
 le :: Ord a => AssertCompare a
 le = asrtCompare "<=" (<=)
+
+asrtZero :: Num n => LabeledValue n
+asrtZero = ("0", 0)
+
+asrtOne :: Num n => LabeledValue n
+asrtOne = ("1", 1)
 
 ----------------------------------------------------------------------------------------------------
 
@@ -1254,7 +1292,7 @@ newLineEditorAt parent loc = liftIO $ flip runEditTextIO parent $ do
   i <- getAbsoluteChk $ Absolute $ lineToIndex $ loc ^. lineIndex
   line <- getElemIndex i
   liftIO $ do
-    let this = "newLineEditorAt"
+    let myname = "newLineEditorAt"
     let str = ("textLineString", line ^. textLineString)
     let strlen = intSize $ snd str
     let breakSize = line ^. textLineBreakSize
@@ -1262,10 +1300,10 @@ newLineEditorAt parent loc = liftIO $ flip runEditTextIO parent $ do
     cur <- pure $ min (max 0 $ strlen - fromIntegral breakSize) $ max 0 cur
     let buflen = head $ takeWhile (< strlen) $ iterate (* 2) 1024
     newbuf <- liftIO $ (,) "newbuf" <$> UMVec.new buflen
-    UVec.copy (asrtMSlice SafeOp this (asrtShow "" 0) (asrtShow "cur" cur) newbuf)
-              (asrtSlice SafeOp this (asrtShow "" 0) (asrtShow "cur" cur) str)
-    UVec.copy (asrtMSlice SafeOp this (asrtShow "buflen-cur+strlen" $ buflen - cur + strlen) (asrtShow "cur-strlen" $ cur - strlen) newbuf)
-              (asrtSlice SafeOp this (asrtShow "cur" cur) (asrtShow "strlen-cur" $ strlen - cur) str)
+    UVec.copy (asrtMSlice SafeOp myname asrtZero (asrtShow "cur" cur) newbuf)
+              (asrtSlice  SafeOp myname asrtZero (asrtShow "cur" cur) str)
+    UVec.copy (asrtMSlice SafeOp myname (asrtShow "buflen-cur+strlen" $ buflen - cur + strlen) (asrtShow "cur-strlen" $ cur - strlen) newbuf)
+              (asrtSlice  SafeOp myname (asrtShow "cur" cur) (asrtShow "strlen-cur" $ strlen - cur) str)
     return LineEditor
       { theLineEditBuffer    = snd newbuf
       , parentTextEditor     = parent
@@ -1551,7 +1589,7 @@ getVoidSlice (Relative count) = do
    then asrtMSlice SafeOp "getVoidSlice" (asrtShow "hi+count" $ hi + count) (asrtShow "abs count" $ abs count) vec
    else if count > 0
    then asrtMSlice SafeOp "getVoidSlice" (asrtShow "lo" lo) (asrtShow "count" count) vec
-   else asrtMSlice SafeOp "getVoidSlice" (asrtShow "" 0) (asrtShow "" 0) vec
+   else asrtMSlice SafeOp "getVoidSlice" asrtZero asrtZero vec
 
 -- Obtain a slice (using 'getSlice') for the portion of the vector containing elements before or on
 -- the current cursor.
@@ -1570,7 +1608,7 @@ copyRegion
   :: (GMVec.MVector vec elem, MonadEditVec (vec RealWorld elem) m)
   => Absolute Int -> Relative Int -> m (vec RealWorld elem)
 copyRegion (Absolute i) (Relative count) = if count == 0 then liftIO $ GMVec.new 0 else do
-  let this = "copyRegion"
+  let myname = "copyRegion"
   let sum = i + count
   let lo  = min i sum
   let hi  = max i sum
@@ -1580,18 +1618,18 @@ copyRegion (Absolute i) (Relative count) = if count == 0 then liftIO $ GMVec.new
   if lo >= before
    then do
     i <- getAbsolute $ Absolute lo
-    liftIO $ GMVec.clone $ asrtMSlice SafeOp this (asrtShow "getAbsolute" i) siz oldvec
+    liftIO $ GMVec.clone $ asrtMSlice SafeOp myname (asrtShow "getAbsolute" i) siz oldvec
    else if hi < before
-   then liftIO $ GMVec.clone $ asrtMSlice SafeOp this (asrtShow "lo" lo) siz oldvec
+   then liftIO $ GMVec.clone $ asrtMSlice SafeOp myname (asrtShow "lo" lo) siz oldvec
    else do
     let sublen = before - lo
     lovec  <- getSlice $ Relative $ negate sublen
     hivec  <- getSlice $ Relative $ hi - before
     newvec <- newVector (snd siz)
     let copy  = (.) liftIO . if unsafeMode then GMVec.unsafeCopy else GMVec.copy
-    flip copy lovec $ asrtMSlice SafeOp this
-      (asrtShow "" 0) (asrtShow "sublen" sublen) ("newvec", newvec)
-    flip copy hivec $ asrtMSlice SafeOp this
+    flip copy lovec $ asrtMSlice SafeOp myname
+      asrtZero (asrtShow "sublen" sublen) ("newvec", newvec)
+    flip copy hivec $ asrtMSlice SafeOp myname
       (asrtShow "sublen" sublen) (asrtShow "siz-sublen" $ snd siz - sublen) ("newvec", newvec)
     return newvec
 
@@ -1613,8 +1651,10 @@ putElemIndex
      )
   => Int -> elem -> m ()
 putElemIndex i elem =
-  ((if unsafeMode then GMVec.unsafeWrite else GMVec.write) <$>
-    getVector <*> pure i <*> pure elem
+  ( asrtMWrite UnsafeOp "putElemIndex"
+      <$> ((,) "getVector" <$> getVector)
+      <*> pure (asrtShow "i" i)
+      <*> pure elem
   ) >>= liftIO
 
 -- Read an element from a vector index. __WARNING__: there is no bounds checking.
@@ -1623,8 +1663,11 @@ getElemIndex
      , Show elem --DEBUG
      )
   => Int -> m elem
-getElemIndex i = read <$> getVector <*> pure i >>= liftIO where
-  read = if unsafeMode then GMVec.unsafeRead else GMVec.read
+getElemIndex i =
+  ( asrtMRead UnsafeOp "getElemIndex"
+      <$> ((,) "getVector" <$> getVector)
+      <*> pure (asrtShow "i" i)
+  ) >>= liftIO
 
 -- Like 'putElemIndex' but the index to which the element is written is given by a
 -- 'RelativeToCursor' value, so the index returned by 'cursorIndex'. The cursor position is not
@@ -1754,17 +1797,17 @@ shiftCursor (Relative count) =
         vec  <- getVector
         from <- getSlice (Relative count)
         let to = vec &
-              if      count > 1 then asrtMSlice UnsafeOp this
+              if      count > 1 then asrtMSlice UnsafeOp myname
                 (asrtShow "lo" lo)
                 (asrtShow "count" count) . (,) "getVector"
-              else if count < 1 then asrtMSlice UnsafeOp this
+              else if count < 1 then asrtMSlice UnsafeOp myname
                 (asrtShow "hi+count+1" $ hi + count + 1)
                 (asrtShow "negate count" $ negate count) . (,) "getVector"
               else error "shiftCursor: internal error, this should never happen"
         liftIO $ GMVec.move to from
         done
     where
-      this = "shiftCursor"
+      myname = "shiftCursor"
       done = void $ modCount Before (+ count) >> modCount After (subtract count)
 
 -- Like 'shiftCursor' but performs bounds checking. This function does not throw an out-of-range
@@ -1791,8 +1834,14 @@ freezeVector = do
   bef <- getLoSlice
   aft <- getHiSlice
   liftIO $ do
-    GMVec.copy (asrtMSlice UnsafeOp "freezeVector" (asrtShow "" 0) (asrtShow "length bef" $ GMVec.length bef) ("newvec", newvec)) bef
-    GMVec.copy (asrtMSlice UnsafeOp "freezeVector" (asrtShow "length bef" $ GMVec.length bef) (asrtShow "length aft" $ GMVec.length aft) ("newvec", newvec)) aft
+    flip GMVec.copy bef $ asrtMSlice UnsafeOp "freezeVector"
+      asrtZero
+      (asrtShow "length bef" $ GMVec.length bef)
+      ("newvec", newvec)
+    flip GMVec.copy aft $ asrtMSlice UnsafeOp "freezeVector"
+      (asrtShow "length bef" $ GMVec.length bef)
+      (asrtShow "length aft" $ GMVec.length aft)
+      ("newvec", newvec)
     GVec.unsafeFreeze newvec
 
 ----------------------------------------------------------------------------------------------------
@@ -1875,17 +1924,17 @@ copyVec
   => vector (PrimState m) a
   -> Int -> Int -> m (vector (PrimState m) a)
 copyVec oldVec0 before after = do
-  let this  = "copyVec"
+  let myname  = "copyVec"
   let oldVec = ("oldVec", oldVec0)
   let len   = GMVec.length $ snd oldVec
   let upper = ("len-after", len - after)
   newVec <- (,) "newVec" <$> GMVec.new len
   when (before > 0) $ GMVec.copy
-    (asrtMSlice UnsafeOp this     (asrtShow "" 0) (asrtShow "before" before) newVec)
-    (asrtMSlice UnsafeOp this     (asrtShow "" 0) (asrtShow "before" before) oldVec)
+    (asrtMSlice UnsafeOp myname asrtZero (asrtShow "before" before) newVec)
+    (asrtMSlice UnsafeOp myname asrtZero (asrtShow "before" before) oldVec)
   when (after  > 0) $ GMVec.copy
-    (asrtMSlice UnsafeOp this upper  (asrtShow "after" after) newVec)
-    (asrtMSlice UnsafeOp this upper  (asrtShow "after" after) oldVec)
+    (asrtMSlice UnsafeOp myname upper (asrtShow "after" after) newVec)
+    (asrtMSlice UnsafeOp myname upper (asrtShow "after" after) oldVec)
   return $ snd newVec
 
 -- | Push a 'TextLine' before or after the cursor. This function does not effect the content of the
@@ -2255,7 +2304,7 @@ refillLineEditorWith = \ case
   TextLineUndefined -> error
     "internal error: evaluated (refillLineEditorWith TextLineUndefined)"
   line              -> liftEditText $ do
-    let this   = "refillLineEditorWith"
+    let myname   = "refillLineEditorWith"
     let srcvec = theTextLineString line
     let srclen = intSize srcvec
     let lbrksz = theTextLineBreakSize line
@@ -2278,11 +2327,11 @@ refillLineEditorWith = \ case
       cursorBreakSize   .= lbrksz
       lineEditorTags    .= theTextLineTags line
       liftIO $ do
-        UVec.copy targlo $ asrtSlice UnsafeOp this
-          (asrtShow "" 0)
+        UVec.copy targlo $ asrtSlice UnsafeOp myname
+          asrtZero
           (asrtShow "length targlo" targlolen)
           ("srcvec", srcvec)
-        UVec.copy targhi $ asrtSlice UnsafeOp this
+        UVec.copy targhi $ asrtSlice UnsafeOp myname
           (asrtShow "length targlo" targlolen)
           (asrtShow "length targhi" targhilen)
           ("srcvec", srcvec)
@@ -2562,7 +2611,7 @@ overwriteAtCursor rel concatTags line = case line of
    , theTextLineBreakSize = lbrksz
    , theTextLineTags      = tagsB
    } -> do
-    let this = "overwriteAtCursor"
+    let myname = "overwriteAtCursor"
     modCount rel $ const 0 -- this "deletes" the chars Before/After the cursor
     count <- countElems
     alloc <- getAllocSize
@@ -2574,11 +2623,12 @@ overwriteAtCursor rel concatTags line = case line of
     alloc <- getAllocSize       -- new (resized) allocation value
     liftIO $ case rel of
       Before -> UVec.copy
-        (asrtMSlice SafeOp this (asrtShow "" 0) (asrtShow "adjusted" adjusted) ("lineEditBuffer", buf))
-        (asrtSlice SafeOp this (asrtShow "" 0) (asrtShow "adjusted" adjusted) ("line", line))
-      After  -> UVec.copy
-        (asrtMSlice SafeOp this (asrtShow "alloc-adjusted" $ alloc - adjusted) (asrtShow "adjusted" adjusted) ("buf", buf))
-        line
+        (asrtMSlice SafeOp myname asrtZero (asrtShow "adjusted" adjusted) ("lineEditBuffer", buf))
+        (asrtSlice  SafeOp myname asrtZero (asrtShow "adjusted" adjusted) ("line", line))
+      After  -> flip UVec.copy line $ asrtMSlice SafeOp myname
+        (asrtShow "alloc-adjusted" $ alloc - adjusted)
+        (asrtShow "adjusted" adjusted)
+        ("buf", buf)
     cursorBreakSize .= lbrksz
     lineEditorIsClean .= False
     lineEditorTags    %= (`concatTags` tagsB)
@@ -2870,7 +2920,8 @@ lineBreak rel = liftEditText $ do
       cursor <- use bufferLineEditor
       let vec = cursor ^. lineEditBuffer
       let cur = cursor ^. charsBeforeCursor
-      str <- liftIO $! UVec.freeze $! asrtMSlice SafeOp "lineBreak" (asrtShow "" 0) (asrtShow "cur" cur) ("lineEditBuffer", vec)
+      str <- liftIO $! UVec.freeze $! asrtMSlice SafeOp "lineBreak"
+        asrtZero (asrtShow "cur" cur) ("lineEditBuffer", vec)
       pushLine Before $ TextLine
         { theTextLineTags      = cursor ^. lineEditorTags
         , theTextLineString    = str
@@ -2947,7 +2998,7 @@ gotoPosition
      , Show tags --DEBUG
      )
   => TextLocation -> editor tags m TextLocation
-gotoPosition loc@(TextLocation{theLocationLineIndex=ln,theLocationCharIndex=ch}) = liftEditText $
+gotoPosition (TextLocation{theLocationLineIndex=ln,theLocationCharIndex=ch}) = liftEditText $
   TextLocation <$> flushRefill (gotoLine ln) <*> gotoChar ch
 
 -- | Save the location of the cursor, then evaluate an @editor@ function. After evaluation
@@ -3067,17 +3118,20 @@ textViewAppend appendTags
                     , theTextLineTags = appendTags (theTextLineTags lastA) (theTextLineTags firstB)
                     , theTextLineBreakSize = theTextLineBreakSize firstB
                     }
-              let listA = Vec.toList $ asrtSlice SafeOp this (asrtShow "" 0) (asrtShow "lenA-1" $ lenA - 1) ("vecA", vecA)
-              let listB = Vec.toList $ asrtSlice SafeOp this (asrtShow "" 1) (asrtShow "lenB-1" $ lenB - 1) ("vecB", vecB)
+              let listA = Vec.toList $ asrtSlice SafeOp myname
+                    asrtZero (asrtShow "lenA-1" $ lenA - 1) ("vecA", vecA)
+              let listB = Vec.toList $ asrtSlice SafeOp myname
+                    asrtOne  (asrtShow "lenB-1" $ lenB - 1) ("vecB", vecB)
               let (size, list) = if theTextLineBreakSize lastA > 0
                     then (lenAB, listA ++ lastA : firstB : listB)
                     else (lenAB - 1, listA ++ lineAB : listB)
               newVec <- MVec.new size
-              forM_ (zip [0 ..] list) $ uncurry $ MVec.write newVec
+              forM_ (zip [0 ..] list) $ \ (i, elem) ->
+                asrtMWrite UnsafeOp myname ("newVec", newVec) (asrtShow "i" i) elem
               return newVec
           )
     }
-  where { this = "textViewAppend"; }
+  where { myname = "textViewAppend"; }
 
 -- | Copy a region of the current 'TextBuffer' into a 'TextView', delimited by the two given
 -- 'TextLocation' values. If the two 'TextLocation' values given are identical, an empty 'TextView'
@@ -3090,6 +3144,7 @@ textView
      )
   => TextLocation -> TextLocation -> editor tags m (TextView tags)
 textView from0 to0 = liftEditText $ do
+  let myname = "textView"
   (from, loline) <- validateLocation $ min from0 to0
   (to,   hiline) <- validateLocation $ max from0 to0
   if (from ^. lineIndex) == (to ^. lineIndex) then return $
@@ -3105,8 +3160,10 @@ textView from0 to0 = liftEditText $ do
     newvec <- copyRegion (Absolute $ lineToIndex $ from ^. lineIndex) (Relative $ top + 1)
     let freeze = liftIO . if unsafeMode then Vec.unsafeFreeze else Vec.freeze
     newvec <- liftIO $ do
-      GMVec.write newvec 0   $ snd $ splitLineAt (from ^. charIndex) loline
-      GMVec.write newvec top $ fst $ splitLineAt (to   ^. charIndex) hiline
+      asrtMWrite UnsafeOp myname ("newvec", newvec) asrtZero $
+        snd $ splitLineAt (from ^. charIndex) loline
+      asrtMWrite UnsafeOp myname ("newvec", newvec) (asrtShow "top" top) $
+        fst $ splitLineAt (to   ^. charIndex) hiline
       freeze newvec
     return TextView
       { textViewCharCount = sum $ intSize <$> Vec.toList newvec
@@ -3147,7 +3204,8 @@ newTextBufferFromView rel tags (TextView{textViewVector=vec}) = liftIO $ do
   let (idx, st) = case rel of
         Before -> ([0 ..], st & linesAboveCursor .~ cursor)
         After  -> ([newLen - oldLen ..], st & linesBelowCursor .~ cursor)
-  forM_ (zip idx $ Vec.toList vec) $ uncurry $ MVec.write newBuf
+  forM_ (zip idx $ Vec.toList vec) $ \ (i, elem) ->
+    asrtMWrite UnsafeOp "newTextBufferFromView" ("newBuf", newBuf) (asrtShow "i" i) elem
   putMVar mvar st
   return this
 
@@ -3197,7 +3255,8 @@ debugPrintBuffer = liftEditText $ do
   lineVec <- use bufferVector
   let len = MVec.length lineVec
   let printLines nullCount i = if i >= len then return () else do
-        line <- liftIO $ MVec.read lineVec i
+        line <- liftIO $ asrtMRead UnsafeOp "debugPrintBuffer"
+                           ("lineVec", lineVec) (asrtShow "i" i)
         let showLine = putStrLn $ ralign i ++ ": " ++ show line
         if textLineIsUndefined line
           then do
@@ -3227,7 +3286,8 @@ debugPrintCursor = liftEditText $ do
   let before     = cur ^. charsBeforeCursor
   let after      = cur ^. charsAfterCursor
   liftIO $ do
-    str <- forM [0 .. charVecLen - 1] $ UMVec.read charVec
+    str <- forM [0 .. charVecLen - 1] $
+      asrtMRead UnsafeOp "debugPrintCursor" ("charVec", charVec) . (,) "i"
     putStrLn $ "     bufferLineEditor: " ++ show str
     putStrLn $ "       lineEditorTags: " ++ show (cur ^. lineEditorTags)
     putStrLn $ " __cursorVectorLength: " ++ show charVecLen
