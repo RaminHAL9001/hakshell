@@ -482,26 +482,26 @@ asrtOne = ("1", 1)
 
 -- | Used for indexing lines and characters relative to the cursor.
 newtype Relative a = Relative a
-  deriving (Eq, Ord, Show, Read, Enum, Num)
+  deriving (Eq, Ord, Show, Read, Enum, Num, Bounded)
 
 -- | Used for indexing absolute lines and characters (relative to the start of the document, which
 -- is line 1).
 newtype Absolute a = Absolute a
-  deriving (Eq, Ord, Show, Read, Enum, Num)
+  deriving (Eq, Ord, Show, Read, Enum, Num, Bounded)
 
 -- | A number for indexing a line. This data type instantiates the 'Prelude.Num' typeclass so that
 -- you can write an integer literal in your code and (if used in the correct context) the type
 -- inference will automatically declare a 'LineIndex' without you needing to write @(LineIndex 1)@
 -- constructor unless you really want to.
 newtype LineIndex = LineIndex Int
-  deriving (Eq, Ord, Show, Read, Enum, Num)
+  deriving (Eq, Ord, Show, Read, Enum, Num, Bounded)
 
 -- | A number for indexing a column, i.e. a character within a line. This data type instantiates
 -- the 'Prelude.Num' typeclass so that you can write an integer literal in your code and (if used in
 -- the correct context) the type inference will automatically declare a 'CharIndex' without you
 -- needing to write @(LineIndex 1)@ constructor unless you really want to.
 newtype CharIndex = CharIndex Int
-  deriving (Eq, Ord, Show, Read, Enum, Num)
+  deriving (Eq, Ord, Show, Read, Enum, Num, Bounded)
 
 -- | When instructing the editor engine to move by or delete a number of cursor positions (where
 -- line breaking characters consisting of two characters are considered a single cursor position,
@@ -552,22 +552,6 @@ instance Semigroup CharStats where
 instance Monoid CharStats where
   mempty = CharStats{ cursorStepCount = 0, deltaCharCount = 0 }
   mappend = (<>)
-
-instance Bounded (Absolute CharIndex) where
-  minBound = Absolute $ CharIndex 1
-  maxBound = Absolute $ CharIndex maxBound
-
-instance Bounded (Absolute LineIndex) where
-  minBound = Absolute $ LineIndex 1
-  maxBound = Absolute $ LineIndex maxBound
-
-instance Bounded (Relative CharIndex) where
-  minBound = Relative $ CharIndex minBound
-  maxBound = Relative $ CharIndex maxBound
-
-instance Bounded (Relative LineIndex) where
-  minBound = Relative $ LineIndex minBound
-  maxBound = Relative $ LineIndex maxBound
 
 -- | This function is an arithmetic operation that alters an 'Absolute' index by adding a 'Relative'
 -- index to it.
