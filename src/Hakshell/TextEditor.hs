@@ -150,6 +150,7 @@ module Hakshell.TextEditor
     TextCursorSpan(..), CharStats(..),
     shiftAbsolute, diffAbsolute, unwrapTextCursorSpan,
     lineToIndex, charToIndex, indexToLine, indexToChar,
+    distanceBetween, spanDistance,
 
     -- *** Moving the cursor relative to the cursor
 
@@ -180,7 +181,7 @@ module Hakshell.TextEditor
 
     -- * Batch Editing
 
-    -- ** Folding over lines of text
+    -- ** Folding /and/ mapping over lines of text
     --
     -- Folding and mapping can both be done in a single pass. It is also possible to halt a
     -- folding/mapping function by evaluating a halting continuation function provided by
@@ -188,24 +189,43 @@ module Hakshell.TextEditor
 
     FoldMapLines, FoldMapLinesHalt, forLines, forLinesInRange, forLinesInBuffer,
 
-    -- *** Mapping over lines of text
+    -- ** Folding over lines of text
     --
-    -- The 'MapLines' function type is a special case of 'FoldMapLines'.
+    -- These functions perform a batch read-only opertion over the 'TextBuffer' without moving the
+    -- position of the cursor. Be careful to evaluate 'flushLineEditor' before evaluating folds over
+    -- 'TextBuffer's to ensure the latest changes to the 'LineEditor' are actually stored into the
+    -- 'TextBuffer' and are ready to be folded, or your results may not be what you expect.
+
+    FoldLines, foldLines, foldLinesInRange, foldLinesInBuffer,
+
+    -- *** Evaluate 'FoldLines' without looping
+    --
+    -- These functions do not iterate over a range of lines, they merely unwrap the outer-most
+    -- monad, converting the 'FoldLines' function to an 'EditText' function.
+
+    runFoldLines,
+
+    -- ** Mapping over lines of text
+    --
+    -- Functions of the type described here are used to perform statelses updates on a buffer, for
+    -- example a context-free search and replace function.
 
     MapLines, runMapLines,
 
-    -- *** Evaluate a 'FoldMapLines' function without input
+    -- *** Evaluate a 'FoldMapLines' function without looping
     --
     -- These functions do not iterate over a range of lines in the buffer, rather they evaluate a
     -- function of type 'FoldMapLines' just once, which reduces it to a function of type 'EditText'.
+    -- These are not batch operations, they only remove the outer-most monad of the 'MapLines' and
+    -- 'FoldMapLines' function types. To do batch operations, use 'forLines' instead.
 
     runFoldMapLines, execFoldMapLines, evalFoldMapLines,
 
-    -- ** Folding over characters
+    -- ** Folding /and/ mapping over characters
 
     FoldMapChars, foldMapChars, runFoldMapChars,
 
-    -- *** Mapping over characters in a line of text
+    -- ** Mapping over characters in a line of text
     --
     -- The 'MapChars' function type is a special case of 'FoldMapChars'.
 
@@ -606,6 +626,104 @@ runEditTextOnCopy (EditText f) = liftIO . copyTextBuffer >=> \ copy@(TextBuffer 
 
 ----------------------------------------------------------------------------------------------------
 
+-- | This is a read-only folding function, unlikes 'FoldMapLines' or 'MapLines' which can perform
+-- updates to the text in the buffer. 'FoldLines' functions will never change the position of the
+-- text cursor, but you must be sure to call 'flushLineEditor' before evaluating 'foldLines' or
+-- 'foldLinesInRange' if you want the latest updates to the 'LineEditor' to be included in the fold
+-- result.
+newtype FoldLines r fold tags m a
+  = FoldLines
+    { unwrapFoldLines :: ContT r (ExceptT TextEditError (StateT fold (EditText tags m))) a }
+  deriving (Functor, Applicative, Monad, MonadIO)
+
+instance Monad m => MonadState fold (FoldLines r fold tags m) where
+  state = FoldLines . lift . lift . state
+
+instance Monad m => MonadError TextEditError (FoldLines r fold tags m) where
+  throwError = FoldLines . lift . throwError
+  catchError (FoldLines try) catch =
+    FoldLines $ ContT $ \ next ->
+    catchError (runContT try next) $ \ err ->
+    runContT (unwrapFoldLines $ catch err) next
+
+instance Monad m => MonadCont (FoldLines r fold tags m) where
+  callCC f = FoldLines $ callCC $ unwrapFoldLines . f . fmap FoldLines
+
+instance MonadTrans (FoldLines r fold tags) where
+  lift = FoldLines . lift . lift . lift . lift
+
+foldLiftEditText :: Monad m => EditText tags m a -> FoldLines r fold tags m a
+foldLiftEditText = FoldLines . lift . lift . lift
+
+-- | Evaluate a 'FoldLines' function to a 'EditText' function without performing any looping.
+runFoldLines :: Monad m => FoldLines a fold tags m a -> fold -> EditText tags m (a, fold)
+runFoldLines (FoldLines f) = runStateT (runExceptT $ runContT f return) >=> \ case
+  (Left err, _   ) -> throwError err
+  (Right  a, fold) -> return (a, fold)
+
+-- | Evaluate a 'FoldLines' function between two @('Absolute' 'LineIndex')@ markers, including the
+-- given line indicies.
+foldLinesInRange
+  :: (MonadIO m
+     , Show tags --DEBUG
+     )
+  => Absolute LineIndex
+  -> Absolute LineIndex
+  -> fold
+  -> ((() -> FoldLines () fold tags m fold)
+      -> Absolute LineIndex -> TextLine tags -> FoldLines () fold tags m fold)
+  -> EditText tags m fold
+foldLinesInRange from0 to0 fold f = do
+  top  <- countElems
+  let chk i0 = let i = lineToIndex i0 in
+        ( if i0 == minBound then pure 0
+          else if i0 == maxBound then pure (top - 1)
+          else if 0 <= i && i < top then pure i
+          else throwIndexErr i
+        ) >>= getAbsolute . Absolute
+  from <- chk from0
+  to   <- chk to0
+  let iter :: (Num n, Ord n) => n -> n -> [n]
+      iter from to =
+        takeWhile (flip (if from <= to then (<=) else (>=)) to) $
+        iterate ((if from <= to then (+) else subtract) 1) from
+  fmap snd $ flip runFoldLines fold $ callCC $ \ halt -> do
+    let loop = mapM_ (\ (ln, i) -> getElemIndex i >>= f halt ln) . zip (iter from0 to0)
+    getVoid >>= \ case
+      Nothing -> loop $ iter from to
+      Just (Absolute voidLo, Absolute voidHi) ->
+        if from < voidLo && to < voidLo || from > voidHi && to > voidHi
+        then loop $ iter from to
+        else if from <= to
+        then loop $ (iter from (voidLo - 1)) ++ (iter (voidHi + 1) to)
+        else loop $ (iter from (voidHi + 1)) ++ (iter (voidLo - 1) to)
+
+foldLines
+  :: (MonadIO m
+     , Show tags --DEBUG
+     )
+  => Relative LineIndex
+  -> fold
+  -> ((() -> FoldLines () fold tags m fold)
+      -> Absolute LineIndex -> TextLine tags -> FoldLines () fold tags m fold)
+  -> EditText tags m fold
+foldLines rel fold f = do
+  from <- currentLineNumber
+  let to = shiftAbsolute from rel
+  foldLinesInRange from to fold f
+
+foldLinesInBuffer
+  :: (MonadIO m
+     , Show tags --DEBUG
+     )
+  => fold
+  -> ((() -> FoldLines () fold tags m fold)
+      -> Absolute LineIndex -> TextLine tags -> FoldLines () fold tags m fold)
+  -> EditText tags m fold
+foldLinesInBuffer = foldLinesInRange minBound maxBound
+
+----------------------------------------------------------------------------------------------------
+
 -- | A type of functions that can perform a fold (in the sense of the Haskell 'Control.Monad.foldM'
 -- function) over lines of text in a 'TextBufferState'. This function takes an arbitrary @fold@ data
 -- type which can be anything you want, and is initialized when evaluating the 'runFoldMapLines'
@@ -689,7 +807,9 @@ evalFoldMapLines = fmap (fmap fst) . runFoldMapLines
 
 ----------------------------------------------------------------------------------------------------
 
--- | A type synonym for a 'FoldMapLines' function in which the folded type is the unit @()@ value.
+-- | A type synonym for a 'FoldMapLines' function in which the folded type is the unit @()@
+-- value. This is a special case of 'FoldMapLines', so use 'forLines', 'forLinesInRange', or
+-- 'forLinesInBuffer' to evaluate a function of this type.
 type MapLines r tags m a = FoldMapLines r () tags m a
 
 -- | This function evaluates a 'MapLines' using 'evalFoldMapLines' without actually performing a
@@ -757,8 +877,8 @@ editLine (EditLine f) = use bufferLineEditor >>= runStateT (runExceptT f) >>= \ 
 --       This simply means you can evaluate the 'Control.Monad.Cont.callCC' function to produce a
 --       breaking function. Then within the folding/mapping function you may evaluate the breaking
 --       function to halt and return from the fold or map operation immediately. The only
---       restriction is that the type @r@ always be the same as the type @a@ of the function that
---       was called with 'runFoldMapLines' function.
+--       restriction on the type @r@ is that when you evaluate 'runFoldMapChars', @r@ must be the
+--       same as the type @a@ of the function that was called with 'runFoldMapLines' function.
 newtype FoldMapChars r fold tags m a
   = FoldMapChars
     { unwrapFoldMapChars :: ContT r (ExceptT TextEditError (StateT fold (EditLine tags m))) a
@@ -1433,7 +1553,7 @@ instance MonadIO m => MonadEditVec (UMVec.IOVector Char) (EditLine tags m) where
   throwIndexErr = throwError . CharIndexOutOfRange . indexToChar
   throwCountErr = throwError . CharCountOutOfRange . countToChar
 
-instance MonadIO m => MonadEditVec (MVec.IOVector (TextLine tags))  (FoldMapLines r fold tags m) where
+instance MonadIO m => MonadEditVec (MVec.IOVector (TextLine tags)) (FoldMapLines r fold tags m) where
   nullElem      = foldMapLiftEditText nullElem
   newVector     = foldMapLiftEditText . newVector
   modVector     = foldMapLiftEditText . modVector
@@ -1441,6 +1561,15 @@ instance MonadIO m => MonadEditVec (MVec.IOVector (TextLine tags))  (FoldMapLine
   throwLimitErr = foldMapLiftEditText . throwLimitErr
   throwIndexErr = foldMapLiftEditText . throwIndexErr
   throwCountErr = foldMapLiftEditText . throwCountErr
+
+instance MonadIO m => MonadEditVec (MVec.IOVector (TextLine tags)) (FoldLines r fold tags m) where
+  nullElem       = foldLiftEditText nullElem
+  newVector      = foldLiftEditText . newVector
+  modVector      = foldLiftEditText . modVector
+  modCount dir   = foldLiftEditText . modCount dir
+  throwLimitErr  = foldLiftEditText . throwLimitErr
+  throwIndexErr  = foldLiftEditText . throwIndexErr
+  throwCountErr  = foldLiftEditText . throwCountErr
 
 -- The vector of the text buffer.
 getVector :: MonadEditVec vec m => m vec
@@ -1878,8 +2007,8 @@ class MonadEditText m where
        ) => EditText tags io a -> m tags io a
 
 instance MonadEditText EditText where { liftEditText = id; }
-instance MonadEditText (FoldMapLines r fold) where
-  liftEditText = FoldMapLines . lift . lift . lift
+instance MonadEditText (FoldMapLines r fold) where { liftEditText = foldMapLiftEditText; }
+instance MonadEditText (FoldLines r fold) where { liftEditText = foldLiftEditText; }
 
 -- | This class is basically the same as 'MonadEditText', but lifts a 'EditLine' function rather
 -- than an 'EditText' function. Note that 'MonadEditText' is a subclass of this typeclass, which
@@ -2530,6 +2659,42 @@ moveByChar count = liftEditText $ do
     if count > 0 then min count $ diffAbsolute column top
     else if count < 0 then max count $ diffAbsolute column 1
     else 0
+ 
+-- | Compute the 'TextCursorSpan' between two 'TextLocation's. The 'TextCursorSpan' is the number of
+-- steps the text cursor must take to get from point @a@ to point @b@. For the most part, this is
+-- equal to the number of characters that exist between point @a@ and point @b@, except when line
+-- break characters consist of two characters (like the @'\\r\\n'@ combination) and, only in this
+-- case, two characters are treated as one cursor step.
+--
+-- This function __DOES_NOT__ evlauate 'flushLineEditor', so you may get unexpected results if the
+-- text between the two given 'TextLocation's contains the line currently being edited by the
+-- 'LineEditor'. If you want to make sure the expected result is always computed, be sure to
+-- evaluate 'flushLineEditor' before evaluating this function.
+distanceBetween
+  :: (MonadIO m
+     , Show tags --DEBUG
+     )
+  => TextLocation -> TextLocation -> EditText tags m TextCursorSpan
+distanceBetween a0 b0 = do
+  (a, lineA) <- validateLocation $ min a0 b0
+  (b, lineB) <- validateLocation $ max a0 b0
+  error "TODO: diffTextLocation"
+
+-- | Compute the 'TextLocation' where the cursor would end up if you were to count a given number of
+-- cursor steps (a value given by 'TextCursorSpan') from an initial 'TextLocation'.
+--
+-- This function __DOES_NOT__ evlauate 'flushLineEditor', so you may get unexpected results if the
+-- text between the two given 'TextLocation's contains the line currently being edited by the
+-- 'LineEditor'. If you want to make sure the expected result is always computed, be sure to
+-- evaluate 'flushLineEditor' before evaluating this function.
+spanDistance
+  :: (MonadIO m
+     , Show tags --DEBUG
+     )
+  => TextLocation -> TextCursorSpan -> EditText tags m TextLocation
+spanDistance a dist = do
+  (a, lineA) <- validateLocation a
+  error "TODO: spanDistance"
 
 -- | Like 'moveByChar' but will wrap up to the previous line and continue moving on the
 -- previous/next line if the value is large enough to move the cursor past the start\/end of the
@@ -2539,7 +2704,8 @@ moveByCharWrap
      , Show tags --DEBUG
      )
   => TextCursorSpan -> editor tags m TextLocation
-moveByCharWrap = error "TODO: implement 'moveByCharWrap'"
+moveByCharWrap dist = liftEditText $
+  currentTextLocation >>= flip spanDistance dist >>= gotoPosition
 
 -- | Go to an absolute line number, the first line is 1 (line 0 and below all send the cursor to
 -- line 1), the last line is 'Prelude.maxBound'.
