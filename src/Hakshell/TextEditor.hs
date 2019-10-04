@@ -350,7 +350,7 @@ unsafeMode :: Bool
 unsafeMode = False
 
 -- Set this to 'True' to install additional checks throughout this module, especially after having
--- made a change to any functino that manipulates mutable arrays.
+-- made a change to any function that manipulates mutable arrays.
 enableAssertions :: Bool
 enableAssertions = True
 
@@ -670,8 +670,8 @@ foldLinesInRange
   => Absolute LineIndex
   -> Absolute LineIndex
   -> fold
-  -> ((() -> FoldLines () fold tags m fold)
-      -> Absolute LineIndex -> TextLine tags -> FoldLines () fold tags m fold)
+  -> ((() -> FoldLines () fold tags m void)
+      -> Absolute LineIndex -> TextLine tags -> FoldLines () fold tags m ())
   -> EditText tags m fold
 foldLinesInRange from0 to0 fold f = do
   top  <- countElems
@@ -704,8 +704,8 @@ foldLines
      )
   => Relative LineIndex
   -> fold
-  -> ((() -> FoldLines () fold tags m fold)
-      -> Absolute LineIndex -> TextLine tags -> FoldLines () fold tags m fold)
+  -> ((() -> FoldLines () fold tags m void)
+      -> Absolute LineIndex -> TextLine tags -> FoldLines () fold tags m ())
   -> EditText tags m fold
 foldLines rel fold f = do
   from <- currentLineNumber
@@ -717,8 +717,8 @@ foldLinesInBuffer
      , Show tags --DEBUG
      )
   => fold
-  -> ((() -> FoldLines () fold tags m fold)
-      -> Absolute LineIndex -> TextLine tags -> FoldLines () fold tags m fold)
+  -> ((() -> FoldLines () fold tags m void)
+      -> Absolute LineIndex -> TextLine tags -> FoldLines () fold tags m ())
   -> EditText tags m fold
 foldLinesInBuffer = foldLinesInRange minBound maxBound
 
@@ -2666,27 +2666,40 @@ moveByChar count = liftEditText $ do
 -- break characters consist of two characters (like the @'\\r\\n'@ combination) and, only in this
 -- case, two characters are treated as one cursor step.
 --
--- This function __DOES_NOT__ evlauate 'flushLineEditor', so you may get unexpected results if the
--- text between the two given 'TextLocation's contains the line currently being edited by the
--- 'LineEditor'. If you want to make sure the expected result is always computed, be sure to
--- evaluate 'flushLineEditor' before evaluating this function.
+-- This function __DOES_NOT__ evlauate 'flushLineEditor', so you may get a results you are not
+-- expecting if the text between the two given 'TextLocation's contains the line currently being
+-- edited by the 'LineEditor'. If you want to make sure text in the 'LineEditor' is properly
+-- accounted for in the result of this function, be sure to evaluate 'flushLineEditor' before
+-- evaluating this function.
 distanceBetween
   :: (MonadIO m
      , Show tags --DEBUG
      )
   => TextLocation -> TextLocation -> EditText tags m TextCursorSpan
 distanceBetween a0 b0 = do
-  (a, lineA) <- validateLocation $ min a0 b0
-  (b, lineB) <- validateLocation $ max a0 b0
-  error "TODO: diffTextLocation"
+  (a, lineA) <- validateLocation a0
+  (b, lineB) <- validateLocation b0
+  let forward = a <= b
+  let ci = theLocationCharIndex
+  let li = theLocationLineIndex
+  let (liA, liB) = (li a, li b)
+  let (sp, tcs) = (textLineCursorSpan, TextCursorSpan)
+  let edge line a b = sp line - tcs (charToIndex $ ci a) + tcs (charToIndex $ ci b)
+  let edgeSize = if forward then edge lineA a b else edge lineB b a
+  let (nextA, prevB) = if forward then (liA + 1, liB - 1) else (liA - 1, liB + 1)
+  (if forward then id else negate) <$>
+    if liA == liB then return $ tcs $ charToIndex (ci b) - charToIndex (ci a)
+    else if nextA == liB || prevB == liA then return edgeSize
+    else foldLinesInRange nextA prevB edgeSize (\ _halt _i -> modify . (+) . sp)
 
 -- | Compute the 'TextLocation' where the cursor would end up if you were to count a given number of
 -- cursor steps (a value given by 'TextCursorSpan') from an initial 'TextLocation'.
 --
--- This function __DOES_NOT__ evlauate 'flushLineEditor', so you may get unexpected results if the
--- text between the two given 'TextLocation's contains the line currently being edited by the
--- 'LineEditor'. If you want to make sure the expected result is always computed, be sure to
--- evaluate 'flushLineEditor' before evaluating this function.
+-- This function __DOES_NOT__ evlauate 'flushLineEditor', so you may get a results you are not
+-- expecting if the text between the two given 'TextLocation's contains the line currently being
+-- edited by the 'LineEditor'. If you want to make sure text in the 'LineEditor' is properly
+-- accounted for in the result of this function, be sure to evaluate 'flushLineEditor' before
+-- evaluating this function.
 spanDistance
   :: (MonadIO m
      , Show tags --DEBUG
