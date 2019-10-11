@@ -10,6 +10,8 @@ import           Control.Monad.Except
 
 import           Test.Hspec
 
+import Debug.Trace
+
 ----------------------------------------------------------------------------------------------------
 
 main :: IO ()
@@ -395,7 +397,8 @@ textDeletionTests = describe "text deletion tests" $ testWithGrid $ \ buf ->
   it "*** deleteCharsWrap tests" $ do
     fakebuf <- newIORef grid
     let del at len = do
-          let info = "deleteCharsWrap ("++show at++") ("++show len++")"
+          let info = "del ("++show at++") ("++show len++")"
+          traceM ("-- | "++info)
           (_grid0, grid1) <- liftIO $ do
             grid0 <- readIORef fakebuf
             modifyIORef fakebuf $

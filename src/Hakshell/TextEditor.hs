@@ -65,7 +65,7 @@ module Hakshell.TextEditor
     -- 'TextLine' at that address into a 'LineEditor'. You can then edit the text in a 'LineEditor'
     -- by evaluating a function of type 'EditLine' with the 'editLine' function.
 
-    TextLine, emptyTextLine, nullTextLine, textLineCursorSpan,
+    TextLine, emptyTextLine, nullTextLine, textLineCursorSpan, textLineGetChar,
     textLineTop, textLineIsUndefined, sliceLine, sliceLineToEnd, splitLineAt,
 
     -- *** 'TextLine' lenses
@@ -255,6 +255,16 @@ module Hakshell.TextEditor
     LineBreaker(..), bufferLineBreaker, lineBreaker, lineBreakPredicate,
     defaultLineBreak, bufferLineEditor, bufferDefaultTags, lineBreakerNLCR,
 
+    -- * Parser Stream
+    --
+    -- To perform parsing of text, use the "Hakshell.TextEditor.Parser" module. The 'ParserStream'
+    -- provided here provides stateful information necessary to efficiently deliver a stream of
+    -- characters from a 'TextBuffer' to a 'Hakshell.TextEditor.Parser.Parser'.
+
+    ParserStream, newParserStreamAt, newParserStream, parserStreamGoto,
+    parserStreamLook, parserStreamStep, parserStreamResetCache,
+    parserStreamLocation, parserStreamCache,
+
     -- * Debugging
 
     debugPrintBuffer, debugPrintView, debugPrintCursor,
@@ -292,8 +302,6 @@ import qualified Data.Vector.Unboxed         as UVec
 import qualified Data.Vector.Generic.Mutable as GMVec
 import qualified Data.Vector.Unboxed.Mutable as UMVec
 import           Data.Word
-
-import Debug.Trace
 
 ----------------------------------------------------------------------------------------------------
 
@@ -1217,6 +1225,17 @@ textLineCursorSpan line = TextCursorSpan $ intSize line - breaksize + min 1 (max
 -- the line breaking characters is equal to the result of this function evaluated by 'charToIndex'.
 textLineTop :: TextLine tags -> Absolute CharIndex
 textLineTop line = indexToChar $ intSize line - (fromIntegral $ theTextLineBreakSize line)
+
+-- | Get a character at the @('Absolute' 'CharIndex')@ of a 'TextLine'. This may read into the line
+-- breaking character without evaluating to 'Nothing'.
+textLineGetChar :: TextLine tags -> Absolute CharIndex -> Maybe Char
+textLineGetChar txt i0 = do
+  let i = charToIndex i0
+  guard (i < intSize txt && 0 <= i)
+  pure (textLineGetCharNoChk txt i0)
+
+textLineGetCharNoChk :: TextLine tags -> Absolute CharIndex -> Char
+textLineGetCharNoChk txt = ((theTextLineString txt) UVec.!) . charToIndex
 
 ----------------------------------------------------------------------------------------------------
 
@@ -2897,7 +2916,6 @@ deleteCharsWrap
      )
   => TextCursorSpan -> EditText tags m CharStats
 deleteCharsWrap request =
-  trace ("-- | deleteCharsWrap ("++show request++")") $ --DEBUG
   let direction = if request < 0 then Before else After in
   if request == 0 then return mempty
   -- First, if we can prove that the 'request' is not a 'minBound' or 'maxBound' value, we can use
@@ -2907,11 +2925,7 @@ deleteCharsWrap request =
   -- and see if that satisfies the request.
   else deleteChars request >>= \ st0 ->
   let satreq = cursorStepCount st0 in
-  trace ("-- | deleteCharsWrap: satreq="++show satreq) $ --DEBUG
-  if abs satreq >= abs request then
-    trace ("-- | deleteCharsWrap: (abs satreq = "++ --DEBUG
-           show (abs satreq)++") >= (abs req = "++show (abs request)++") -- DONE") $ --DEBUG
-    return st0
+  if abs satreq >= abs request then return st0
   -- Deleting characters from the line editor did not satisfy the request, but check if we are
   -- deleting forwards and if deleting just the line breaking character is enough to satisfy the
   -- request.
@@ -2924,11 +2938,9 @@ deleteCharsWrap request =
     -- all or part of adjacent lines. If we are deleting forward, delete the final line breaking
     -- character from the line editor, but DO NOT merge the next line into the 'LineEditor'.
     st0 <- if direction == After then (st0 <>) <$> forwardDeleteLineBreak False else pure st0
-    traceM $ "-- | deleteCharsWrap: forLines "++show direction++" "++show(abs satreq, satreq) --DEBUG
     -- Now let's use 'forLines' to delete each 'TextLine' until the request has been satsified.
     forLines direction st0 $ \ halt line -> do
       st0 <- get
-      traceM $ "-- | deleteCharsWrap:loop: "++show st0 --DEBUG
       -- If the previous iteration succeeded in deleting the requested number of steps, it should have
       -- preformed any final stateful updates, set the second element of the state to be equal to
       -- 'req', and then loop. So the first thing we do on each step of the loop is check if the
@@ -3003,7 +3015,6 @@ forLinesLoop
   -> Int -> RelativeToCursor -> EditText tags m fold
 forLinesLoop fold f count dir = execFoldMapLines (callCC $ loop count) fold where
   loop count halt =
-    trace ("-- | forLinesLoop: count="++show count++", popElem "++show dir) $ --DEBUG
     if count <= 0 then get else
     liftEditText (popElem dir) >>= f halt >>= mapM_ (pushElem (opposite dir)) >>
     loop (count - 1) halt
@@ -3089,7 +3100,6 @@ lineBreak
      )
   => RelativeToCursor -> editor tags m ()
 lineBreak rel = liftEditText $ do
-  traceM $ "-- | lineBreak "++show rel --DEBUG
   breaker <- use bufferLineBreaker
   let lbrk     = breaker ^. defaultLineBreak
   let lbrkSize = fromIntegral $ intSize lbrk
@@ -3139,7 +3149,11 @@ instance Show TextLocation where
   show (TextLocation
         { theLocationLineIndex=(Absolute (LineIndex line))
         , theLocationCharIndex=(Absolute (CharIndex char))
-        }) = "TextLocation "++show line++' ':show char
+        }) = let sh i =
+                   if i == minBound then "minBound"
+                   else if i == maxBound then "maxBound"
+                   else show i
+             in  "TextLocation "++sh line++' ':sh char
 
 relativeLine :: RelativeToCursor -> Int -> Relative LineIndex
 relativeChar :: RelativeToCursor -> Int -> Relative CharIndex
@@ -3331,23 +3345,23 @@ textView from0 to0 = liftEditText $ do
       { textViewCharCount = charToCount numchars
       , textViewVector = Vec.singleton $ sliceLineNoChk (from ^. charIndex) numchars loline
       }
-  else do
-    to <- if to ^. charIndex > 1 then pure to else
-      fst <$> validateLocation (to & (lineIndex -~ 1) . (charIndex .~ maxBound))
-    -- Compute the range of lines to copy.
-    let top = lineToCount $ diffAbsolute (from ^. lineIndex) (to ^. lineIndex)
-    newvec <- copyRegion (Absolute $ lineToIndex $ from ^. lineIndex) (Relative $ top + 1)
-    let freeze = liftIO . if unsafeMode then Vec.unsafeFreeze else Vec.freeze
-    newvec <- liftIO $ do
-      asrtMWrite UnsafeOp myname ("newvec", newvec) asrtZero $
-        snd $ splitLineAt (from ^. charIndex) loline
-      asrtMWrite UnsafeOp myname ("newvec", newvec) (asrtShow "top" top) $
-        fst $ splitLineAt (to   ^. charIndex) hiline
-      freeze newvec
-    return TextView
-      { textViewCharCount = sum $ intSize <$> Vec.toList newvec
-      , textViewVector    = newvec
-      }
+    else do
+      to <- if to ^. charIndex > 1 then pure to else
+        fst <$> validateLocation (to & (lineIndex -~ 1) . (charIndex .~ maxBound))
+      -- Compute the range of lines to copy.
+      let top = lineToCount $ diffAbsolute (from ^. lineIndex) (to ^. lineIndex)
+      newvec <- copyRegion (Absolute $ lineToIndex $ from ^. lineIndex) (Relative $ top + 1)
+      let freeze = liftIO . if unsafeMode then Vec.unsafeFreeze else Vec.freeze
+      newvec <- liftIO $ do
+        asrtMWrite UnsafeOp myname ("newvec", newvec) asrtZero $
+          snd $ splitLineAt (from ^. charIndex) loline
+        asrtMWrite UnsafeOp myname ("newvec", newvec) (asrtShow "top" top) $
+          fst $ splitLineAt (to   ^. charIndex) hiline
+        freeze newvec
+      return TextView
+        { textViewCharCount = sum $ intSize <$> Vec.toList newvec
+        , textViewVector    = newvec
+        }
 
 -- | Like 'textView', creates a new text view, but rather than taking two 'TextLocation's to delimit
 -- the range, takes two @('Absolute' 'LineIndex')@ values to delimit the range.
@@ -3402,6 +3416,150 @@ forLinesInView (TextView{textViewVector=vec}) fold f = flip execStateT fold $
 
 ----------------------------------------------------------------------------------------------------
 
+-- | This data type will ordinarily not be useful on it's own, it should be used by way of the
+-- "Hakshell.TextEditor.Parser" module, although if you need to perform special parsing operations,
+-- such as running a single parser over multiple buffers, you may need to use some of the APIs here.
+--
+-- This data type can be thought of as a sort of "cursor" that inspects every character within a
+-- 'TextBuffer', and contains the state necessary to perform parsing over a 'TextBuffer'. Streaming
+-- characters from a 'TextBuffer' is very efficient, all character retreival operates in O(1) time,
+-- and all characters are already in memory so there is no additional cost for look-aheads or
+-- backtracking, as the cost has already been paid in advance.
+--
+-- Thinking of this data structure as a text cursor, the current character under the cursor value is
+-- taken with the 'parserStreamLook' function, the cursor is stepped to the next character using
+-- 'parserStreamStep', and the cursor can be moved to an arbitrary 'TextLocation' using
+-- 'parserStreamGoto'.
+--
+-- This data type is immutable (pure), so modifications to the state of this object must be stored
+-- on the stack, or used as the mutable value of a 'State' monad, or stored in a mutable variable of
+-- some form. Although you create a 'ParserStream' cursor within a 'EditText' function evaluation
+-- context, the 'ParserStream' is not sensitive to which 'TextBuffer' is currently being inspected
+-- by the 'EditText' function. This means your 'EditText' function evaluating in 'TextBuffer' @a@
+-- can return the 'ParserStream', and this same parser stream can then be used to call
+-- 'parserStreamStep' within an 'EditText' function that is currently evaluating in a different
+-- 'TextBuffer' @b@. The 'ParserStream' itself only contains the current 'TextLocation' and a cached
+-- copy of the last line that it had been inspecting. If you are performing low-level programming of
+-- parsers using a 'ParserStream' it is up to you to ensure the 'ParserStream' evaluates in the
+-- expected 'TextBuffer'.
+data ParserStream tags
+  = ParserStream
+    { theParStreamCache    :: !(TextLine tags)
+    , theParStreamLocation :: !TextLocation
+    }
+
+parStreamCache :: Lens' (ParserStream tags) (TextLine tags)
+parStreamCache = lens theParStreamCache $ \ a b -> a{ theParStreamCache = b }
+
+parStreamLocation :: Lens' (ParserStream tags) TextLocation
+parStreamLocation = lens theParStreamLocation $ \ a b -> a{ theParStreamLocation = b }
+
+-- | Get the 'TextLine' currently being cached by this 'ParserStream' object. This cached 'TextLine'
+-- changes every time the 'parserStreamLocation' moves to another line, or when
+-- 'parserStreamResetCache' is evaluated within an 'EditText' function context.
+parserStreamCache :: ParserStream tags -> TextLine tags
+parserStreamCache = theParStreamCache
+
+-- | Thinking of a 'ParserStream' as a cursor pointing to a character within a 'TextBuffer' this
+-- function returns the 'TextLocation' of the cursor, similar to how 'currentTextLocation' returns
+-- the position of the text editing cursor.
+parserStreamLocation :: ParserStream tags -> TextLocation
+parserStreamLocation = theParStreamLocation
+
+-- | Constructs a new 'ParserStream' at a given 'TextLocation' within a given 'TextBuffer'. This
+-- function must validate the 'TextLocation' using 'testLocation', so the return type is similar in
+-- meaning to the return type of 'validateLocation', which may throw a soft exception (which can be
+-- caught with 'catchError') if the given 'TextLocation' is out of bounds.
+newParserStreamAt
+  :: (MonadIO m
+     , Show tags --DEBUG
+     )
+  => TextLocation -> EditText tags m (ParserStream tags)
+newParserStreamAt loc = parserStreamResetCache ParserStream
+  { theParStreamCache    = TextLineUndefined
+  , theParStreamLocation = loc
+  }
+
+-- | A convenience function that calls 'newParserStreamAt' with 'minBound' as the 'TextLocation'.
+newParserStream
+  :: (MonadIO m
+     , Show tags --DEBUG
+     )
+  => EditText tags m (ParserStream tags)
+newParserStream = newParserStreamAt minBound
+
+-- | This in an 'EditText' type of function which moves a given 'ParserStream' to a different
+-- location within the 'TextBuffer' of the current 'EditText' context. This can be used to perform
+-- backtracking, or forward-tracking, or any kind of tracking.
+--
+-- If the given 'ParserStream' originated in a different 'TextBuffer' (supposing the 'EditText'
+-- function in which 'newParserStream' was evaluated returned the 'ParserStream'), the target
+-- 'TextBuffer' for the 'ParserStream' simply changes over to the new 'TextBuffer' and begins
+-- sourcing characters from there. You should probably evaluate 'parserStreamResetCache' 
+--
+-- This function must validate the 'TextLocation' using 'validateLocation', and so may throw a soft
+-- exception (which can be caught with 'catchError') if the given 'TextLocation' is out of bounds.
+parserStreamGoto
+  :: (MonadIO m
+     , Show tags --DEBUG
+     )
+  => ParserStream tags -> TextLocation -> EditText tags m (ParserStream tags)
+parserStreamGoto cursor = validateLocation >=> \ (loc, txt) ->
+  return cursor{ theParStreamCache = txt, theParStreamLocation = loc }
+
+-- | Thinking of the 'ParserStream' as a cursor pointing to a character within a 'TextBuffer' this
+-- function returns the character currently under the cursor __without advancing the cursor.__ For a
+-- function that does return the character under the cursor and and also advances the cursor, refer
+-- to the 'parserStreamStep' function.
+parserStreamLook :: MonadIO m => ParserStream tags -> EditText tags m Char
+parserStreamLook s = pure $ textLineGetCharNoChk (theParStreamCache s) $
+  theLocationCharIndex $ theParStreamLocation s
+  -- This function could be pure, but I can't think of a good reason to make it pure since it
+  -- doesn't fit in with how other functions make use of a 'ParserStream' value.
+
+-- | Thinking of the 'ParserStream' as a cursor pointing to a character within a 'TextBuffer' this
+-- function returns the character currently under the cursor __and then advances the cursor.__ For a
+-- function that does not advance the cursor, refer to the 'parserStreamLook' function.
+parserStreamStep
+  :: (MonadIO m
+     , Show tags --DEBUG
+     )
+  => ParserStream tags -> EditText tags m (Char, ParserStream tags)
+parserStreamStep s = do
+  c <- parserStreamLook s
+  let txt   = theParStreamCache s
+  let loc   = theParStreamLocation s
+  let chnum = charToIndex (theLocationCharIndex loc) + 1
+  let i     = indexToChar chnum
+  if chnum < intSize txt then pure (c, s & parStreamLocation . charIndex .~ i) else
+    testLocation (loc & lineIndex +~ 1 & charIndex .~ 1) >>= \ case
+      Left{} -> throwError $ EndOfLineBuffer After
+      Right (txt, (ok, loc)) -> if not ok then throwError $ EndOfLineBuffer After else pure
+        (c, ParserStream{ theParStreamCache = txt, theParStreamLocation = loc })
+
+-- | There are times when the 'ParserStream' contains a cached 'TextLine' (given by the
+-- 'parserStreamCache' value) that is different from the actual 'TextLine' unders the cursor
+-- position of the 'TextLocation' given by 'parserStreamLocation'. This can happen when you evaluate
+-- a 'ParserStream' in a new 'EditText' context for a different 'TextBuffer', or if
+-- 'flushLineEditor' has been evaluated and modified the line currently being inspected by the
+-- 'ParserStream'.
+--
+-- If you happen to know that the 'TextLine' given by 'parserStreamCache' is different from what it
+-- should be, you should evaluate this function to reset the cached 'TextLine' to the correct
+-- value. This function must also check that the 'parserStreamLocation' is still valid, so it may
+-- evaluate to a @('Left' 'After')@ or @('Left' 'Before')@ value as with the 'parserStreamGoto'
+-- function.
+parserStreamResetCache
+  :: (MonadIO m
+     , Show tags --DEBUG
+     )
+  => ParserStream tags -> EditText tags m (ParserStream tags)
+parserStreamResetCache s = do
+  (loc, txt) <- validateLocation (theParStreamLocation s)
+  return (s & parStreamLocation .~ loc & parStreamCache .~ txt)
+
+----------------------------------------------------------------------------------------------------
+
 ralign :: Int -> String
 ralign n = case safeAbs n of
   i | i < 10 -> "      " ++ show i
@@ -3415,13 +3573,13 @@ ralign n = case safeAbs n of
 -- | Print debugger information about the structured data that forms the 'TextView' to standard
 -- output. __WARNING:__ this print's every line of text in the view, so if your text view has
 -- thousands of lines of text, there will be a lot of output.
-debugPrintView :: (Show tags, MonadIO m) => TextView tags -> m ()
-debugPrintView view = do
+debugPrintView :: (Show tags, MonadIO m) => (String -> IO ()) -> TextView tags -> m ()
+debugPrintView output view = do
   (_, errCount) <- forLinesInView view (1 :: Int, 0 :: Int) $ \ _halt line -> do
     lineNum <- state $ \ (lineNum, errCount) ->
       (lineNum, (lineNum + 1, errCount + if textLineIsUndefined line then 1 else 0))
-    liftIO $ putStrLn $ ralign lineNum ++ ": " ++ show line
-  liftIO $ putStrLn ""
+    liftIO $ output $ ralign lineNum ++ ": " ++ show line
+  liftIO $ output ""
   when (errCount > 0) $ error $ "iterated over "++show errCount++" undefined lines"
 
 -- | Print debugger information about the structured data that forms the 'TextBuffer' to standard
@@ -3429,14 +3587,14 @@ debugPrintView view = do
 -- thousands of lines of text, there will be a lot of output.
 debugPrintBuffer
   :: (MonadEditText editor, Show tags, MonadIO (editor tags m), MonadIO m)
-  => editor tags m ()
-debugPrintBuffer = liftEditText $ do
+  => (String -> IO ()) -> editor tags m ()
+debugPrintBuffer output = liftEditText $ do
   lineVec <- use bufferVector
   let len = MVec.length lineVec
   let printLines nullCount i = if i >= len then return () else do
-        line <- liftIO $ asrtMRead UnsafeOp "debugPrintBuffer"
-                           ("lineVec", lineVec) (asrtShow "i" i)
-        let showLine = putStrLn $ ralign i ++ ": " ++ show line
+        line <- liftIO $
+          asrtMRead UnsafeOp "debugPrintBuffer" ("lineVec", lineVec) (asrtShow "i" i)
+        let showLine = output $ ralign i ++ ": " ++ show line
         if textLineIsUndefined line
           then do
             liftIO $ if nullCount < (1 :: Int) then showLine else
@@ -3447,9 +3605,9 @@ debugPrintBuffer = liftEditText $ do
   above   <- use linesAboveCursor
   below   <- use linesBelowCursor
   liftIO $ do
-    putStrLn $ "   linesAboveCursor: " ++ show above
-    putStrLn $ "   linesBelowCursor: " ++ show below
-    putStrLn $ "    bufferLineCount: " ++ show (above + below)
+    output $ "   linesAboveCursor: " ++ show above
+    output $ "   linesBelowCursor: " ++ show below
+    output $ "    bufferLineCount: " ++ show (above + below)
 
 -- | The 'bufferLineEditor', which is a 'LineEditor' is a separate data structure contained within
 -- the 'TextBuffer', and it is often not necessary to know this information when debugging, so you
@@ -3457,8 +3615,8 @@ debugPrintBuffer = liftEditText $ do
 -- necessary.
 debugPrintCursor
   :: (MonadEditText editor, Show tags, MonadIO (editor tags m), MonadIO m)
-  => editor tags m ()
-debugPrintCursor = liftEditText $ do
+  => (String -> IO ()) -> editor tags m ()
+debugPrintCursor output = liftEditText $ do
   cur <- use bufferLineEditor
   let charVec    = theLineEditBuffer cur
   let charVecLen = UMVec.length charVec
@@ -3467,10 +3625,10 @@ debugPrintCursor = liftEditText $ do
   liftIO $ do
     str <- forM [0 .. charVecLen - 1] $
       asrtMRead UnsafeOp "debugPrintCursor" ("charVec", charVec) . (,) "i"
-    putStrLn $ "     bufferLineEditor: " ++ show str
-    putStrLn $ "       lineEditorTags: " ++ show (cur ^. lineEditorTags)
-    putStrLn $ " __cursorVectorLength: " ++ show charVecLen
-    putStrLn $ "    charsBeforeCursor: " ++ show before
-    putStrLn $ "     charsAfterCursor: " ++ show after
-    putStrLn $ "      cursorInputSize: " ++ show (before + after)
-    putStrLn $ "  cursorLineBreakSize: " ++ show (theCursorBreakSize cur)
+    output $ "     bufferLineEditor: " ++ show str
+    output $ "       lineEditorTags: " ++ show (cur ^. lineEditorTags)
+    output $ " __cursorVectorLength: " ++ show charVecLen
+    output $ "    charsBeforeCursor: " ++ show before
+    output $ "     charsAfterCursor: " ++ show after
+    output $ "      cursorInputSize: " ++ show (before + after)
+    output $ "  cursorLineBreakSize: " ++ show (theCursorBreakSize cur)
