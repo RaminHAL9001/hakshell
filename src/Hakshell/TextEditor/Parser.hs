@@ -37,7 +37,7 @@ module Hakshell.TextEditor.Parser
     -- ** Parser state information
     parserGet, parserUse, parserModify, currentTags, parserUserState, thePosition, theCurrentLine,
 
-    -- ** Lifted 'ParserStream' combinators
+    -- ** Lifted 'StreamCursor' combinators
     --
     -- TODO
 
@@ -69,14 +69,14 @@ import           Text.Parser.Token
 data ParserState tags fold
   = ParserState
     { theParBuffer    :: !(TextBuffer tags)
-    , theParStream    :: !(ParserStream tags)
+    , theParStream    :: !(StreamCursor tags)
     , theParUserState :: !fold
     }
 
 --parserBuffer :: Lens' (ParserState tags fold) (TextBuffer tags)
 --parserBuffer = lens theParBuffer $ \ a b -> a{ theParBuffer = b }
 
-parserStream :: Lens' (ParserState tags fold) (ParserStream tags)
+parserStream :: Lens' (ParserState tags fold) (StreamCursor tags)
 parserStream = lens theParStream $ \ a b -> a{ theParStream = b }
 
 parserUserState :: Lens' (ParserState tags fold) fold
@@ -172,7 +172,7 @@ newParserState
   => st -> EditText tags m (ParserState tags st)
 newParserState ust = do
   buf    <- currentBuffer
-  stream <- newParserStream
+  stream <- newStreamCursor
   return ParserState
     { theParBuffer    = buf
     , theParStream    = stream
@@ -207,15 +207,15 @@ parserModify = Parser . fmap ParSuccess . modify
 -- | Pass this function to 'parserGet' to obtain the current position of the parser within the
 -- 'TextBuffer'.
 thePosition :: ParserState tags fold -> TextLocation
-thePosition = parserStreamLocation . theParStream
+thePosition = streamLocation . theParStream
 
 -- | Pass this function to 'parserGet' to obtain the current line being inspected by the parser.
 theCurrentLine :: Parser tags st (TextLine tags)
-theCurrentLine = Parser $ ParSuccess . parserStreamCache <$> use parserStream
+theCurrentLine = Parser $ ParSuccess . streamCache <$> use parserStream
 
 -- | This is a lens that can be used with 'parserModify' to alter the @tags@' for the current line.
 currentTags :: Lens' (ParserState tags fold) tags
-currentTags = parserStream . parserStreamTags
+currentTags = parserStream . streamTags
 
 ----------------------------------------------------------------------------------------------------
 

@@ -257,13 +257,13 @@ module Hakshell.TextEditor
 
     -- * Parser Stream
     --
-    -- To perform parsing of text, use the "Hakshell.TextEditor.Parser" module. The 'ParserStream'
+    -- To perform parsing of text, use the "Hakshell.TextEditor.Parser" module. The 'StreamCursor'
     -- provided here provides stateful information necessary to efficiently deliver a stream of
     -- characters from a 'TextBuffer' to a 'Hakshell.TextEditor.Parser.Parser'.
 
-    ParserStream, newParserStreamAt, newParserStream, parserStreamGoto,
-    parserStreamLook, parserStreamStep, parserStreamResetCache,
-    parserStreamLocation, parserStreamCache, parserStreamTags, parserStreamCommitTags,
+    StreamCursor, newStreamCursorAt, newStreamCursor, streamGoto,
+    streamLook, streamStep, streamResetCache,
+    streamLocation, streamCache, streamTags, streamCommitTags,
 
     -- * Debugging
 
@@ -3435,113 +3435,113 @@ forLinesInView (TextView{textViewVector=vec}) fold f = flip execStateT fold $
 -- backtracking, as the cost has already been paid in advance.
 --
 -- Thinking of this data structure as a text cursor, the current character under the cursor value is
--- taken with the 'parserStreamLook' function, the cursor is stepped to the next character using
--- 'parserStreamStep', and the cursor can be moved to an arbitrary 'TextLocation' using
--- 'parserStreamGoto'.
+-- taken with the 'streamLook' function, the cursor is stepped to the next character using
+-- 'streamStep', and the cursor can be moved to an arbitrary 'TextLocation' using
+-- 'streamGoto'.
 --
 -- This data type is immutable (pure), so modifications to the state of this object must be stored
 -- on the stack, or used as the mutable value of a 'State' monad, or stored in a mutable variable of
--- some form. Although you create a 'ParserStream' cursor within a 'EditText' function evaluation
--- context, the 'ParserStream' is not sensitive to which 'TextBuffer' is currently being inspected
+-- some form. Although you create a 'StreamCursor' cursor within a 'EditText' function evaluation
+-- context, the 'StreamCursor' is not sensitive to which 'TextBuffer' is currently being inspected
 -- by the 'EditText' function. This means your 'EditText' function evaluating in 'TextBuffer' @a@
--- can return the 'ParserStream', and this same parser stream can then be used to call
--- 'parserStreamStep' within an 'EditText' function that is currently evaluating in a different
--- 'TextBuffer' @b@. The 'ParserStream' itself only contains the current 'TextLocation' and a cached
+-- can return the 'StreamCursor', and this same parser stream can then be used to call
+-- 'streamStep' within an 'EditText' function that is currently evaluating in a different
+-- 'TextBuffer' @b@. The 'StreamCursor' itself only contains the current 'TextLocation' and a cached
 -- copy of the last line that it had been inspecting. If you are performing low-level programming of
--- parsers using a 'ParserStream' it is up to you to ensure the 'ParserStream' evaluates in the
+-- parsers using a 'StreamCursor' it is up to you to ensure the 'StreamCursor' evaluates in the
 -- expected 'TextBuffer'.
-data ParserStream tags
-  = ParserStream
+data StreamCursor tags
+  = StreamCursor
     { theParStreamCache    :: !(TextLine tags)
     , theParStreamLocation :: !TextLocation
     }
 
-parStreamCache :: Lens' (ParserStream tags) (TextLine tags)
+parStreamCache :: Lens' (StreamCursor tags) (TextLine tags)
 parStreamCache = lens theParStreamCache $ \ a b -> a{ theParStreamCache = b }
 
-parStreamLocation :: Lens' (ParserStream tags) TextLocation
+parStreamLocation :: Lens' (StreamCursor tags) TextLocation
 parStreamLocation = lens theParStreamLocation $ \ a b -> a{ theParStreamLocation = b }
 
 -- | This is not a getter but a lens which you can use to update the @tags@ of the current
--- 'ParserStream'. If you do update the @tags@, you can call 'parserStreamCommitTags' to write these
--- tags back to the 'TextBuffer'. The 'parserStreamCommitTags' function is called automatically by
--- the 'parserStreamStep' function.
-parserStreamTags :: Lens' (ParserStream tags) tags
-parserStreamTags = parStreamCache . textLineTags
+-- 'StreamCursor'. If you do update the @tags@, you can call 'streamCommitTags' to write these
+-- tags back to the 'TextBuffer'. The 'streamCommitTags' function is called automatically by
+-- the 'streamStep' function.
+streamTags :: Lens' (StreamCursor tags) tags
+streamTags = parStreamCache . textLineTags
 
--- | Get the 'TextLine' currently being cached by this 'ParserStream' object. This cached 'TextLine'
--- changes every time the 'parserStreamLocation' moves to another line, or when
--- 'parserStreamResetCache' is evaluated within an 'EditText' function context.
-parserStreamCache :: ParserStream tags -> TextLine tags
-parserStreamCache = theParStreamCache
+-- | Get the 'TextLine' currently being cached by this 'StreamCursor' object. This cached 'TextLine'
+-- changes every time the 'streamLocation' moves to another line, or when
+-- 'streamResetCache' is evaluated within an 'EditText' function context.
+streamCache :: StreamCursor tags -> TextLine tags
+streamCache = theParStreamCache
 
--- | Thinking of a 'ParserStream' as a cursor pointing to a character within a 'TextBuffer' this
+-- | Thinking of a 'StreamCursor' as a cursor pointing to a character within a 'TextBuffer' this
 -- function returns the 'TextLocation' of the cursor, similar to how 'currentTextLocation' returns
 -- the position of the text editing cursor.
-parserStreamLocation :: ParserStream tags -> TextLocation
-parserStreamLocation = theParStreamLocation
+streamLocation :: StreamCursor tags -> TextLocation
+streamLocation = theParStreamLocation
 
--- | Constructs a new 'ParserStream' at a given 'TextLocation' within a given 'TextBuffer'. This
+-- | Constructs a new 'StreamCursor' at a given 'TextLocation' within a given 'TextBuffer'. This
 -- function must validate the 'TextLocation' using 'testLocation', so the return type is similar in
 -- meaning to the return type of 'validateLocation', which may throw a soft exception (which can be
 -- caught with 'catchError') if the given 'TextLocation' is out of bounds.
-newParserStreamAt
+newStreamCursorAt
   :: (MonadIO m
      , Show tags --DEBUG
      )
-  => TextLocation -> EditText tags m (ParserStream tags)
-newParserStreamAt loc = parserStreamResetCache ParserStream
+  => TextLocation -> EditText tags m (StreamCursor tags)
+newStreamCursorAt loc = streamResetCache StreamCursor
   { theParStreamCache    = TextLineUndefined
   , theParStreamLocation = loc
   }
 
--- | A convenience function that calls 'newParserStreamAt' with 'minBound' as the 'TextLocation'.
-newParserStream
+-- | A convenience function that calls 'newStreamCursorAt' with 'minBound' as the 'TextLocation'.
+newStreamCursor
   :: (MonadIO m
      , Show tags --DEBUG
      )
-  => EditText tags m (ParserStream tags)
-newParserStream = newParserStreamAt minBound
+  => EditText tags m (StreamCursor tags)
+newStreamCursor = newStreamCursorAt minBound
 
--- | This in an 'EditText' type of function which moves a given 'ParserStream' to a different
+-- | This in an 'EditText' type of function which moves a given 'StreamCursor' to a different
 -- location within the 'TextBuffer' of the current 'EditText' context. This can be used to perform
 -- backtracking, or forward-tracking, or any kind of tracking.
 --
--- If the given 'ParserStream' originated in a different 'TextBuffer' (supposing the 'EditText'
--- function in which 'newParserStream' was evaluated returned the 'ParserStream'), the target
--- 'TextBuffer' for the 'ParserStream' simply changes over to the new 'TextBuffer' and begins
--- sourcing characters from there. You should probably evaluate 'parserStreamResetCache' 
+-- If the given 'StreamCursor' originated in a different 'TextBuffer' (supposing the 'EditText'
+-- function in which 'newStreamCursor' was evaluated returned the 'StreamCursor'), the target
+-- 'TextBuffer' for the 'StreamCursor' simply changes over to the new 'TextBuffer' and begins
+-- sourcing characters from there. You should probably evaluate 'streamResetCache' 
 --
 -- This function must validate the 'TextLocation' using 'validateLocation', and so may throw a soft
 -- exception (which can be caught with 'catchError') if the given 'TextLocation' is out of bounds.
-parserStreamGoto
+streamGoto
   :: (MonadIO m
      , Show tags --DEBUG
      )
-  => ParserStream tags -> TextLocation -> EditText tags m (ParserStream tags)
-parserStreamGoto cursor = validateLocation >=> \ (loc, txt) ->
+  => StreamCursor tags -> TextLocation -> EditText tags m (StreamCursor tags)
+streamGoto cursor = validateLocation >=> \ (loc, txt) ->
   return cursor{ theParStreamCache = txt, theParStreamLocation = loc }
 
--- | Thinking of the 'ParserStream' as a cursor pointing to a character within a 'TextBuffer' this
+-- | Thinking of the 'StreamCursor' as a cursor pointing to a character within a 'TextBuffer' this
 -- function returns the character currently under the cursor __without advancing the cursor.__ For a
 -- function that does return the character under the cursor and and also advances the cursor, refer
--- to the 'parserStreamStep' function.
-parserStreamLook :: MonadIO m => ParserStream tags -> EditText tags m Char
-parserStreamLook s = pure $ textLineGetCharNoChk (theParStreamCache s) $
+-- to the 'streamStep' function.
+streamLook :: MonadIO m => StreamCursor tags -> EditText tags m Char
+streamLook s = pure $ textLineGetCharNoChk (theParStreamCache s) $
   theLocationCharIndex $ theParStreamLocation s
   -- This function could be pure, but I can't think of a good reason to make it pure since it
-  -- doesn't fit in with how other functions make use of a 'ParserStream' value.
+  -- doesn't fit in with how other functions make use of a 'StreamCursor' value.
 
--- | Thinking of the 'ParserStream' as a cursor pointing to a character within a 'TextBuffer' this
+-- | Thinking of the 'StreamCursor' as a cursor pointing to a character within a 'TextBuffer' this
 -- function returns the character currently under the cursor __and then advances the cursor.__ For a
--- function that does not advance the cursor, refer to the 'parserStreamLook' function.
-parserStreamStep
+-- function that does not advance the cursor, refer to the 'streamLook' function.
+streamStep
   :: (MonadIO m
      , Show tags --DEBUG
      )
-  => ParserStream tags -> EditText tags m (Char, ParserStream tags)
-parserStreamStep s = do
-  c <- parserStreamLook s
+  => StreamCursor tags -> EditText tags m (Char, StreamCursor tags)
+streamStep s = do
+  c <- streamLook s
   let txt   = theParStreamCache s
   let loc   = theParStreamLocation s
   let chnum = charToIndex (theLocationCharIndex loc) + 1
@@ -3550,41 +3550,41 @@ parserStreamStep s = do
     testLocation (loc & lineIndex +~ 1 & charIndex .~ 1) >>= \ case
       Left{} -> throwError $ EndOfLineBuffer After
       Right (txt, (ok, loc)) -> if not ok then throwError $ EndOfLineBuffer After else do
-        parserStreamCommitTags s
-        pure (c, ParserStream{ theParStreamCache = txt, theParStreamLocation = loc })
+        streamCommitTags s
+        pure (c, StreamCursor{ theParStreamCache = txt, theParStreamLocation = loc })
 
--- | There are times when the 'ParserStream' contains a cached 'TextLine' (given by the
--- 'parserStreamCache' value) that is different from the actual 'TextLine' unders the cursor
--- position of the 'TextLocation' given by 'parserStreamLocation'. This can happen when you evaluate
--- a 'ParserStream' in a new 'EditText' context for a different 'TextBuffer', or if
+-- | There are times when the 'StreamCursor' contains a cached 'TextLine' (given by the
+-- 'streamCache' value) that is different from the actual 'TextLine' unders the cursor
+-- position of the 'TextLocation' given by 'streamLocation'. This can happen when you evaluate
+-- a 'StreamCursor' in a new 'EditText' context for a different 'TextBuffer', or if
 -- 'flushLineEditor' has been evaluated and modified the line currently being inspected by the
--- 'ParserStream'.
+-- 'StreamCursor'.
 --
--- If you happen to know that the 'TextLine' given by 'parserStreamCache' is different from what it
+-- If you happen to know that the 'TextLine' given by 'streamCache' is different from what it
 -- should be, you should evaluate this function to reset the cached 'TextLine' to the correct
--- value. This function must also check that the 'parserStreamLocation' is still valid, so it may
--- evaluate to a @('Left' 'After')@ or @('Left' 'Before')@ value as with the 'parserStreamGoto'
+-- value. This function must also check that the 'streamLocation' is still valid, so it may
+-- evaluate to a @('Left' 'After')@ or @('Left' 'Before')@ value as with the 'streamGoto'
 -- function.
-parserStreamResetCache
+streamResetCache
   :: (MonadIO m
      , Show tags --DEBUG
      )
-  => ParserStream tags -> EditText tags m (ParserStream tags)
-parserStreamResetCache s = do
+  => StreamCursor tags -> EditText tags m (StreamCursor tags)
+streamResetCache s = do
   (loc, txt) <- validateLocation (theParStreamLocation s)
   return (s & parStreamLocation .~ loc & parStreamCache .~ txt)
 
--- | You can use the 'parserStreamTags' lens to alter the @tags@ value of the line cached (the line
--- returned by 'parserStreamCache'd function), but to actually store these changes back to the
+-- | You can use the 'streamTags' lens to alter the @tags@ value of the line cached (the line
+-- returned by 'streamCache'd function), but to actually store these changes back to the
 -- 'TextBuffer', this function must be called. This function is called automatically by the
--- 'parserStreamStep' function when the cursor steps past the end of the current line and to the
+-- 'streamStep' function when the cursor steps past the end of the current line and to the
 -- next line.
-parserStreamCommitTags
+streamCommitTags
   :: (MonadIO m
      , Show tags --DEBUG
      )
-  => ParserStream tags -> EditText tags m ()
-parserStreamCommitTags s = putLineIndex (s ^. parStreamLocation . lineIndex) (s ^. parStreamCache)
+  => StreamCursor tags -> EditText tags m ()
+streamCommitTags s = putLineIndex (s ^. parStreamLocation . lineIndex) (s ^. parStreamCache)
 
 ----------------------------------------------------------------------------------------------------
 
