@@ -22,9 +22,26 @@
 -- `parsers`, you will consequently be able to use your parser as a MegaParsec parser or an
 -- AttoParsec parser, as well as a `Hakehsell.TextEditor.Parser`.
 module Hakshell.TextEditor.Parser
-  ( Parser, getLocation, getCharCounter,
-    getTextLine, getTextLineTags, putTextLineTags, modifyTextLineTags,resetTextLineTags,
-    ParStep(..), ParState, newParStateIO,
+  ( -- * The 'Parser' function type
+    Parser, ParserState, newParserState,
+    -- TODO: runParserWith, execParserWith, runParser, execParser,
+    ParStep(..),
+
+    -- * Primitive Combinators
+    --
+    -- For the most part, you should avoid using these primitive combinators except to update the
+    -- @tags@ value of the current line of text being parsed. For all other purposes, construct a
+    -- 'Parser' by way of the API functions defined in the 'Parsing' typeclass, not by use of these
+    -- functions directly.
+
+    -- ** Parser state information
+    parserGet, parserUse, parserModify, currentTags, parserUserState, thePosition, theCurrentLine,
+
+    -- ** Lifted 'ParserStream' combinators
+    --
+    -- TODO
+
+    -- * Re-exported modules
     module Text.Parser.Char,
     module Text.Parser.Combinators,
     module Text.Parser.Token
@@ -45,56 +62,35 @@ import           Text.Parser.Token
 
 ----------------------------------------------------------------------------------------------------
 
-data ParState tags st
-  = ParState
-    { theBuffer      :: !(TextBuffer tags)
-    , theLocation    :: !TextLocation
-    , theCharCounter :: !(Relative CharIndex)
-    , theLine        :: !(TextLine tags)
-    , theUserState   :: st
+-- | This is the data type containing the context of all functions of type 'Parser'. Although you
+-- cannot inspect or modify this data type directly, you can do so indirectly by using 'parserGet',
+-- 'parserUse', or 'parserModify' along with functions like 'thePosition', 'theCurrentLine', or
+-- 'currentTags'.
+data ParserState tags fold
+  = ParserState
+    { theParBuffer    :: !(TextBuffer tags)
+    , theParStream    :: !(ParserStream tags)
+    , theParUserState :: !fold
     }
 
-newParStateIO
-  ::
-    (Show tags) => --DEBUG
-    TextBuffer tags -> st -> IO (Either TextEditError (ParState tags st))
-newParStateIO buf ust = runEditTextIO (getLineIndex 1) buf <&> \ case
-  Left   err -> Left err
-  Right line -> Right $ ParState
-    { theBuffer      = buf
-    , theLocation    = TextLocation{ theLocationLineIndex = 1, theLocationCharIndex = 1 }
-    , theCharCounter = 0
-    , theLine        = line
-    , theUserState   = ust
-    }
+--parserBuffer :: Lens' (ParserState tags fold) (TextBuffer tags)
+--parserBuffer = lens theParBuffer $ \ a b -> a{ theParBuffer = b }
 
--- not for export
---buffer :: Lens' (ParState tags st) (TextBuffer tags)
---buffer = lens theBuffer $ \ a b -> a{ theBuffer = b }
+parserStream :: Lens' (ParserState tags fold) (ParserStream tags)
+parserStream = lens theParStream $ \ a b -> a{ theParStream = b }
 
--- not for export
-location :: Lens' (ParState tags st) TextLocation
-location = lens theLocation $ \ a b -> a{ theLocation = b }
-
--- not for export
-charCounter :: Lens' (ParState tags st) (Relative CharIndex)
-charCounter = lens theCharCounter $ \ a b -> a{ theCharCounter = b }
-
--- not for export
-line :: Lens' (ParState tags st) (TextLine tags)
-line = lens theLine $ \ a b -> a{ theLine = b }
-
--- not for export
-userState :: Lens' (ParState tags st) st
-userState = lens theUserState $ \ a b -> a{ theUserState = b }
+parserUserState :: Lens' (ParserState tags fold) fold
+parserUserState = lens theParUserState $ \ a b -> a{ theParUserState = b }
 
 ----------------------------------------------------------------------------------------------------
 
+-- | This is the internal control structure for a 'Parser' function type. After evaluating a
+-- 'Parser' function, the result of parsing is expressed as a value of this type.
 data ParStep tags st a
   = Backtrack
   | ParSuccess a
-  | ParWaiting !(ParState tags st) (Parser tags st a)
-  | ParError   !(ParState tags st) !StrictBytes
+  | ParWaiting !(ParserState tags st) (Parser tags st a)
+  | ParError   !(ParserState tags st) !StrictBytes
   deriving Functor
 
 instance Applicative (ParStep tags st) where
@@ -125,8 +121,13 @@ instance MonadPlus (ParStep tags st) where { mzero = empty; mplus = (<|>); }
 
 ----------------------------------------------------------------------------------------------------
 
+-- | The most common use of this function type is to define parsers for syntax coloring. This is the
+-- 'Parser' function type specificly designed to operate on a 'TextBuffer'. This function type
+-- instantiates the 'Parsing' typeclass, so you should define parsers using the 'Parsing' typeclass
+-- APIs, and then evaluate these parsers on a 'TextBuffer' to extract information about the text in
+-- the 'TextBuffer' using the 'execParser' function.
 newtype Parser tags st a
-  = Parser{ unwrapParser :: StateT (ParState tags st) IO (ParStep tags st a) }
+  = Parser{ unwrapParser :: StateT (ParserState tags st) IO (ParStep tags st a) }
   deriving Functor
 
 instance Applicative (Parser tags st) where
@@ -160,32 +161,61 @@ instance MonadFail (Parser tags st) where
 
 instance MonadState st (Parser tags st) where
   state f = Parser $ state $ \ st ->
-    let (a, ust) = f (st ^. userState) in (ParSuccess a, st & userState .~ ust)
+    let (a, ust) = f (st ^. parserUserState) in (ParSuccess a, st & parserUserState .~ ust)
 
-getLocation :: Parser tags st TextLocation
-getLocation = Parser $ ParSuccess <$> use location
+-- | Construct a new 'ParserState'. Note that this function must be evaluated within an 'EditText'
+-- type of function.
+newParserState
+  :: (MonadIO m
+     , Show tags --DEBUG
+     )
+  => st -> EditText tags m (ParserState tags st)
+newParserState ust = do
+  buf    <- currentBuffer
+  stream <- newParserStream
+  return ParserState
+    { theParBuffer    = buf
+    , theParStream    = stream
+    , theParUserState = ust
+    }
 
-getCharCounter :: Parser tags st (Relative CharIndex)
-getCharCounter = Parser $ ParSuccess <$> use charCounter
+---- | Evaluates a 'Parser' using an existing 'ParserState' that has already been constructed with a
+---- call to 'newParserState'.
+--runParserWith
+--  :: (MonadIO m
+--     , Show tags --DEBUG
+--     )
+--  => Parser tags fold a -> ParserState tags fold -> EditText tags m (ParStep tags fold a)
+--runParserWith (Parser par) st = 
 
-getTextLine :: Parser tags st (TextLine tags)
-getTextLine = Parser $ ParSuccess <$> use line
+----------------------------------------------------------------------------------------------------
 
-getTextLineTags :: Parser tags st tags
-getTextLineTags = Parser $ ParSuccess <$> use (line . textLineTags)
+-- | This function takes information from the 'ParserState' internal to the 'Parser' function
+-- context. Pass functions like 'thePosition' or 'theCurrentLine' as arguments to this function to
+-- obtain information.
+parserGet :: (ParserState tags fold -> a) -> Parser tags fold a
+parserGet = Parser . fmap ParSuccess . gets
 
-putTextLineTags :: tags -> Parser tags st ()
-putTextLineTags = Parser . fmap ParSuccess . ((line . textLineTags) .=)
+-- | Same as 'parserGet' but takes a 'Lens' parameter instead of a pure function.
+parserUse :: Lens' (ParserState tags fold) a -> Parser tags fold a
+parserUse = Parser . fmap ParSuccess . use
 
-modifyTextLineTags :: (tags -> tags) -> Parser tags st ()
-modifyTextLineTags = Parser . fmap ParSuccess . ((line . textLineTags) %=)
+-- | Like 'modify' but updates part of the 'ParserState' rather than the @fold@ed value.
+parserModify :: (ParserState tags fold -> ParserState tags fold) -> Parser tags fold ()
+parserModify = Parser . fmap ParSuccess . modify
 
-resetTextLineTags :: Parser tags st ()
-resetTextLineTags = Parser $
-  gets theBuffer >>=
-  liftIO . runEditTextIO (use bufferDefaultTags) >>= \ case
-    Left err -> error $ "(INTERAL ERROR) resetTextLineTags produced error message: "++show err
-    Right  a -> fmap ParSuccess . assign (line . textLineTags) $ a
+-- | Pass this function to 'parserGet' to obtain the current position of the parser within the
+-- 'TextBuffer'.
+thePosition :: ParserState tags fold -> TextLocation
+thePosition = parserStreamLocation . theParStream
+
+-- | Pass this function to 'parserGet' to obtain the current line being inspected by the parser.
+theCurrentLine :: Parser tags st (TextLine tags)
+theCurrentLine = Parser $ ParSuccess . parserStreamCache <$> use parserStream
+
+-- | This is a lens that can be used with 'parserModify' to alter the @tags@' for the current line.
+currentTags :: Lens' (ParserState tags fold) tags
+currentTags = parserStream . parserStreamTags
 
 ----------------------------------------------------------------------------------------------------
 

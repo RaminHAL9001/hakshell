@@ -106,7 +106,7 @@ module Hakshell.TextEditor
     insertString, lineBreak, deleteCharsWrap,
     pushLine, popLine, currentTextLocation, currentLineNumber, currentColumnNumber,
     getLineIndex, putLineIndex, withCurrentLine,
-    bufferLineCount, bufferIsEmpty,
+    bufferLineCount, bufferIsEmpty, currentBuffer,
 
     -- ** The 'EditLine' function type
     --
@@ -263,7 +263,7 @@ module Hakshell.TextEditor
 
     ParserStream, newParserStreamAt, newParserStream, parserStreamGoto,
     parserStreamLook, parserStreamStep, parserStreamResetCache,
-    parserStreamLocation, parserStreamCache,
+    parserStreamLocation, parserStreamCache, parserStreamTags, parserStreamCommitTags,
 
     -- * Debugging
 
@@ -2575,6 +2575,14 @@ bufferIsEmpty = bufferLineCount >>= \ ln ->
   else if ln <= 0 then return True
   else withCurrentLine $ \ _ line -> return $ textLineCursorSpan line == 0
 
+-- | Return a pointer to the buffer currently being edited by the @editor@ function.
+currentBuffer
+  :: (MonadEditText editor, MonadIO (editor tags m), MonadIO m
+     , Show tags --DEBUG
+     )
+  => editor tags m (TextBuffer tags)
+currentBuffer = liftEditText $ gets $ parentTextEditor . theBufferLineEditor
+
 ----------------------------------------------------------------------------------------------------
 
 -- not for export
@@ -3454,6 +3462,13 @@ parStreamCache = lens theParStreamCache $ \ a b -> a{ theParStreamCache = b }
 parStreamLocation :: Lens' (ParserStream tags) TextLocation
 parStreamLocation = lens theParStreamLocation $ \ a b -> a{ theParStreamLocation = b }
 
+-- | This is not a getter but a lens which you can use to update the @tags@ of the current
+-- 'ParserStream'. If you do update the @tags@, you can call 'parserStreamCommitTags' to write these
+-- tags back to the 'TextBuffer'. The 'parserStreamCommitTags' function is called automatically by
+-- the 'parserStreamStep' function.
+parserStreamTags :: Lens' (ParserStream tags) tags
+parserStreamTags = parStreamCache . textLineTags
+
 -- | Get the 'TextLine' currently being cached by this 'ParserStream' object. This cached 'TextLine'
 -- changes every time the 'parserStreamLocation' moves to another line, or when
 -- 'parserStreamResetCache' is evaluated within an 'EditText' function context.
@@ -3534,8 +3549,9 @@ parserStreamStep s = do
   if chnum < intSize txt then pure (c, s & parStreamLocation . charIndex .~ i) else
     testLocation (loc & lineIndex +~ 1 & charIndex .~ 1) >>= \ case
       Left{} -> throwError $ EndOfLineBuffer After
-      Right (txt, (ok, loc)) -> if not ok then throwError $ EndOfLineBuffer After else pure
-        (c, ParserStream{ theParStreamCache = txt, theParStreamLocation = loc })
+      Right (txt, (ok, loc)) -> if not ok then throwError $ EndOfLineBuffer After else do
+        parserStreamCommitTags s
+        pure (c, ParserStream{ theParStreamCache = txt, theParStreamLocation = loc })
 
 -- | There are times when the 'ParserStream' contains a cached 'TextLine' (given by the
 -- 'parserStreamCache' value) that is different from the actual 'TextLine' unders the cursor
@@ -3557,6 +3573,18 @@ parserStreamResetCache
 parserStreamResetCache s = do
   (loc, txt) <- validateLocation (theParStreamLocation s)
   return (s & parStreamLocation .~ loc & parStreamCache .~ txt)
+
+-- | You can use the 'parserStreamTags' lens to alter the @tags@ value of the line cached (the line
+-- returned by 'parserStreamCache'd function), but to actually store these changes back to the
+-- 'TextBuffer', this function must be called. This function is called automatically by the
+-- 'parserStreamStep' function when the cursor steps past the end of the current line and to the
+-- next line.
+parserStreamCommitTags
+  :: (MonadIO m
+     , Show tags --DEBUG
+     )
+  => ParserStream tags -> EditText tags m ()
+parserStreamCommitTags s = putLineIndex (s ^. parStreamLocation . lineIndex) (s ^. parStreamCache)
 
 ----------------------------------------------------------------------------------------------------
 
