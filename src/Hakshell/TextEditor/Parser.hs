@@ -38,7 +38,7 @@ module Hakshell.TextEditor.Parser
     parserGet, parserUse, parserModify, currentTags, parserUserState, thePosition, theCurrentLine,
 
     -- ** Lifted 'StreamCursor' combinators
-    parserGoto, parserLook, parserStep,
+    parserGoto, parserLook, parserStep, parserCommitTags, parserResetCache,
 
     -- *** Parser state utilities
     --
@@ -282,13 +282,14 @@ liftCursorStreamGet
   -> Parser tags fold m a
 liftCursorStreamGet f = Parser $ use parserStream >>= fmap ParSuccess . lift . f
 
--- | Change the current position of the parser's cursor. This function lifts 'streamGoto'
+-- | Change the current position of the parser's cursor. This function lifts 'streamGoto'.
 parserGoto
   :: (MonadIO m
      , Show tags --DEBUG
      )
   => TextLocation -> Parser tags fold m ()
-parserGoto = liftCursorStreamModify . flip streamGoto
+parserGoto = (>>) parserResetCache .
+  liftCursorStreamModify . flip streamGoto
 
 -- | Get the character under the cursor without advancing the cursor. This function lifts
 -- 'streamLook'.
@@ -299,7 +300,6 @@ parserLook
   => Parser tags fold m Char
 parserLook = liftCursorStreamGet streamLook
 
-
 -- | Get the character under the cursor and advances the cursor. This function lifts 'streamStep'.
 parserStep 
   :: (MonadIO m
@@ -308,6 +308,23 @@ parserStep
   => Parser tags fold m Char
 parserStep = liftCursorStreamState streamStep
 
+-- | This function pushses the @tags@ value of the current cached 'TextLine'
+parserCommitTags
+  :: (MonadIO m
+     , Show tags --DEBUG
+     )
+  => Parser tags fold m ()
+parserCommitTags = liftCursorStreamGet streamCommitTags
+
+-- | This function ensures that the cached 'TextLine' being analyzed by the parser is the same
+-- 'TextLine' that is under the parsing cursor. This function is called automatically by
+-- 'parserGoto'.
+parserResetCache
+  :: (MonadIO m
+     , Show tags --DEBUG
+     )
+  => Parser tags fold m ()
+parserResetCache = liftCursorStreamModify streamResetCache
 
 ----------------------------------------------------------------------------------------------------
 
