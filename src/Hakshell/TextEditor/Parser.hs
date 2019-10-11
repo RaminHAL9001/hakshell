@@ -86,14 +86,14 @@ parserUserState = lens theParUserState $ \ a b -> a{ theParUserState = b }
 
 -- | This is the internal control structure for a 'Parser' function type. After evaluating a
 -- 'Parser' function, the result of parsing is expressed as a value of this type.
-data ParStep tags st a
+data ParStep tags st m a
   = Backtrack
   | ParSuccess a
-  | ParWaiting !(ParserState tags st) (Parser tags st a)
+  | ParWaiting !(ParserState tags st) (Parser tags st m a)
   | ParError   !(ParserState tags st) !StrictBytes
   deriving Functor
 
-instance Applicative (ParStep tags st) where
+instance Monad m => Applicative (ParStep tags st m) where
   pure = ParSuccess
   a <*> b = case a of
     Backtrack                 -> Backtrack
@@ -105,11 +105,11 @@ instance Applicative (ParStep tags st) where
     ParWaiting st0 (Parser a) -> ParWaiting st0 $ Parser $ (<*> b) <$> a
     ParError   err  msg       -> ParError err msg
 
-instance Alternative (ParStep tags st) where
+instance Monad m => Alternative (ParStep tags st m) where
   empty = Backtrack
   a <|> b = case a of { Backtrack -> b; a -> a; }
 
-instance Monad (ParStep tags st) where
+instance Monad m => Monad (ParStep tags st m) where
   return = pure
   (>>=) = \ case
     Backtrack                 -> const Backtrack
@@ -117,7 +117,7 @@ instance Monad (ParStep tags st) where
     ParWaiting  st (Parser a) -> \ f -> ParWaiting st $ Parser $ (>>= f) <$> a
     ParError    err      msg  -> const $ ParError err msg
 
-instance MonadPlus (ParStep tags st) where { mzero = empty; mplus = (<|>); }
+instance Monad m => MonadPlus (ParStep tags st m) where { mzero = empty; mplus = (<|>); }
 
 ----------------------------------------------------------------------------------------------------
 
@@ -126,19 +126,19 @@ instance MonadPlus (ParStep tags st) where { mzero = empty; mplus = (<|>); }
 -- instantiates the 'Parsing' typeclass, so you should define parsers using the 'Parsing' typeclass
 -- APIs, and then evaluate these parsers on a 'TextBuffer' to extract information about the text in
 -- the 'TextBuffer' using the 'execParser' function.
-newtype Parser tags st a
-  = Parser{ unwrapParser :: StateT (ParserState tags st) IO (ParStep tags st a) }
+newtype Parser tags st m a
+  = Parser{ unwrapParser :: StateT (ParserState tags st) (EditText tags m) (ParStep tags st m a) }
   deriving Functor
 
-instance Applicative (Parser tags st) where
+instance Monad m => Applicative (Parser tags st m) where
   pure = Parser . return . pure
   (Parser a) <*> (Parser b) = Parser $ (<*>) <$> a <*> b
 
-instance Alternative (Parser tags st) where
+instance Monad m => Alternative (Parser tags st m) where
   empty = Parser $ return empty
   (Parser a) <|> (Parser b) = Parser $ (<|>) <$> a <*> b
 
-instance Monad (Parser tags st) where
+instance Monad m => Monad (Parser tags st m) where
   return = pure
   (Parser a) >>= f = Parser $ a >>= \ case
     Backtrack        -> return Backtrack
@@ -146,9 +146,9 @@ instance Monad (Parser tags st) where
     ParWaiting  st a -> return $ ParWaiting st $ a >>= f
     ParError err msg -> return $ ParError err msg
 
-instance MonadPlus (Parser tags st) where { mzero = empty; mplus = (<|>); }
+instance Monad m => MonadPlus (Parser tags st m) where { mzero = empty; mplus = (<|>); }
 
-instance MonadError StrictBytes (Parser tags st) where
+instance Monad m => MonadError StrictBytes (Parser tags st m) where
   throwError msg = Parser $ flip ParError msg <$> get
   catchError (Parser try) catch = Parser $ try >>= \ case
     Backtrack       -> return Backtrack
@@ -156,10 +156,10 @@ instance MonadError StrictBytes (Parser tags st) where
     ParWaiting st a -> return $ ParWaiting st $ catchError a catch
     ParError  _ msg -> unwrapParser $ catch msg
 
-instance MonadFail (Parser tags st) where
+instance Monad m => MonadFail (Parser tags st m) where
   fail = throwError . pack
 
-instance MonadState st (Parser tags st) where
+instance Monad m => MonadState st (Parser tags st m) where
   state f = Parser $ state $ \ st ->
     let (a, ust) = f (st ^. parserUserState) in (ParSuccess a, st & parserUserState .~ ust)
 
@@ -193,15 +193,17 @@ newParserState ust = do
 -- | This function takes information from the 'ParserState' internal to the 'Parser' function
 -- context. Pass functions like 'thePosition' or 'theCurrentLine' as arguments to this function to
 -- obtain information.
-parserGet :: (ParserState tags fold -> a) -> Parser tags fold a
+parserGet :: Monad m => (ParserState tags fold -> a) -> Parser tags fold m a
 parserGet = Parser . fmap ParSuccess . gets
 
 -- | Same as 'parserGet' but takes a 'Lens' parameter instead of a pure function.
-parserUse :: Lens' (ParserState tags fold) a -> Parser tags fold a
+parserUse :: Monad m => Lens' (ParserState tags fold) a -> Parser tags fold m a
 parserUse = Parser . fmap ParSuccess . use
 
 -- | Like 'modify' but updates part of the 'ParserState' rather than the @fold@ed value.
-parserModify :: (ParserState tags fold -> ParserState tags fold) -> Parser tags fold ()
+parserModify
+  :: Monad m
+  => (ParserState tags fold -> ParserState tags fold) -> Parser tags fold m ()
 parserModify = Parser . fmap ParSuccess . modify
 
 -- | Pass this function to 'parserGet' to obtain the current position of the parser within the
@@ -210,7 +212,7 @@ thePosition :: ParserState tags fold -> TextLocation
 thePosition = streamLocation . theParStream
 
 -- | Pass this function to 'parserGet' to obtain the current line being inspected by the parser.
-theCurrentLine :: Parser tags st (TextLine tags)
+theCurrentLine :: Monad m => Parser tags st m (TextLine tags)
 theCurrentLine = Parser $ ParSuccess . streamCache <$> use parserStream
 
 -- | This is a lens that can be used with 'parserModify' to alter the @tags@' for the current line.
