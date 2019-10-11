@@ -38,8 +38,14 @@ module Hakshell.TextEditor.Parser
     parserGet, parserUse, parserModify, currentTags, parserUserState, thePosition, theCurrentLine,
 
     -- ** Lifted 'StreamCursor' combinators
+    parserGoto, parserLook, parserStep,
+
+    -- *** Parser state utilities
     --
-    -- TODO
+    -- These functions shouldn't be necessary unless you have some very odd function that alters the
+    -- 'StreamCursror' in an 'EditText' function context that cannot be done with any of the other
+    -- combinators provided in this module.
+    liftCursorStreamState, liftCursorStreamModify, liftCursorStreamGet,
 
     -- * Re-exported modules
     module Text.Parser.Char,
@@ -240,6 +246,68 @@ theCurrentLine = Parser $ ParSuccess . streamCache <$> use parserStream
 -- | This is a lens that can be used with 'parserModify' to alter the @tags@' for the current line.
 currentTags :: Lens' (ParserState tags fold) tags
 currentTags = parserStream . streamTags
+
+----------------------------------------------------------------------------------------------------
+
+-- | Lift a function that modifies a 'StreamCursor' within the lifted 'EditText' function context.
+liftCursorStreamState
+  :: (MonadIO m
+     , Show tags --DEBUG
+     )
+  => (StreamCursor tags -> EditText tags m (a, StreamCursor tags))
+  -> Parser tags fold m a
+liftCursorStreamState f = Parser $ do
+  (a, fold) <- use parserStream >>= lift . f
+  parserStream .= fold
+  return (ParSuccess a)
+
+-- | Like 'liftCursorStreamState', but the lifted function only modifies the 'StreamCursor' and
+-- doesn't return any other value.
+liftCursorStreamModify
+  :: (MonadIO m
+     , Show tags --DEBUG
+     )
+  => (StreamCursor tags -> EditText tags m (StreamCursor tags))
+  -> Parser tags fold m ()
+liftCursorStreamModify f = Parser $ use parserStream >>= lift . f >>=
+  fmap ParSuccess . assign parserStream
+
+-- | Like 'liftCursorStreamGet', but the lifted function only modifies the 'StreamCursor' and
+-- doesn't return any other value.
+liftCursorStreamGet
+  :: (MonadIO m
+     , Show tags --DEBUG
+     )
+  => (StreamCursor tags -> EditText tags m a)
+  -> Parser tags fold m a
+liftCursorStreamGet f = Parser $ use parserStream >>= fmap ParSuccess . lift . f
+
+-- | Change the current position of the parser's cursor. This function lifts 'streamGoto'
+parserGoto
+  :: (MonadIO m
+     , Show tags --DEBUG
+     )
+  => TextLocation -> Parser tags fold m ()
+parserGoto = liftCursorStreamModify . flip streamGoto
+
+-- | Get the character under the cursor without advancing the cursor. This function lifts
+-- 'streamLook'.
+parserLook 
+  :: (MonadIO m
+     , Show tags --DEBUG
+     )
+  => Parser tags fold m Char
+parserLook = liftCursorStreamGet streamLook
+
+
+-- | Get the character under the cursor and advances the cursor. This function lifts 'streamStep'.
+parserStep 
+  :: (MonadIO m
+     , Show tags --DEBUG
+     )
+  => Parser tags fold m Char
+parserStep = liftCursorStreamState streamStep
+
 
 ----------------------------------------------------------------------------------------------------
 
