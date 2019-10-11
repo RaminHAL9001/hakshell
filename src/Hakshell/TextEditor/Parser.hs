@@ -24,7 +24,7 @@
 module Hakshell.TextEditor.Parser
   ( -- * The 'Parser' function type
     Parser, ParserState, newParserState,
-    -- TODO: runParserWith, execParserWith, runParser, execParser,
+    runParserWith, runParser, evalParser,
     ParStep(..),
 
     -- * Primitive Combinators
@@ -181,14 +181,34 @@ newParserState fold = do
     , theParUserState = fold
     }
 
----- | Evaluates a 'Parser' using an existing 'ParserState' that has already been constructed with a
----- call to 'newParserState'.
---runParserWith
---  :: (MonadIO m
---     , Show tags --DEBUG
---     )
---  => Parser tags fold a -> ParserState tags fold -> EditText tags m (ParStep tags fold a)
---runParserWith (Parser par) st = 
+-- | Evaluates a 'Parser' using an existing 'ParserState' that has already been constructed with a
+-- call to 'newParserState'.
+runParserWith
+  :: (MonadIO m
+     , Show tags --DEBUG
+     )
+  => Parser tags fold m a
+  -> ParserState tags fold
+  -> EditText tags m (ParStep tags fold m a, ParserState tags fold)
+runParserWith (Parser par) st = runStateT par st
+
+-- | Similar to 'runParserWith', but evaluates 'newParserState' before running the parser.
+runParser
+  :: (MonadIO m
+     , Show tags --DEBUG
+     )
+  => Parser tags fold m a -> fold
+  -> EditText tags m (ParStep tags fold m a, ParserState tags fold)
+runParser p = newParserState >=> runParserWith p
+
+-- | The simplest way to evaluate a 'Parser', this function creates a new 'ParserState', throws away
+-- the 'ParserState' when completed, and only returns the 'ParStep' result.
+evalParser 
+  :: (MonadIO m
+     , Show tags --DEBUG
+     )
+  => Parser tags fold m a -> fold -> EditText tags m (ParStep tags fold m a)
+evalParser p = fmap fst . runParser p
 
 ----------------------------------------------------------------------------------------------------
 
