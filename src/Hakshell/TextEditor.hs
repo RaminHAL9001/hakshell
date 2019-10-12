@@ -262,7 +262,7 @@ module Hakshell.TextEditor
     -- characters from a 'TextBuffer' to a 'Hakshell.TextEditor.Parser.Parser'.
 
     StreamCursor, newStreamCursorAt, newStreamCursor,
-    streamGoto, streamLook, streamStep,
+    streamGoto, streamLook, streamStep, streamIsEOF,
     streamTags, streamCommitTags, streamResetCache, streamResetEndpoint,
     theStreamCache, theStreamLocation, theStreamEndpoint,
 
@@ -3446,7 +3446,7 @@ forLinesInView (TextView{textViewVector=vec}) fold f = flip execStateT fold $
 -- context, the 'StreamCursor' is not sensitive to which 'TextBuffer' is currently being inspected
 -- by the 'EditText' function. This means your 'EditText' function evaluating in 'TextBuffer' @a@
 -- can return the 'StreamCursor', and this same parser stream can then be used to call
--- 'streamStep' within an 'EditText' function that is currently evaluating in a different
+-- 'streamLook' within an 'EditText' function that is currently evaluating in a different
 -- 'TextBuffer' @b@. The 'StreamCursor' itself only contains the current 'TextLocation' and a cached
 -- copy of the last line that it had been inspecting. If you are performing low-level programming of
 -- parsers using a 'StreamCursor' it is up to you to ensure the 'StreamCursor' evaluates in the
@@ -3529,35 +3529,45 @@ streamGoto cursor = validateLocation >=> \ (loc, txt) ->
   return cursor{ theStreamCache = txt, theStreamLocation = loc }
 
 -- | Thinking of the 'StreamCursor' as a cursor pointing to a character within a 'TextBuffer' this
--- function returns the character currently under the cursor __without advancing the cursor.__ For a
--- function that does return the character under the cursor and and also advances the cursor, refer
--- to the 'streamStep' function.
-streamLook :: MonadIO m => StreamCursor tags -> EditText tags m Char
-streamLook s = pure $ textLineGetCharNoChk (theStreamCache s) $
-  theLocationCharIndex $ theStreamLocation s
-  -- This function could be pure, but I can't think of a good reason to make it pure since it
-  -- doesn't fit in with how other functions make use of a 'StreamCursor' value.
-
--- | Thinking of the 'StreamCursor' as a cursor pointing to a character within a 'TextBuffer' this
--- function returns the character currently under the cursor __and then advances the cursor.__ For a
--- function that does not advance the cursor, refer to the 'streamLook' function.
-streamStep
+-- function returns the character currently under the cursor __without advancing the cursor.__ This
+-- function throws an @'EndOfLineBuffer' 'After'@ exception if 'streamResetCache' cannot resolve
+-- 'theStreamLocation'. This function throws an @'EndOfCharBuffer' 'After'@ exception if cursor has
+-- somehow moved beyond 'theStreamCache', which could only happen if the 'streamResetCache' function
+-- has not been called after transplanting the 'StreamCursor' to another 'TextBuffer'.
+streamLook
   :: (MonadIO m
      , Show tags --DEBUG
      )
   => StreamCursor tags -> EditText tags m (Char, StreamCursor tags)
+streamLook s = case theStreamCache s of
+  TextLineUndefined -> streamResetCache s >>= streamLook
+  line              -> case textLineGetChar line (theStreamLocation s ^. charIndex) of
+    Nothing           -> throwError $ EndOfCharBuffer After
+    Just  c           -> return (c, s)
+{-# INLINE streamLook #-}
+
+-- | Thinking of the 'StreamCursor' as a cursor pointing to a character within a 'TextBuffer' this
+-- function advances the cursor without reading any characters.
+streamStep
+  :: (MonadIO m
+     , Show tags --DEBUG
+     )
+  => StreamCursor tags -> EditText tags m (StreamCursor tags)
 streamStep s = do
-  c <- streamLook s
-  let txt   = theStreamCache s
-  let loc   = theStreamLocation s
-  let chnum = charToIndex (theLocationCharIndex loc) + 1
-  let i     = indexToChar chnum
-  if chnum < intSize txt then pure (c, s & streamLocation . charIndex .~ i) else
-    testLocation (loc & lineIndex +~ 1 & charIndex .~ 1) >>= \ case
-      Left{} -> throwError $ EndOfLineBuffer After
-      Right (txt, (ok, loc)) -> if not ok then throwError $ EndOfLineBuffer After else do
-        streamCommitTags s
-        pure (c, s{ theStreamCache = txt, theStreamLocation = loc })
+  let i   = charToIndex $ s ^. streamLocation . charIndex
+  let top = intSize     $ s ^. streamCache
+  when (i >= top) $ streamCommitTags s
+  return $ 
+    ( if i < top then streamLocation . charIndex +~ 1 else
+        (streamLocation %~ (lineIndex +~ 1) . (charIndex .~ 1)) .
+        (streamCache .~ TextLineUndefined)
+    ) s
+{-# INLINE streamStep #-}
+
+-- | Tests whether 'theStreamLocation' is greater-than or equal-to 'theStreamEndpoint'.
+streamIsEOF :: StreamCursor tags -> Bool
+streamIsEOF s = theStreamLocation s >= theStreamEndpoint s
+{-# INLINE streamIsEOF #-}
 
 -- | There are times when the 'StreamCursor' contains a cached 'TextLine' (given by the
 -- 'streamCache' value) that is different from the actual 'TextLine' unders the cursor
