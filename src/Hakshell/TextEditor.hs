@@ -261,9 +261,10 @@ module Hakshell.TextEditor
     -- provided here provides stateful information necessary to efficiently deliver a stream of
     -- characters from a 'TextBuffer' to a 'Hakshell.TextEditor.Parser.Parser'.
 
-    StreamCursor, newStreamCursorAt, newStreamCursor, streamGoto,
-    streamLook, streamStep, streamResetCache,
-    streamLocation, streamCache, streamTags, streamCommitTags,
+    StreamCursor, newStreamCursorAt, newStreamCursor,
+    streamGoto, streamLook, streamStep,
+    streamTags, streamCommitTags, streamResetCache, streamResetEndpoint,
+    theStreamCache, theStreamLocation, theStreamEndpoint,
 
     -- * Debugging
 
@@ -3452,34 +3453,38 @@ forLinesInView (TextView{textViewVector=vec}) fold f = flip execStateT fold $
 -- expected 'TextBuffer'.
 data StreamCursor tags
   = StreamCursor
-    { theParStreamCache    :: !(TextLine tags)
-    , theParStreamLocation :: !TextLocation
+    { theStreamCache    :: !(TextLine tags)
+      -- ^ Get the 'TextLine' currently being cached by this 'StreamCursor' object. This cached
+      -- 'TextLine' changes every time the 'streamLocation' moves to another line, or when
+      -- 'streamResetCache' is evaluated within an 'EditText' function context.
+    , theStreamLocation :: !TextLocation
+      -- ^ Thinking of a 'StreamCursor' as a cursor pointing to a character within a 'TextBuffer'
+      -- this function returns the 'TextLocation' of the cursor, similar to how
+      -- 'currentTextLocation' returns the position of the text editing cursor.
+    , theStreamEndpoint :: !TextLocation
+      -- ^ This is 'TextLocation' of the final character within the 'TextBuffer' from which this
+      -- 'StreamCursor' is reading. If the 'TextBuffer' is modified during parsing, this value must
+      -- be updated by evaluating 'streamResetEndpoint'.
     }
 
-parStreamCache :: Lens' (StreamCursor tags) (TextLine tags)
-parStreamCache = lens theParStreamCache $ \ a b -> a{ theParStreamCache = b }
+-- not for export
+streamCache :: Lens' (StreamCursor tags) (TextLine tags)
+streamCache = lens theStreamCache $ \ a b -> a{ theStreamCache = b }
 
-parStreamLocation :: Lens' (StreamCursor tags) TextLocation
-parStreamLocation = lens theParStreamLocation $ \ a b -> a{ theParStreamLocation = b }
+-- not for export
+streamLocation :: Lens' (StreamCursor tags) TextLocation
+streamLocation = lens theStreamLocation $ \ a b -> a{ theStreamLocation = b }
+
+---- not for export
+--streamEndpoint :: Lens' (StreamCursor tags) TextLocation
+--streamEndpoint = lens theStreamEndpoint $ \ a b -> a{ theStreamEndpoint = b }
 
 -- | This is not a getter but a lens which you can use to update the @tags@ of the current
 -- 'StreamCursor'. If you do update the @tags@, you can call 'streamCommitTags' to write these
 -- tags back to the 'TextBuffer'. The 'streamCommitTags' function is called automatically by
 -- the 'streamStep' function.
 streamTags :: Lens' (StreamCursor tags) tags
-streamTags = parStreamCache . textLineTags
-
--- | Get the 'TextLine' currently being cached by this 'StreamCursor' object. This cached 'TextLine'
--- changes every time the 'streamLocation' moves to another line, or when
--- 'streamResetCache' is evaluated within an 'EditText' function context.
-streamCache :: StreamCursor tags -> TextLine tags
-streamCache = theParStreamCache
-
--- | Thinking of a 'StreamCursor' as a cursor pointing to a character within a 'TextBuffer' this
--- function returns the 'TextLocation' of the cursor, similar to how 'currentTextLocation' returns
--- the position of the text editing cursor.
-streamLocation :: StreamCursor tags -> TextLocation
-streamLocation = theParStreamLocation
+streamTags = streamCache . textLineTags
 
 -- | Constructs a new 'StreamCursor' at a given 'TextLocation' within a given 'TextBuffer'. This
 -- function must validate the 'TextLocation' using 'testLocation', so the return type is similar in
@@ -3491,9 +3496,10 @@ newStreamCursorAt
      )
   => TextLocation -> EditText tags m (StreamCursor tags)
 newStreamCursorAt loc = streamResetCache StreamCursor
-  { theParStreamCache    = TextLineUndefined
-  , theParStreamLocation = loc
-  }
+  { theStreamCache    = TextLineUndefined
+  , theStreamLocation = loc
+  , theStreamEndpoint = maxBound
+  } >>= streamResetEndpoint
 
 -- | A convenience function that calls 'newStreamCursorAt' with 'minBound' as the 'TextLocation'.
 newStreamCursor
@@ -3520,15 +3526,15 @@ streamGoto
      )
   => StreamCursor tags -> TextLocation -> EditText tags m (StreamCursor tags)
 streamGoto cursor = validateLocation >=> \ (loc, txt) ->
-  return cursor{ theParStreamCache = txt, theParStreamLocation = loc }
+  return cursor{ theStreamCache = txt, theStreamLocation = loc }
 
 -- | Thinking of the 'StreamCursor' as a cursor pointing to a character within a 'TextBuffer' this
 -- function returns the character currently under the cursor __without advancing the cursor.__ For a
 -- function that does return the character under the cursor and and also advances the cursor, refer
 -- to the 'streamStep' function.
 streamLook :: MonadIO m => StreamCursor tags -> EditText tags m Char
-streamLook s = pure $ textLineGetCharNoChk (theParStreamCache s) $
-  theLocationCharIndex $ theParStreamLocation s
+streamLook s = pure $ textLineGetCharNoChk (theStreamCache s) $
+  theLocationCharIndex $ theStreamLocation s
   -- This function could be pure, but I can't think of a good reason to make it pure since it
   -- doesn't fit in with how other functions make use of a 'StreamCursor' value.
 
@@ -3542,16 +3548,16 @@ streamStep
   => StreamCursor tags -> EditText tags m (Char, StreamCursor tags)
 streamStep s = do
   c <- streamLook s
-  let txt   = theParStreamCache s
-  let loc   = theParStreamLocation s
+  let txt   = theStreamCache s
+  let loc   = theStreamLocation s
   let chnum = charToIndex (theLocationCharIndex loc) + 1
   let i     = indexToChar chnum
-  if chnum < intSize txt then pure (c, s & parStreamLocation . charIndex .~ i) else
+  if chnum < intSize txt then pure (c, s & streamLocation . charIndex .~ i) else
     testLocation (loc & lineIndex +~ 1 & charIndex .~ 1) >>= \ case
       Left{} -> throwError $ EndOfLineBuffer After
       Right (txt, (ok, loc)) -> if not ok then throwError $ EndOfLineBuffer After else do
         streamCommitTags s
-        pure (c, StreamCursor{ theParStreamCache = txt, theParStreamLocation = loc })
+        pure (c, s{ theStreamCache = txt, theStreamLocation = loc })
 
 -- | There are times when the 'StreamCursor' contains a cached 'TextLine' (given by the
 -- 'streamCache' value) that is different from the actual 'TextLine' unders the cursor
@@ -3571,8 +3577,20 @@ streamResetCache
      )
   => StreamCursor tags -> EditText tags m (StreamCursor tags)
 streamResetCache s = do
-  (loc, txt) <- validateLocation (theParStreamLocation s)
-  return (s & parStreamLocation .~ loc & parStreamCache .~ txt)
+  (loc, txt) <- validateLocation (theStreamLocation s)
+  return (s & streamLocation .~ loc & streamCache .~ txt)
+
+-- | This function should only need to be evaluated once as long as the 'TextBuffer' never changes
+-- suring the parsing process. If the 'TextBuffer' does change while the parsing has been paused,
+-- this function must be evaluated to ensure the 'StreamCursor' is aware of the endpoint.
+streamResetEndpoint
+  :: (MonadIO m
+     , Show tags --DEBUG
+     )
+  => StreamCursor tags -> EditText tags m (StreamCursor tags)
+streamResetEndpoint s = do
+  (loc, _txt) <- validateLocation maxBound
+  return (s & streamLocation .~ loc)
 
 -- | You can use the 'streamTags' lens to alter the @tags@ value of the line cached (the line
 -- returned by 'streamCache'd function), but to actually store these changes back to the
@@ -3584,7 +3602,7 @@ streamCommitTags
      , Show tags --DEBUG
      )
   => StreamCursor tags -> EditText tags m ()
-streamCommitTags s = putLineIndex (s ^. parStreamLocation . lineIndex) (s ^. parStreamCache)
+streamCommitTags s = putLineIndex (s ^. streamLocation . lineIndex) (s ^. streamCache)
 
 ----------------------------------------------------------------------------------------------------
 

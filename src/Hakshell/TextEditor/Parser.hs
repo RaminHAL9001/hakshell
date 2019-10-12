@@ -76,6 +76,7 @@ data ParserState tags fold
   = ParserState
     { theParBuffer    :: !(TextBuffer tags)
     , theParStream    :: !(StreamCursor tags)
+    , theParName      :: !StrictBytes
     , theParUserState :: !fold
     }
 
@@ -87,6 +88,9 @@ parserStream = lens theParStream $ \ a b -> a{ theParStream = b }
 
 parserUserState :: Lens' (ParserState tags fold) fold
 parserUserState = lens theParUserState $ \ a b -> a{ theParUserState = b }
+
+parserName :: Lens' (ParserState tags fold) StrictBytes
+parserName = lens theParName $ \ a b -> a{ theParName = b }
 
 ----------------------------------------------------------------------------------------------------
 
@@ -185,6 +189,7 @@ newParserState fold = do
     { theParBuffer    = buf
     , theParStream    = stream
     , theParUserState = fold
+    , theParName      = ""
     }
 
 -- | Evaluates a 'Parser' using an existing 'ParserState' that has already been constructed with a
@@ -237,11 +242,11 @@ parserModify = Parser . fmap ParSuccess . modify
 -- | Pass this function to 'parserGet' to obtain the current position of the parser within the
 -- 'TextBuffer'.
 thePosition :: ParserState tags fold -> TextLocation
-thePosition = streamLocation . theParStream
+thePosition = theStreamLocation . theParStream
 
 -- | Pass this function to 'parserGet' to obtain the current line being inspected by the parser.
 theCurrentLine :: Monad m => Parser tags fold m (TextLine tags)
-theCurrentLine = Parser $ ParSuccess . streamCache <$> use parserStream
+theCurrentLine = Parser $ ParSuccess . theStreamCache <$> use parserStream
 
 -- | This is a lens that can be used with 'parserModify' to alter the @tags@' for the current line.
 currentTags :: Lens' (ParserState tags fold) tags
@@ -328,5 +333,33 @@ parserResetCache = liftCursorStreamModify streamResetCache
 
 ----------------------------------------------------------------------------------------------------
 
---instance Parsing (Parser tags fold) where
---  try f = Parser get >>= \ st -> f <|> (Parser (put st) >> mzero)
+instance
+  (MonadIO m
+  , Show tags --DEBUG
+  ) => Parsing (Parser tags fold m) where
+
+  try f = parserGet id >>= \ st -> f <|> (parserModify (const st) >> mzero)
+
+  (<?>) (Parser f) newName = Parser $ do
+    oldName <- use parserName
+    result  <- f
+    parserName .= oldName
+    case result of
+      Backtrack          -> get >>= \ st -> return $ ParError st $ "expecting: " <> pack newName
+      ParWaiting st cont -> return $ ParWaiting st $ cont <?> newName
+      _                  -> return result
+
+  unexpected = Control.Monad.Fail.fail
+
+  notFollowedBy (Parser f) = do
+    loc <- parserGet thePosition
+    result <- Parser (ParSuccess <$> f)
+    let success = parserGoto loc
+    case result of
+      Backtrack{}        -> success
+      ParError{}         -> success
+      ParSuccess{}       -> mzero
+      ParWaiting st cont -> Parser $ return $ ParWaiting st $ notFollowedBy cont
+
+  eof = Parser (ParSuccess <$> use parserStream) >>= \ st ->
+    if theStreamLocation st == theStreamEndpoint st then return () else mzero <?> "end of input"
