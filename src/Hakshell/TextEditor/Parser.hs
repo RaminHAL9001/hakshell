@@ -304,15 +304,17 @@ parserLook
      , Show tags --DEBUG
      )
   => Parser tags fold m Char
-parserLook = liftCursorStreamGet streamLook
+parserLook = liftCursorStreamState streamLook
 
--- | Get the character under the cursor and advances the cursor. This function lifts 'streamStep'.
+-- | Advance the cursor by a single character within the 'TextBuffer', do not read any
+-- characters. This function may evaluate 'parserCommitTags' if the cursor advances to the next
+-- line.
 parserStep 
   :: (MonadIO m
      , Show tags --DEBUG
      )
-  => Parser tags fold m Char
-parserStep = liftCursorStreamState streamStep
+  => Parser tags fold m ()
+parserStep = liftCursorStreamModify streamStep
 
 -- | This function pushses the @tags@ value of the current cached 'TextLine'
 parserCommitTags
@@ -372,7 +374,7 @@ instance
       ParWaiting st cont -> Parser $ return $ ParWaiting st $ notFollowedBy cont
 
   eof = Parser (ParSuccess <$> use parserStream) >>= \ st ->
-    if theStreamLocation st == theStreamEndpoint st then return () else mzero <?> "end of input"
+    if streamIsEOF st then return () else mzero <?> "end of input"
 
 ----------------------------------------------------------------------------------------------------
 
@@ -382,3 +384,21 @@ instance
   ) => LookAheadParsing (Parser tags fold m) where
 
   lookAhead (Parser f) = Parser $ use parserStream >>= (f <*) . assign parserStream
+
+----------------------------------------------------------------------------------------------------
+
+instance
+  (MonadIO m
+  , Show tags --DEBUG
+  ) => CharParsing (Parser tags fold m) where
+
+  satisfy check = parserLook >>= \ c -> if check c then parserStep >> return c else mzero
+
+  anyChar = parserLook <* parserStep
+
+----------------------------------------------------------------------------------------------------
+
+instance
+  (MonadIO m
+  , Show tags --DEBUG
+  ) => TokenParsing (Parser tags fold m) where {} -- All defaults
