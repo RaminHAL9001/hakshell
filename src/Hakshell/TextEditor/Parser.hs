@@ -38,7 +38,7 @@ module Hakshell.TextEditor.Parser
     parserGet, parserUse, parserModify, currentTags, parserUserState, thePosition, theCurrentLine,
 
     -- ** Lifted 'StreamCursor' combinators
-    parserGoto, parserLook, parserStep, parserCommitTags, parserResetCache,
+    parserGoto, parserLook, parserStep, parserCommitTags, parserResetCache, parserResetEndpoint,
 
     -- *** Parser state utilities
     --
@@ -64,6 +64,7 @@ import           Control.Monad.State
 
 import           Text.Parser.Char
 import           Text.Parser.Combinators
+import           Text.Parser.LookAhead
 import           Text.Parser.Token
 
 ----------------------------------------------------------------------------------------------------
@@ -331,6 +332,15 @@ parserResetCache
   => Parser tags fold m ()
 parserResetCache = liftCursorStreamModify streamResetCache
 
+-- | This function must be called if the 'TextBuffer' over which a parser is running is modified
+-- while the parser is paused.
+parserResetEndpoint
+  :: (MonadIO m
+     , Show tags --DEBUG
+     )
+  => Parser tags fold m ()
+parserResetEndpoint = liftCursorStreamModify streamResetEndpoint
+
 ----------------------------------------------------------------------------------------------------
 
 instance
@@ -363,3 +373,12 @@ instance
 
   eof = Parser (ParSuccess <$> use parserStream) >>= \ st ->
     if theStreamLocation st == theStreamEndpoint st then return () else mzero <?> "end of input"
+
+----------------------------------------------------------------------------------------------------
+
+instance
+  (MonadIO m
+  , Show tags --DEBUG
+  ) => LookAheadParsing (Parser tags fold m) where
+
+  lookAhead (Parser f) = Parser $ use parserStream >>= (f <*) . assign parserStream
