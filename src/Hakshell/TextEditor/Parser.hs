@@ -17,14 +17,46 @@
 --    considerably less garbage for the memory manager to collect. However a copy of the text in a
 --    token sequence can be allocated if requested.
 --
--- This parser instantiates the typeclasses provided by Edward Kmett's `parsers` package of abstract
+-- This parser instantiates the typeclasses provided by Edward Kmett's @parsers@ package of abstract
 -- parser interfaces, so it is a good idea to write your parser using the combinators from
--- `parsers`, you will consequently be able to use your parser as a MegaParsec parser or an
--- AttoParsec parser, as well as a `Hakehsell.TextEditor.Parser`.
+-- @parsers@, you will consequently be able to use your parser as a MegaParsec parser or an
+-- AttoParsec parser, as well as a "Hakehsell.TextEditor.Parser".
 module Hakshell.TextEditor.Parser
-  ( -- * The 'Parser' function type
-    Parser, ParserState, newParserState,
-    runParserWith, runParser, evalParser,
+  ( -- * Parsing over 'TextBuffer's
+    --
+    -- The parsers in this module are designed specifically to deduce some structure about the text
+    -- in a 'TextBuffer'. Usually, this structure is an Abstract Syntax Tree for a programming
+    -- language or markup language, and the structure can be used to provide text editing services
+    -- like syntax coloring, and smart text search/replace of symbols based on the syntactic type
+    -- (like keywords, variable names, and so forth).
+    --
+    -- Define your 'Parser' using the combinator API functions defined in the @parsers@ library,
+    -- Begin by importing the "Text.Parsers.Combinator" module and use any functions in the
+    -- 'Parsing' typeclass to define a function of type 'Parser' (the 'Parser' functino type also
+    -- instantiates the 'Parsing' typeclass). Then you can run this 'Parser' using one of the
+    -- functions defined in this section.
+
+    parseBufferRange, parseBuffer, parseBufferRangeNoTags, parseBufferNoTags,
+
+    -- * The @tags@ type variable
+    --
+    -- If you started reading documentation in the 'TextBuffer' module you may have noticed that all
+    -- text editor combinators take a polymorphic type variable @tags@, as does the 'Parser'
+    -- function type itself. The @tags@ variable allows you to define a @data@ structure that can
+    -- store useful meta-data about all of the 'TextLine's in a 'TextBuffer', storing information
+    -- about various things, such as syntax coloring.
+    --
+    -- The 'Parser' function type defined in this module, which is evaluated by the above
+    -- 'parserTextBuffer' function, can automatically update the @tags@ data structure for your
+    -- 'TextBuffer' at the end of every 'TextLine', by way of a 'ParWaiting' data structure (of type
+    -- a datum of type 'ParStep'). In order to do this, you must provide a 'Lens' that describes how
+    -- to store and retrieve a 'ParStep' data structure within the @data@ structure that you are
+    -- using as the @tags@ type.
+
+    TaggedSyntax(..),
+
+    -- * The 'Parser' function type
+    Parser, ParserState, newParserState, newParserStateRange, runParser, evalParser,
     ParStep(..),
 
     -- * Primitive Combinators
@@ -37,8 +69,31 @@ module Hakshell.TextEditor.Parser
     -- ** Parser state information
     parserGet, parserUse, parserModify, currentTags, parserUserState, thePosition, theCurrentLine,
 
-    -- ** Lifted 'StreamCursor' combinators
+    -- ** Primitive combinators
+    --
+    -- Most of thses functions are simply combinators of type 'StreamCursor' that have been lifted
+    -- into the 'Parser' monad to produce new primitive combinators of type 'Parser'.
     parserGoto, parserLook, parserStep, parserCommitTags, parserResetCache, parserResetEndpoint,
+
+    -- ** Pausing/Resuming parsers
+    --
+    -- For those familiar with the @attoparsec@ library, these primitives provide a similar ability
+    -- to pause the 'Parser' and wait for more input, which makes the parser useful in interactive
+    -- read-eval-print loops (REPLs).
+    --
+    -- Unlike @attoparsec@, the Hakshell 'Parser' is designed to operate on a 'TextBuffer', but it
+    -- is often useful to store a 'ParWaiting' structure inside of the @tags@ value of every
+    -- 'TextLine' within the 'TextBuffer', which allows you to restart a parser after a 'TextLine'
+    -- has been edited simply by retrieiving the 'ParserState' stored in the line in the
+    -- 'TextBuffer' above the edited line.
+    --
+    -- This is a very useful feature for text editors with syntax coloring, as it allows for very
+    -- rapid re-coloring of syntax due to the fact that the 'Parser' does not need to re-parse the
+    -- entire 'TextBuffer' after every edit, only the lines after the edit. And a clever 'Parser'
+    -- can even be defined to only parse to the next top-level code construct and then pause itself
+    -- again, further increasing the efficiency of the syntax coloring algorithm.
+
+    parserPause_thenDo, parserPause, parserResume, parserResumeAt,
 
     -- *** Parser state utilities
     --
@@ -176,16 +231,17 @@ instance Monad m => MonadState fold (Parser tags fold m) where
   state f = Parser $ state $ \ st ->
     let (a, ust) = f (st ^. parserUserState) in (ParSuccess a, st & parserUserState .~ ust)
 
--- | Construct a new 'ParserState'. Note that this function must be evaluated within an 'EditText'
--- type of function.
-newParserState
+-- | Construct a new 'ParserState' which will begin parsing at the first 'TextLocation's and it's
+-- EOF is set to the second 'TextLocation'. Note that this function must be evaluated within an
+-- 'EditText' type of function.
+newParserStateRange
   :: (MonadIO m
      , Show tags --DEBUG
      )
-  => fold -> EditText tags m (ParserState tags fold)
-newParserState fold = do
+  => TextLocation -> TextLocation -> fold -> EditText tags m (ParserState tags fold)
+newParserStateRange start end fold = do
   buf    <- currentBuffer
-  stream <- newStreamCursor
+  stream <- newStreamCursorRange start end
   return ParserState
     { theParBuffer    = buf
     , theParStream    = stream
@@ -193,34 +249,111 @@ newParserState fold = do
     , theParName      = ""
     }
 
--- | Evaluates a 'Parser' using an existing 'ParserState' that has already been constructed with a
--- call to 'newParserState'.
-runParserWith
+-- | Similar to 'newParserStateRange', but conveniently passes 'minBound' and 'maxBound' as the
+-- start and end points.
+newParserState
   :: (MonadIO m
      , Show tags --DEBUG
      )
-  => Parser tags fold m a
-  -> ParserState tags fold
-  -> EditText tags m (ParStep tags fold m a, ParserState tags fold)
-runParserWith (Parser par) st = runStateT par st
+  => fold -> EditText tags m (ParserState tags fold)
+newParserState = newParserStateRange minBound maxBound
 
--- | Similar to 'runParserWith', but evaluates 'newParserState' before running the parser.
+-- | This function does nothing for you, apart from simply evaluating a 'Parser' function. You would
+-- use this function when defining your own unique 'TextBuffer' analysis algorithms which loop over
+-- every 'TextLine' in a 'TextBuffer'. Most of the time, you will probably want to use the
+-- 'parseBuffer' family of functions to run a 'Parser' function.
+--
+-- Evaluates 'newParserState' and then evaluates 'resumeParser' with the new parser state and the
+-- given 'Parser' function.
 runParser
   :: (MonadIO m
      , Show tags --DEBUG
      )
-  => Parser tags fold m a -> fold
+  => TextLocation -> TextLocation -> Parser tags fold m a -> fold
   -> EditText tags m (ParStep tags fold m a, ParserState tags fold)
-runParser p = newParserState >=> runParserWith p
+runParser start end p = newParserStateRange start end  >=> parserResume p
 
--- | The simplest way to evaluate a 'Parser', this function creates a new 'ParserState', throws away
--- the 'ParserState' when completed, and only returns the 'ParStep' result.
+-- | Similar to 'runParser' but throws away the 'ParserState' and only provides the 'ParStep'
+-- result.
 evalParser 
   :: (MonadIO m
      , Show tags --DEBUG
      )
-  => Parser tags fold m a -> fold -> EditText tags m (ParStep tags fold m a)
-evalParser p = fmap fst . runParser p
+  => TextLocation -> TextLocation -> Parser tags fold m a
+  -> fold -> EditText tags m (ParStep tags fold m a)
+evalParser start end p = fmap fst . runParser start end p
+
+-- not for export
+parseBufferRange'
+  :: (MonadIO m
+     , Show tags
+     )
+  => TextLocation -> TextLocation -> Maybe (ParserState tags fold -> tags -> tags)
+  -> Parser tags fold m a -> fold
+  -> EditText tags m (ParStep tags fold m a, fold)
+parseBufferRange' start end updateTags par fold = do
+  st <- newParserStateRange start end fold
+  let start = theStreamLocation $ theParStream st
+  parserResume (parserGoto start >> par) st >>= fmap (fmap theParUserState) . loop
+  where
+    loop result@(status, st) = let s = theParStream st in
+      if theStreamLocation s >= theStreamEndpoint s then return result else case status of
+        ParWaiting st par ->
+          ( flip parserResume st
+              (do maybe (pure ()) (\ upd -> parserModify $ currentTags %~ upd st) updateTags
+                  parserStep
+                  par
+              )
+          ) >>= loop
+        status            -> return (status, st)
+{-# INLINE parseBufferRange' #-}
+
+parseBufferRange
+  :: (MonadIO m
+     , Show tags
+     )
+  => TextLocation -- ^ The point in the 'TextBuffer' at which to begin parsing
+  -> TextLocation -- ^ The point in the 'TextBuffer' at which to end parsing
+  -> (ParserState tags fold -> tags -> tags) -- ^ A function to update the @tags@ with a 'ParStep'
+  -> Parser tags fold m a -- ^ The parser function to run on the above range.
+  -> fold -- ^ An arbitrary state value that can be updated at any time during parsing.
+  -> EditText tags m (ParStep tags fold m a, fold)
+parseBufferRange start end updateTags = parseBufferRange' start end (Just updateTags)
+
+-- | Calls the 'parserBufferRange' function with 'minBound' and 'maxBound', effectively using the
+-- whole buffer as the range of text to parse.
+parseBuffer
+  :: (MonadIO m
+     , Show tags
+     )
+  => (ParserState tags fold -> tags -> tags)
+  -> Parser tags fold m a -> fold
+  -> EditText tags m (ParStep tags fold m a, fold)
+parseBuffer = parseBufferRange minBound maxBound
+
+-- | Same as 'parseBufferRange' but does not bother updating the @tags@ after parsing each
+-- 'TextLine' in the 'TextBuffer'.
+parseBufferRangeNoTags
+  :: (MonadIO m
+     , Show tags
+     )
+  => TextLocation -- ^ The point in the 'TextBuffer' at which to begin parsing
+  -> TextLocation -- ^ The point in the 'TextBuffer' at which to end parsing
+  -> Parser tags fold m a -- ^ The parser function to run on the above range.
+  -> fold -- ^ An arbitrary state value that can be updated at any time during parsing.
+  -> EditText tags m (ParStep tags fold m a, fold)
+parseBufferRangeNoTags start end = parseBufferRange' start end Nothing
+
+-- | Same as 'parseBufferRange' but does not bother updating the @tags@ after parsing each
+-- 'TextLine' in the 'TextBuffer'.
+parseBufferNoTags
+  :: (MonadIO m
+     , Show tags
+     )
+  => Parser tags fold m a -- ^ The parser function to run on the above range.
+  -> fold -- ^ An arbitrary state value that can be updated at any time during parsing.
+  -> EditText tags m (ParStep tags fold m a, fold)
+parseBufferNoTags  = parseBufferRangeNoTags minBound maxBound
 
 ----------------------------------------------------------------------------------------------------
 
@@ -304,11 +437,19 @@ parserLook
      , Show tags --DEBUG
      )
   => Parser tags fold m Char
-parserLook = liftCursorStreamState streamLook
+parserLook = do
+  -- The order of events here is very important. First check if we are at the end-of-line
+  eol <- liftCursorStreamGet (pure . streamIsEOL)
+  -- Pause if we are at the end of line.
+  when eol parserPause
+  -- While paused, the 'parseBuffer' function will evaluate (currentTags %~ updateTags st)
+  -- and then 'parserStep' is evaluated. When resuming, finally the next step is evaluated.
+  liftCursorStreamState streamLook
 
 -- | Advance the cursor by a single character within the 'TextBuffer', do not read any
 -- characters. This function may evaluate 'parserCommitTags' if the cursor advances to the next
--- line.
+-- line. If the cursor does advance to the next line, 'True' is returned, otherwise if the cursor
+-- remains on the current line, 'False' is returned.
 parserStep 
   :: (MonadIO m
      , Show tags --DEBUG
@@ -318,7 +459,7 @@ parserStep = liftCursorStreamModify streamStep
 
 -- | This function pushses the @tags@ value of the current cached 'TextLine'
 parserCommitTags
-  :: (MonadIO m
+  :: (MonadIO m, TaggedSyntax tags fold
      , Show tags --DEBUG
      )
   => Parser tags fold m ()
@@ -341,7 +482,74 @@ parserResetEndpoint
      , Show tags --DEBUG
      )
   => Parser tags fold m ()
-parserResetEndpoint = liftCursorStreamModify streamResetEndpoint
+parserResetEndpoint = liftCursorStreamModify (streamResetEndpoint maxBound)
+
+----------------------------------------------------------------------------------------------------
+
+-- | Pause the 'Parser', and then evaluate the given continuation function. This function can be
+-- used to parse a 'TextBuffer' and pause at the end of each line in the 'TextBuffer'. You can store
+-- the current state of the 'Parser' in the @tags@ value of every 'TextLine' in the
+-- 'TextBuffer'. When an end user makes a modification to the buffer, you can resume parsing from
+-- the 'TextLine' on which the edit occurred.
+--
+-- Pausing a 'Parser' means dropping back to the calling context in which 'runParser' (or
+-- 'evalParser') was called. This does not result in a 'ParError' message, rather it results in a
+-- 'ParWaiting' message containing the 'Parser's current state at the time this function was called,
+-- and also the continuation function given here, to be returned in the 'ParWaiting' message. You
+-- can then evaluate 'runParser' again using the state value and continuation value once your buffer
+-- has been updated and is ready to resume parsing. See also: the 'parserPause' function.
+parserPause_thenDo
+  :: (MonadIO m
+     , Show tags --DEBUG
+     )
+  => Parser tags fold m a -> Parser tags fold m a
+parserPause_thenDo = Parser . (<$> get) . flip ParWaiting
+
+-- | This function is similar to 'parserWait_thenDo', but is intended to be used more like a
+-- single-line instruction in a @do@ block of code. You do not need to pass a continuation function
+-- to be used when the 'Parser' is resumed, rather the entire remainder of the @do@ block that is to
+-- be executed after this "pause instruction" is treated as the continuation.
+parserPause
+  :: (MonadIO m
+     , Show tags --DEBUG
+     )
+  => Parser tags fold m ()
+parserPause = Parser $ flip ParWaiting (pure ()) <$> get
+
+-- | Like 'parserResume' but evaluates 'parserGoto' on the given 'TextLocation' before resuming the
+-- given 'Parser'.
+parserResumeAt
+  :: (MonadIO m
+     , Show tags --DEBUG
+     )
+  => Parser tags fold m a -> ParserState tags fold -> TextLocation
+  -> EditText tags m (ParStep tags fold m a, ParserState tags fold)
+parserResumeAt par st loc = parserResume (parserGoto loc >> par) st
+
+-- | Evaluates a 'Parser' using an existing 'ParserState' that has already been constructed with a
+-- call to 'newParserState'.
+parserResume
+  :: (MonadIO m
+     , Show tags --DEBUG
+     )
+  => Parser tags fold m a
+  -> ParserState tags fold
+  -> EditText tags m (ParStep tags fold m a, ParserState tags fold)
+parserResume (Parser par) st = runStateT par st
+
+----------------------------------------------------------------------------------------------------
+
+-- | This class defines a 'Lens' called 'textLineParser' which provides a method of store and
+-- retrieve a 'ParStep' result indicating the 'ParserState' of the 'Parser' as it existed when it
+-- reached the end of the 'TextLine'. Your @tags@ data type /must/ instantiate this class if you use
+-- 'parseTextBuffer'.
+--
+-- The 'parseTextBufferWith' function provides a method of running a 'Parser' where you supply an
+-- arbitrary 'Lens' rather than implicitly passing one by way of the 'Lens' defined in this
+-- typeclass for your @tags@ data type, so it is still possible to run a 'Parser' even if your
+-- @tags@ have not instantiated this typeclass.
+class TaggedSyntax tags fold | tags -> fold where
+  textLineParseResult :: MonadIO m => Lens' tags (ParStep tags fold m a)
 
 ----------------------------------------------------------------------------------------------------
 

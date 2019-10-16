@@ -261,8 +261,8 @@ module Hakshell.TextEditor
     -- provided here provides stateful information necessary to efficiently deliver a stream of
     -- characters from a 'TextBuffer' to a 'Hakshell.TextEditor.Parser.Parser'.
 
-    StreamCursor, newStreamCursorAt, newStreamCursor,
-    streamGoto, streamLook, streamStep, streamIsEOF,
+    StreamCursor, newStreamCursorRange, newStreamCursor,
+    streamGoto, streamLook, streamStep, streamIsEOF, streamIsEOL,
     streamTags, streamCommitTags, streamResetCache, streamResetEndpoint,
     theStreamCache, theStreamLocation, theStreamEndpoint,
 
@@ -3490,24 +3490,24 @@ streamTags = streamCache . textLineTags
 -- function must validate the 'TextLocation' using 'testLocation', so the return type is similar in
 -- meaning to the return type of 'validateLocation', which may throw a soft exception (which can be
 -- caught with 'catchError') if the given 'TextLocation' is out of bounds.
-newStreamCursorAt
+newStreamCursorRange
   :: (MonadIO m
      , Show tags --DEBUG
      )
-  => TextLocation -> EditText tags m (StreamCursor tags)
-newStreamCursorAt loc = streamResetCache StreamCursor
+  => TextLocation -> TextLocation -> EditText tags m (StreamCursor tags)
+newStreamCursorRange start end = streamResetCache StreamCursor
   { theStreamCache    = TextLineUndefined
-  , theStreamLocation = loc
-  , theStreamEndpoint = maxBound
-  } >>= streamResetEndpoint
+  , theStreamLocation = min start end
+  , theStreamEndpoint = max start end
+  } >>= streamResetEndpoint (max start end)
 
--- | A convenience function that calls 'newStreamCursorAt' with 'minBound' as the 'TextLocation'.
+-- | A convenience function that calls 'newStreamCursorRange' with 'minBound' as the 'TextLocation'.
 newStreamCursor
   :: (MonadIO m
      , Show tags --DEBUG
      )
   => EditText tags m (StreamCursor tags)
-newStreamCursor = newStreamCursorAt minBound
+newStreamCursor = newStreamCursorRange minBound maxBound
 
 -- | This in an 'EditText' type of function which moves a given 'StreamCursor' to a different
 -- location within the 'TextBuffer' of the current 'EditText' context. This can be used to perform
@@ -3564,6 +3564,15 @@ streamStep s = do
     ) s
 {-# INLINE streamStep #-}
 
+-- | The 'streamStep' function may have placed this stream into a state indicating that the cursor
+-- has stepped beyond the end of the current 'TextLine'. This function returns whether or not this
+-- is the case.
+streamIsEOL :: StreamCursor tags -> Bool
+streamIsEOL s = case s ^. streamCache of
+  TextLineUndefined -> True
+  line              -> charToIndex (s ^. streamLocation . charIndex) >= intSize line
+{-# INLINE streamIsEOL #-}
+
 -- | Tests whether 'theStreamLocation' is greater-than or equal-to 'theStreamEndpoint'.
 streamIsEOF :: StreamCursor tags -> Bool
 streamIsEOF s = theStreamLocation s >= theStreamEndpoint s
@@ -3597,9 +3606,9 @@ streamResetEndpoint
   :: (MonadIO m
      , Show tags --DEBUG
      )
-  => StreamCursor tags -> EditText tags m (StreamCursor tags)
-streamResetEndpoint s = do
-  (loc, _txt) <- validateLocation maxBound
+  => TextLocation -> StreamCursor tags -> EditText tags m (StreamCursor tags)
+streamResetEndpoint loc s = do
+  (loc, _txt) <- validateLocation loc
   return (s & streamLocation .~ loc)
 
 -- | You can use the 'streamTags' lens to alter the @tags@ value of the line cached (the line
