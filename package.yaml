@@ -77,6 +77,7 @@ library:
   - Hakshell
   - Hakshell.String
   - Hakshell.Struct
+  - Hakshell.System
   - Hakshell.TextEditor
   - Hakshell.TextEditor.Parser
   - Hakshell.UTFUnit

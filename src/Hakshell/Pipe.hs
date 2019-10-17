@@ -188,6 +188,14 @@ foreach = flip mapToPipe
 mapToPipe :: (Applicative m, PipeLike pipe) => (a -> m b) -> pipe a -> m (Pipe b)
 mapToPipe f = traverse f . pipe
 
+-- | Same as 'foreach' but ignores the result of each function application.
+foreach_ :: (Applicative m, PipeLike pipe) => pipe a -> (a -> m b) -> m ()
+foreach_ = flip mapToPipe_
+
+-- | Same as 'foreach_' but with the parameters flipped.
+mapToPipe_ :: (Applicative m, PipeLike pipe) => (a -> m void) -> pipe a -> m ()
+mapToPipe_ f = traverse_ f . pipe
+
 -- | Perform a single step on the next element of a 'Pipe'. This function automatically handles
 -- errors and halting conditions, and serves as a drop-in replacement for any expression that uses a
 -- @case@ statement to inspect a 'Pipe'.
