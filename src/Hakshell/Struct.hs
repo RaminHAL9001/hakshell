@@ -33,7 +33,6 @@ import           Data.Bits
 import           Data.Char
 import           Data.List                   (partition)
 import qualified Data.Map                    as Map
-import           Data.Semigroup
 import qualified Data.ByteString.Char8       as Strict
 import qualified Data.ByteString.UTF8        as UTF8
 import           Data.Typeable

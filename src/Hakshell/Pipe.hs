@@ -211,6 +211,24 @@ step f (Pipe a) = case a of
   Seq.Empty        -> pure empty
   (a Seq.:<| next) -> f a $ Pipe next
 
+-- | Put a "kink" in a 'Pipe', letting no values be returned through the 'Pipe'. This is usually
+-- only used when you evaluate a function for it's side effects, like printing to @STDOUT@, and you
+-- don't want to actually return any values. For example:
+--
+-- @'values' ('Data.List.words' "one two three") $ kink . 'mapM_' 'System.IO.putStrLn'@
+--
+-- will pass map 'System.IO.putStrLn' to a list of values and always return an empty 'Pipe'
+-- regardless of what 'mapM_' returns (which happens to be @()@).
+--
+-- Note that if you evaluate an function such as:
+--
+-- @'kink' 'Control.Monad.>>' return 1)@
+--
+-- this will still return an empty pipe rather than the 'Integer' value @1@, because the 'kink'
+-- prevents the function after 'Control.Monad.>>' from being evaluated.
+kink :: Monad m => m any -> m (Pipe void)
+kink = (>> (return empty))
+
 ----------------------------------------------------------------------------------------------------
 
 -- | A class of monads that can yield multiple values from a 'Pipe' without having to deconstruct it

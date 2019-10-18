@@ -6,11 +6,12 @@ module Hakshell.System
 import           Hakshell.Pipe
 import           Hakshell.String
 
-import           Control.Concurrent
+import           Control.Concurrent        (forkIO, newEmptyMVar, putMVar, takeMVar)
+import           Control.Exception         (SomeException(..), throw, catch)
 
-import           System.Exit
-import           System.IO
-import           System.Process            as Sys
+import           System.Exit               (ExitCode(ExitFailure, ExitSuccess))
+import           System.IO                 (hGetContents, hPutStr, hFlush, hClose)
+import qualified System.Process            as Sys
 
 ----------------------------------------------------------------------------------------------------
 
@@ -32,19 +33,22 @@ sys
 sys cmd args cont instream = 
   ( Sys.createProcess $
       (Sys.proc (unpack cmd) (unpack <$> args))
-      { std_in    = CreatePipe
-      , std_out   = CreatePipe
-      , std_err   = Inherit
-      , close_fds = False
+      { Sys.std_in    = Sys.CreatePipe
+      , Sys.std_out   = Sys.CreatePipe
+      , Sys.std_err   = Sys.Inherit
+      , Sys.close_fds = False
       }
   ) >>= \ case
     (Just procIn, Just procOut, Nothing, procHandle) -> do
       mvar <- newEmptyMVar
-      forkIO $ hGetContents procOut >>= cont >>= putMVar mvar
+      forkIO $
+        ( (hGetContents procOut >>= fmap Just . cont) `catch`
+          (\ (SomeException e) -> putMVar mvar (throw e) >> return Nothing)
+        ) >>= maybe (pure ()) (putMVar mvar)
       foreach_ (pipe instream) $ hPutStr procIn
       hFlush procIn
       hClose procIn
-      waitForProcess procHandle >>= \ case
+      Sys.waitForProcess procHandle >>= \ case
         ExitFailure stat -> error $ show cmd ++ " (exit "++show stat++")"
         ExitSuccess      -> takeMVar mvar
     _ -> error $
