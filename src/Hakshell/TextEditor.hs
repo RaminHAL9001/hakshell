@@ -70,7 +70,7 @@ module Hakshell.TextEditor
 
     -- *** 'TextLine' lenses
 
-    textLineString, textLineTags,
+    textLineString, textLineTags, textLineChomp,
 
     -- ** The 'TextBuffer' data type
     --
@@ -1087,6 +1087,13 @@ textLineTags = lens theTextLineTags $ \ a b -> a{ theTextLineTags = b }
 -- not for export
 textLineBreakSize :: Lens' (TextLine tags) Word16
 textLineBreakSize = lens theTextLineBreakSize $ \ a b -> a{ theTextLineBreakSize = b }
+
+-- | Like 'unpack', but removes the terminating line-breaking characters.
+textLineChomp :: TextLine tags -> String
+textLineChomp = \ case
+  TextLineUndefined -> ""
+  TextLine{theTextLineString=vec,theTextLineBreakSize=lbrksz} ->
+    UVec.toList $ UVec.slice 0 (UVec.length vec - fromIntegral lbrksz) vec
 
 -- | The empty 'TextLine' value.
 emptyTextLine :: tags -> TextLine tags
