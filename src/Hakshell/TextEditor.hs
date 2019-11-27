@@ -150,7 +150,7 @@ module Hakshell.TextEditor
     TextCursorSpan(..), CharStats(..),
     shiftAbsolute, diffAbsolute, unwrapTextCursorSpan,
     lineToIndex, charToIndex, indexToLine, indexToChar,
-    distanceBetween, spanDistance,
+    distanceBetween, spanDistance, sumTextLocation, diffTextLocation,
 
     -- *** Moving the cursor relative to the cursor
 
@@ -3170,6 +3170,19 @@ instance Show TextLocation where
                    else if i == maxBound then "maxBound"
                    else show i
              in  "TextLocation "++sh line++' ':sh char
+
+-- | Compute the difference between two 'TextLocations', works just like vector arithmetic.
+diffTextLocation :: TextLocation -> TextLocation -> TextLocation
+diffTextLocation a b = TextLocation
+  { theLocationLineIndex = theLocationLineIndex a - theLocationLineIndex b
+  , theLocationCharIndex = theLocationCharIndex a - theLocationCharIndex b
+  }
+
+sumTextLocation :: TextLocation -> TextLocation -> TextLocation
+sumTextLocation a b = TextLocation
+  { theLocationLineIndex = theLocationLineIndex a + theLocationLineIndex b
+  , theLocationCharIndex = theLocationCharIndex a + theLocationCharIndex b
+  }
 
 relativeLine :: RelativeToCursor -> Int -> Relative LineIndex
 relativeChar :: RelativeToCursor -> Int -> Relative CharIndex
