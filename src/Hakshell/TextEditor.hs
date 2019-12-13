@@ -316,7 +316,14 @@ import           Data.Word
 -- usually contains 'TextLineUndefined' lines.
 --
 -- For efficient insertion, lines below the cursor are shifted toward the end of the vector, leaving
--- a gap of many conecutive 'TextLineUndefined' lines which can be over-written in O(1) time.
+-- a gap of many conecutive 'TextLineUndefined' lines which can be over-written in O(1) time. This
+-- is called a "gap buffer" data structure.
+--
+-- In a gap buffer, there is a "cursor" indicating to which index in the vector next element will be
+-- stored. The cursor index MUST ALWAYS be the same value as the number of elements before the
+-- cursor. For example, when there are zero elements before the cursor, the next element to be
+-- inserted must be written to index zero. The "push" operation is defined to write the next
+-- element, then increment the cursor index/element count.
 --
 -- When a user positions the cursor, it is done with 1-based indexing values of type 'LineIndex' or
 -- 'CharIndex', so the first line is line 1, not line zero. This means care must be taken to
@@ -1612,17 +1619,16 @@ getUnusedSpace = subtract <$> countElems <*> getAllocSize
 -- that has no meaning to end-users who should not ever know or care about the actual indicies to
 -- which the logical line indicies are mapped.
 --
--- This function is defined as the value returned by 'getElemCount' subtracted by 1 for
--- elements before the cursor (because the 'getElemCount' is always pointing at the undefined vector
--- index just after the element that is considered to be "under" the cursor). The element after the
--- cursor is the first element after the contiguous gap of undefined elements in the vector. If
--- there are no elements after the cursor, this function returns the length of the array, which is
--- an invalid index that may result in a vector index exception.
+-- This function is defined as the value returned by 'getElemCount' because the 'getElemCount' is
+-- not just the count of all elements before the cursor but also the position of the cursor. The
+-- element after the cursor is the first element after the contiguous gap of undefined elements in
+-- the vector. If there are no elements after the cursor, this function returns the length of the
+-- array, which is an invalid index that may result in a vector index exception.
 cursorIndex
   :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem)
   => RelativeToCursor -> m Int -- line editors and text editor have different cursors
 cursorIndex rel = case rel of
-  Before -> subtract 1 <$> getElemCount Before
+  Before -> getElemCount Before
   After  -> subtract <$> getElemCount After <*> getAllocSize
 
 -- Like 'cursorIndex', but evaluates to 'throwLimitErr' if the value __returned__ by 'cursorIndex'
@@ -1681,8 +1687,8 @@ getVoid
   :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem)
   => m (Maybe (Absolute Int, Absolute Int))
 getVoid = do
-  rgn <- (,) <$> (Absolute <$> getElemCount Before)
-             <*> (Absolute . subtract 1 <$> cursorIndex After)
+  let absSub1 = Absolute . subtract 1
+  rgn <- (,) <$> (absSub1 <$> getElemCount Before) <*> (absSub1 <$> cursorIndex After)
   return $ guard (uncurry (<=) rgn) >> Just rgn
 
 -- Make a slice of elements relative to the current cursor. A negative argument will take elements
@@ -1890,7 +1896,7 @@ pushElem
      , Show elem --DEBUG
      )
   => RelativeToCursor -> elem -> m ()
-pushElem rel elem = growVector 1 >> modCount rel (+ 1) >> putElem rel elem
+pushElem rel elem = growVector 1 >> putElem rel elem >> modCount rel (+ 1) >> pure ()
 
 -- Push a vector of elements starting at the index 'Before' (currently on) the cursor, or the index
 -- 'After' the cursor.
@@ -3402,7 +3408,7 @@ textViewOnLines
 textViewOnLines from to = textView
   (TextLocation
    { theLocationLineIndex = min from to
-   , theLocationCharIndex = Absolute $ CharIndex 0
+   , theLocationCharIndex = Absolute $ CharIndex 1
    })
   (TextLocation
    { theLocationLineIndex = max from to
