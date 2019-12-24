@@ -23,6 +23,7 @@ library
     src
   exposed-modules:
     Hakshell
+    Hakshell.GapBuffer
     Hakshell.String
     Hakshell.Struct
     Hakshell.System

@@ -122,7 +122,7 @@ module Hakshell.TextEditor
 
     -- ** Indicies and Bounds Checking
 
-    AnyLineIndex(..), validateLineIndex, lineIndexIsValid,
+    CheckedIndex(..), validateLineIndex, lineIndexIsValid,
     validateGetLineIndex, testLocation, validateLocation, locationIsValid,
     validateCharIndex, testCharIndex, indexIsOnLineBreak,
 
@@ -281,6 +281,7 @@ module Hakshell.TextEditor
     module Control.Monad.Cont.Class,
   ) where
 
+import           Hakshell.GapBuffer
 import           Hakshell.String
 
 import           Control.Arrow
@@ -295,7 +296,7 @@ import           Control.Monad.Reader
 import           Control.Monad.State
 import           Control.Monad.State.Class
 
---import           Data.Semigroup
+import           Data.Semigroup
 import qualified Data.Vector                 as Vec
 import qualified Data.Vector.Generic         as GVec
 import qualified Data.Vector.Mutable         as MVec
@@ -305,6 +306,51 @@ import qualified Data.Vector.Unboxed.Mutable as UMVec
 import           Data.Word
 
 ----------------------------------------------------------------------------------------------------
+
+-- Used by 'newTextBuffer' as a parameter to 'newTextBufferState'.
+defaultInitBufferSize :: Int
+defaultInitBufferSize = 512
+
+-- Overflow-safe absolute value function. Many programming language compilers have unintuitive
+-- behavior when evaluating the expresion @(abs minBound)@ due to integer overflow, GHC also suffers
+-- from this problem
+safeAbs :: (Ord n, Num n, Bounded n) => n -> n
+safeAbs n = if n >= 0 then n else negate $ if n == minBound then n + 1 else n
+
+----------------------------------------------------------------------------------------------------
+
+-- | A number for indexing a line. This data type instantiates the 'Prelude.Num' typeclass so that
+-- you can write an integer literal in your code and (if used in the correct context) the type
+-- inference will automatically declare a 'LineIndex' without you needing to write @(LineIndex 1)@
+-- constructor unless you really want to.
+newtype LineIndex = LineIndex Int
+  deriving (Eq, Ord, Show, Read, Enum, Num, Bounded)
+
+instance IsIndex LineIndex where
+  fromIndex (LineIndex i) = i - 1
+  toIndex = LineIndex . (+ 1)
+
+instance Monad m => IndexedState LineIndex (EditText tags m) where {}
+
+-- | A number for indexing a column, i.e. a character within a line. This data type instantiates
+-- the 'Prelude.Num' typeclass so that you can write an integer literal in your code and (if used in
+-- the correct context) the type inference will automatically declare a 'CharIndex' without you
+-- needing to write @(LineIndex 1)@ constructor unless you really want to.
+newtype CharIndex = CharIndex Int
+  deriving (Eq, Ord, Show, Read, Enum, Num, Bounded)
+
+instance IsIndex CharIndex where
+  fromIndex (CharIndex i) = i - 1
+  toIndex = CharIndex . (+ 1)
+
+instance Monad m => IndexedState CharIndex (EditLine tags m) where {}
+
+-- | When instructing the editor engine to move by or delete a number of cursor positions (where
+-- line breaking characters consisting of two characters are considered a single cursor position,
+-- thus the 'moveByCharWrap' or 'deleteCharsWrap' functions), you must specify the number of cursor
+-- positions to move or delete using a value of this type.
+newtype TextCursorSpan = TextCursorSpan Int
+  deriving (Eq, Ord, Show, Read, Enum, Num, Bounded)
 
 -- (( Programmer notes ))
 --
@@ -375,178 +421,6 @@ import           Data.Word
 -- I decided on approach (2). This is because it is easy to conditionally add one to an element
 -- count, and it is easy to determine whether the element under the cursor is valid by checking as
 -- single field.
-
-----------------------------------------------------------------------------------------------------
-
--- Used by 'newTextBuffer' as a parameter to 'newTextBufferState'.
-defaultInitBufferSize :: Int
-defaultInitBufferSize = 512
-
--- Any vector operations that have a safe (bounds-chekced) version and an unsafe version will be
--- switched to the unsafe version when this constant is set to True.
-unsafeMode :: Bool
-unsafeMode = False
-
--- Set this to 'True' to install additional checks throughout this module, especially after having
--- made a change to any function that manipulates mutable arrays.
-enableAssertions :: Bool
-enableAssertions = True
-
--- Overflow-safe absolute value function. Many programming language compilers have unintuitive
--- behavior when evaluating the expresion @(abs minBound)@ due to integer overflow, GHC also suffers
--- from this problem
-safeAbs :: (Ord n, Num n, Bounded n) => n -> n
-safeAbs n = if n >= 0 then n else negate $ if n == minBound then n + 1 else n
-
-----------------------------------------------------------------------------------------------------
-
--- An assertion system.
-
--- Check that 'Assertion's are true. If one or more 'Assertion's are false, report which ones are
--- false.
-assert :: FunctionName -> [Assertion] -> r -> r
-assert funcName tests a =
-  if not enableAssertions || and (checkAssertion <$> tests) then a else error $ 
-  "-- | "++funcName++": ASSERTION FAILED\n"++
-  unlines (("-- | " ++) <$> (tests >>= reportAssertion))
-{-# INLINE assert #-}
-
-type FunctionName = String
-
-type LabeledValue a = (String, a)
-
-data Assertion = Info String | Assertion String Bool
-
-data UseSafeOp = UnsafeOp | SafeOp
-  deriving (Eq, Ord, Show)
-
-checkAssertion :: Assertion -> Bool
-checkAssertion = \ case { Info{} -> True; Assertion _ ok -> ok; }
-
-reportAssertion :: Assertion -> [String]
-reportAssertion = \ case { Info msg -> [msg]; Assertion msg ok -> if ok then [] else [msg]; }
-
-asrtGSlice
-  :: (vec -> Int)
-  -> (Int -> Int -> vec -> vec)
-  -> (Int -> Int -> vec -> vec)
-  -> UseSafeOp -> FunctionName
-  -> LabeledValue Int -> LabeledValue Int -> LabeledValue vec -> vec
-asrtGSlice length safe unsafe safety funcName i siz vec =
-  let len = (\ lbl -> "(length "++lbl++")") *** length $ vec  in
-  let top = ('(' : fst i ++ fst siz ++ ")", snd i + snd siz) in
-  assert funcName
-    [asrtZero `le` i, i `le` len, asrtZero `le` top, top `le` len]
-    ((if not unsafeMode || safety == SafeOp then safe else unsafe) (snd i) (snd siz) (snd vec))
-{-# INLINE asrtGSlice #-}
-
-asrtSlice
-  :: GVec.Vector vec elem
-  => UseSafeOp -> FunctionName
-  -> LabeledValue Int -> LabeledValue Int -> LabeledValue (vec elem) -> vec elem
-asrtSlice = asrtGSlice GVec.length GVec.slice GVec.unsafeSlice
-{-# INLINE asrtSlice #-}
-
-asrtMSlice
-  :: (GMVec.MVector vec elem)
-  => UseSafeOp -> FunctionName
-  -> LabeledValue Int -> LabeledValue Int -> LabeledValue (vec st elem) -> vec st elem
-asrtMSlice = asrtGSlice GMVec.length GMVec.slice GMVec.unsafeSlice
-{-# INLINE asrtMSlice #-}
-
-asrtGReadWrite
-  :: (GMVec.MVector vec elem)
-  => (vec st elem -> Int)
-  -> (vec st elem -> Int -> rw)
-  -> (vec st elem -> Int -> rw)
-  -> UseSafeOp -> FunctionName
-  -> LabeledValue (vec st elem) -> LabeledValue Int -> rw
-asrtGReadWrite length safe unsafe safety funcName vec i =
-  let len = (\ lbl -> "(length "++lbl++")") *** length $ vec in
-  assert funcName
-    [asrtZero `le` i, i `lt` len]
-    ((if not unsafeMode || safety == SafeOp then safe else unsafe) (snd vec) (snd i))
-{-# INLINE asrtGReadWrite #-}
-
-asrtMRead
-  :: (PrimMonad m, GMVec.MVector vec elem)
-  => UseSafeOp -> FunctionName
-  -> LabeledValue (vec (PrimState m) elem) -> LabeledValue Int -> m elem
-asrtMRead = asrtGReadWrite GMVec.length GMVec.read GMVec.unsafeRead
-{-# INLINE asrtMRead #-}
-
-asrtMWrite
-  :: (PrimMonad m, GMVec.MVector vec elem)
-  => UseSafeOp -> FunctionName
-  -> LabeledValue (vec (PrimState m) elem) -> LabeledValue Int -> elem -> m ()
-asrtMWrite = asrtGReadWrite GMVec.length GMVec.write GMVec.unsafeWrite
-{-# INLINE asrtMWrite #-}
-
-type AssertCompare a = LabeledValue a -> LabeledValue a -> Assertion
-
-asrtCompare :: String -> (a -> a -> Bool) -> AssertCompare a
-asrtCompare compareName compare (lblA, a) (lblB, b) =
-  Assertion ('(' : lblA ++ ' ' : compareName ++ ' ' : lblB ++ ")") (compare a b)
-
-asrtShow :: Show a => String -> a -> LabeledValue a
-asrtShow varName val = if null varName then (show val, val) else
-  ('(' : varName ++ '=' : show val ++ ")", val)
-
---eq :: Eq a => AssertCompare a
---eq = asrtCompare "==" (==)
-
---ne :: Ord a => AssertCompare a
---ne = asrtCompare "/=" (/=)
-
---gt :: Ord a => AssertCompare a
---gt = asrtCompare ">"  (>)
-
---ge :: Ord a => AssertCompare a
---ge = asrtCompare ">=" (>=)
-
-lt :: Ord a => AssertCompare a
-lt = asrtCompare "<"  (<)
-
-le :: Ord a => AssertCompare a
-le = asrtCompare "<=" (<=)
-
-asrtZero :: Num n => LabeledValue n
-asrtZero = ("0", 0)
-
-asrtOne :: Num n => LabeledValue n
-asrtOne = ("1", 1)
-
-----------------------------------------------------------------------------------------------------
-
--- | Used for indexing lines and characters relative to the cursor.
-newtype Relative a = Relative a
-  deriving (Eq, Ord, Show, Read, Enum, Num, Bounded)
-
--- | Used for indexing absolute lines and characters (relative to the start of the document, which
--- is line 1).
-newtype Absolute a = Absolute a
-  deriving (Eq, Ord, Show, Read, Enum, Num, Bounded)
-
--- | A number for indexing a line. This data type instantiates the 'Prelude.Num' typeclass so that
--- you can write an integer literal in your code and (if used in the correct context) the type
--- inference will automatically declare a 'LineIndex' without you needing to write @(LineIndex 1)@
--- constructor unless you really want to.
-newtype LineIndex = LineIndex Int
-  deriving (Eq, Ord, Show, Read, Enum, Num, Bounded)
-
--- | A number for indexing a column, i.e. a character within a line. This data type instantiates
--- the 'Prelude.Num' typeclass so that you can write an integer literal in your code and (if used in
--- the correct context) the type inference will automatically declare a 'CharIndex' without you
--- needing to write @(LineIndex 1)@ constructor unless you really want to.
-newtype CharIndex = CharIndex Int
-  deriving (Eq, Ord, Show, Read, Enum, Num, Bounded)
-
--- | When instructing the editor engine to move by or delete a number of cursor positions (where
--- line breaking characters consisting of two characters are considered a single cursor position,
--- thus the 'moveByCharWrap' or 'deleteCharsWrap' functions), you must specify the number of cursor
--- positions to move or delete using a value of this type.
-newtype TextCursorSpan = TextCursorSpan Int
-  deriving (Eq, Ord, Show, Read, Enum, Num, Bounded)
 
 unwrapTextCursorSpan :: TextCursorSpan -> Int
 unwrapTextCursorSpan (TextCursorSpan o) = o
@@ -623,6 +497,27 @@ instance Monad m => MonadError TextEditError (EditText tags m) where
 instance MonadTrans (EditText tags) where
   lift = EditText . lift . lift . lift
 
+instance (Monad m, Semigroup a) => Semigroup (EditText tags m a) where
+  a <> b = (<>) <$> a <*> b
+
+instance (Monad m, Monoid a) => Monoid (EditText tags m a) where
+  mempty = return mempty
+  mappend a b = mappend <$> a <*> b
+
+instance MonadIO m => MonadEditVec (MVec.IOVector (TextLine tags)) (EditText tags m) where
+  nullElem = pure TextLineUndefined
+  newVector (Relative siz) = nullElem >>= liftIO . MVec.replicate siz
+  modVector f = state $ \ st -> let vec = f $ theBufferVector st in
+    (vec, st{ theBufferVector = vec })
+  modCount rel f = state $ \ st -> case rel of
+    Before -> let i = f $ theLinesAboveCursor st in (i, st{ theLinesAboveCursor = i })
+    After  -> let i = f $ theLinesBelowCursor st in (i, st{ theLinesBelowCursor = i })
+  modCursorIsDefined f = state $ \ st ->
+    let i = f $ theLineCursorIsDefined st in (i, st{ theLineCursorIsDefined = i })
+  throwLimitErr = throwError . EndOfLineBuffer
+  throwIndexErr = throwError . LineIndexOutOfRange . indexToLine
+  throwCountErr = throwError . LineCountOutOfRange . countToLine
+
 -- | Evaluate an 'EditText' function on the given 'TextBufferState'. The given 'EditText' function
 -- is evaluates all updates on the given 'TextBuffer' atomically and in-place (i.e. without copying
 -- anything unless instructed to do so). This is the most efficient way to evaluate an 'EditText'
@@ -674,6 +569,23 @@ instance Monad m => MonadCont (FoldLines r fold tags m) where
 instance MonadTrans (FoldLines r fold tags) where
   lift = FoldLines . lift . lift . lift . lift
 
+instance Semigroup a => Semigroup (FoldLines r fold tags m a) where
+  a <> b = (<>) <$> a <*> b
+
+instance Monoid a => Monoid (FoldLines r fold tags m a) where
+  mappend a b = mappend <$> a <*> b
+  mempty = return mempty
+
+instance MonadIO m => MonadEditVec (MVec.IOVector (TextLine tags)) (FoldLines r fold tags m) where
+  nullElem           = foldLiftEditText nullElem
+  newVector          = foldLiftEditText . newVector
+  modVector          = foldLiftEditText . modVector
+  modCount dir       = foldLiftEditText . modCount dir
+  modCursorIsDefined = foldLiftEditText . modCursorIsDefined
+  throwLimitErr      = foldLiftEditText . throwLimitErr
+  throwIndexErr      = foldLiftEditText . throwIndexErr
+  throwCountErr      = foldLiftEditText . throwCountErr
+
 foldLiftEditText :: Monad m => EditText tags m a -> FoldLines r fold tags m a
 foldLiftEditText = FoldLines . lift . lift . lift
 
@@ -696,29 +608,25 @@ foldLinesInRange
       -> Absolute LineIndex -> TextLine tags -> FoldLines () fold tags m ())
   -> EditText tags m fold
 foldLinesInRange from0 to0 fold f = do
-  top  <- getElemCount
-  let chk i0 = let i = lineToIndex i0 in
-        ( if i0 == minBound then pure 0
-          else if i0 == maxBound then pure (top - 1)
-          else if 0 <= i && i < top then pure i
-          else throwIndexErr i
-        ) >>= getAbsolute . Absolute
-  from <- chk from0
-  to   <- chk to0
-  let iter :: (Num n, Ord n) => n -> n -> [n]
-      iter from to =
-        takeWhile (flip (if from <= to then (<=) else (>=)) to) $
-        iterate ((if from <= to then (+) else subtract) 1) from
+  top  <- indexNearCursor Before
+  from <- lineToIndex <$> validateIndex from0 --TODO: use validateIndex
+  to   <- lineToIndex <$> validateIndex to0
+  
   fmap snd $ flip runFoldLinesStep fold $ callCC $ \ halt -> do
-    let loop = mapM_ (\ (ln, i) -> getElemIndex i >>= f halt ln) . zip (iter from0 to0)
+    let loop :: Absolute LineIndex -> Absolute LineIndex -> FoldLines () fold tags m ()
+        loop from to = do
+          lo <- absoluteIndex from
+          hi <- absoluteIndex to
+          mapM_ (\ (ln, i) -> getElemIndex i >>= f halt ln) $
+            zip (iter2way from to) (iter2way lo hi)
     getVoid >>= \ case
-      Nothing -> loop $ iter from to
-      Just (Absolute voidLo, Absolute voidHi) ->
+      Nothing -> loop $ iterTwoWay from to
+      Just (voidLo, voidHi) ->
         if from < voidLo && to < voidLo || from > voidHi && to > voidHi
-        then loop $ iter from to
+        then loop $ iterTwoWay from to
         else if from <= to
-        then loop $ (iter from (voidLo - 1)) ++ (iter (voidHi + 1) to)
-        else loop $ (iter from (voidHi + 1)) ++ (iter (voidLo - 1) to)
+        then loop $ (iterTwoWay from (voidLo - 1)) ++ (iterTwoWay (voidHi + 1) to)
+        else loop $ (iterTwoWay from (voidHi + 1)) ++ (iterTwoWay (voidLo - 1) to)
 
 foldLines
   :: (MonadIO m
@@ -800,6 +708,23 @@ instance Monad m => MonadCont (FoldMapLines r fold tags m) where
 instance MonadTrans (FoldMapLines r fold tags) where
   lift = FoldMapLines . lift . lift . lift . lift
 
+instance (Monad m, Semigroup a) => Semigroup (FoldMapLines r fold tags m a) where
+  a <> b = (<>) <$> a <*> b
+
+instance (Monad m, Monoid a) => Monoid (FoldMapLines r fold tags m a) where
+  mappend a b = mappend <$> a <*> b
+  mempty = return mempty
+
+instance MonadIO m => MonadEditVec (MVec.IOVector (TextLine tags)) (FoldMapLines r fold tags m) where
+  nullElem           = foldMapLiftEditText nullElem
+  newVector          = foldMapLiftEditText . newVector
+  modVector          = foldMapLiftEditText . modVector
+  modCount dir       = foldMapLiftEditText . modCount dir
+  modCursorIsDefined = foldMapLiftEditText . modCursorIsDefined
+  throwLimitErr      = foldMapLiftEditText . throwLimitErr
+  throwIndexErr      = foldMapLiftEditText . throwIndexErr
+  throwCountErr      = foldMapLiftEditText . throwCountErr
+
 foldMapLiftEditText :: Monad m => EditText tags m a -> FoldMapLines r fold tags m a
 foldMapLiftEditText = FoldMapLines . lift . lift . lift
 
@@ -865,6 +790,20 @@ instance Monad m =>  MonadError TextEditError (EditLine tags m) where
 
 instance MonadTrans (EditLine tags) where
   lift = EditLine . lift . lift . lift
+
+instance MonadIO m => MonadEditVec (UMVec.IOVector Char) (EditLine tags m) where
+  nullElem = pure '\0'
+  newVector (Relative siz) = nullElem >>= liftIO . UMVec.replicate siz
+  modVector f = state $ \ st -> let vec = f $ theLineEditBuffer st in
+    (vec, st{ theLineEditBuffer = vec })
+  modCount rel f = state $ \ st -> case rel of
+    Before -> let i = f $ theCharsBeforeCursor st in (i, st{ theCharsBeforeCursor = i })
+    After  -> let i = f $ theCharsAfterCursor  st in (i, st{ theCharsAfterCursor  = i })
+  modCursorIsDefined f = state $ \ st ->
+    let i = f $ theCharCursorIsDefined st in (i, st{ theCharCursorIsDefined = i })
+  throwLimitErr = throwError . EndOfCharBuffer
+  throwIndexErr = throwError . CharIndexOutOfRange . indexToChar
+  throwCountErr = throwError . CharCountOutOfRange . countToChar
 
 -- | Perform an edit on the line under the cursor. It is usually not necessary to invoke this
 -- function directly, the definition of 'liftEditLine' for the 'TextEdit' function type is this
@@ -1014,9 +953,9 @@ data TextBufferState tags
       -- string is transferred from 'theBufferLineEditor' to to 'theLinesAbove' or 'theLinesBelow'.
     , theBufferVector        :: !(MVec.IOVector (TextLine tags))
       -- ^ A mutable vector containing each line of editable text.
-    , theLinesAboveCursor    :: !Int
+    , theLinesAboveCursor    :: !VecLength
       -- ^ The number of lines above the cursor
-    , theLinesBelowCursor    :: !Int
+    , theLinesBelowCursor    :: !VecLength
       -- ^ The number of line below the cursor
     , theLineCursorIsDefined :: !Bool
       -- ^ Indicates whether the item under the cursor is defined or undefined.
@@ -1295,8 +1234,8 @@ data LineEditor tags
       -- such that it can only directly edit text in it's parent 'TextEditor'. A 'LineEditor' can
       -- indirectly edit text in any other parent, but only if a complete copy of the content of the
       -- line editor is made and passed it to some other 'TextEditor'.
-    , theCharsBeforeCursor   :: !Int
-    , theCharsAfterCursor    :: !Int
+    , theCharsBeforeCursor   :: !VecLength
+    , theCharsAfterCursor    :: !VecLength
     , theCharCursorIsDefined :: !Bool
       -- ^ Set to 'True' if the char under the cursor is defined, 'False' otherwise.
     , theLineEditorIsClean   :: !Bool
@@ -1457,7 +1396,7 @@ newLineEditorAt parent loc = liftIO $ flip runEditTextIO parent $ do
   -- This function is safe to export because we assume a 'TextLine' never contains more than one
   -- line terminator, and always only at the end of the buffer. The 'TextLine' constructor is not
   -- exported.
-  i <- getAbsoluteChk $ Absolute $ lineToIndex $ loc ^. lineIndex
+  i <- absoluteIndexChk $ Absolute $ lineToIndex $ loc ^. lineIndex
   line <- getElemIndex i
   liftIO $ do
     let myname = "newLineEditorAt"
@@ -1566,520 +1505,6 @@ bufferTargetCol = lens theBufferTargetCol $ \ a b -> a{ theBufferTargetCol = b }
 
 ----------------------------------------------------------------------------------------------------
 
--- Line indexing arithmetic
---
--- I think of these functions as being similar to named environment variables in that you can use
--- these names to have meaningful symbols for certain vector indicies. This makes code involving
--- ranges of lines, and code involving translating user-facing @('Absolute' 'LineIndex')@ values to
--- simplliied arithmetic expressions that I consuder to be more human readable.
-
-class MonadIO m => MonadEditVec vec m | m -> vec where
-  nullElem  :: vec ~ v elem => m elem
-  newVector :: Int -> m vec
-  modVector :: (vec -> vec) -> m vec
-  -- | This is a value relative to the cursor, the integer value returned does not include the value
-  -- under the cursor itself, as the value under the cursor may or may not exist.
-  modCount  :: RelativeToCursor -> (Int -> Int) -> m Int
-  -- | Returns a boolean indicating whether the element under the cursor is valid.
-  modCursorIsDefined :: (Bool -> Bool) -> m Bool
-  throwLimitErr :: RelativeToCursor -> m void
-  throwIndexErr :: Int -> m void
-  throwCountErr :: Int -> m void
-
-instance MonadIO m => MonadEditVec (MVec.IOVector (TextLine tags)) (EditText tags m) where
-  nullElem = pure TextLineUndefined
-  newVector siz = nullElem >>= liftIO . MVec.replicate siz
-  modVector f = state $ \ st -> let vec = f $ theBufferVector st in
-    (vec, st{ theBufferVector = vec })
-  modCount rel f = state $ \ st -> case rel of
-    Before -> let i = f $ theLinesAboveCursor st in (i, st{ theLinesAboveCursor = i })
-    After  -> let i = f $ theLinesBelowCursor st in (i, st{ theLinesBelowCursor = i })
-  modCursorIsDefined f = state $ \ st ->
-    let i = f $ theLineCursorIsDefined st in (i, st{ theLineCursorIsDefined = i })
-  throwLimitErr = throwError . EndOfLineBuffer
-  throwIndexErr = throwError . LineIndexOutOfRange . indexToLine
-  throwCountErr = throwError . LineCountOutOfRange . countToLine
-
-instance MonadIO m => MonadEditVec (UMVec.IOVector Char) (EditLine tags m) where
-  nullElem = pure '\0'
-  newVector siz = nullElem >>= liftIO . UMVec.replicate siz
-  modVector f = state $ \ st -> let vec = f $ theLineEditBuffer st in
-    (vec, st{ theLineEditBuffer = vec })
-  modCount rel f = state $ \ st -> case rel of
-    Before -> let i = f $ theCharsBeforeCursor st in (i, st{ theCharsBeforeCursor = i })
-    After  -> let i = f $ theCharsAfterCursor  st in (i, st{ theCharsAfterCursor  = i })
-  modCursorIsDefined f = state $ \ st ->
-    let i = f $ theCharCursorIsDefined st in (i, st{ theCharCursorIsDefined = i })
-  throwLimitErr = throwError . EndOfCharBuffer
-  throwIndexErr = throwError . CharIndexOutOfRange . indexToChar
-  throwCountErr = throwError . CharCountOutOfRange . countToChar
-
-instance MonadIO m => MonadEditVec (MVec.IOVector (TextLine tags)) (FoldMapLines r fold tags m) where
-  nullElem           = foldMapLiftEditText nullElem
-  newVector          = foldMapLiftEditText . newVector
-  modVector          = foldMapLiftEditText . modVector
-  modCount dir       = foldMapLiftEditText . modCount dir
-  modCursorIsDefined = foldMapLiftEditText . modCursorIsDefined
-  throwLimitErr      = foldMapLiftEditText . throwLimitErr
-  throwIndexErr      = foldMapLiftEditText . throwIndexErr
-  throwCountErr      = foldMapLiftEditText . throwCountErr
-
-instance MonadIO m => MonadEditVec (MVec.IOVector (TextLine tags)) (FoldLines r fold tags m) where
-  nullElem           = foldLiftEditText nullElem
-  newVector          = foldLiftEditText . newVector
-  modVector          = foldLiftEditText . modVector
-  modCount dir       = foldLiftEditText . modCount dir
-  modCursorIsDefined = foldLiftEditText . modCursorIsDefined
-  throwLimitErr      = foldLiftEditText . throwLimitErr
-  throwIndexErr      = foldLiftEditText . throwIndexErr
-  throwCountErr      = foldLiftEditText . throwCountErr
-
--- The vector of the text buffer.
-getVector :: MonadEditVec vec m => m vec
-getVector = modVector id
-
--- Returns the number of valid elements on or 'Before' the cursor, or 'After' the cursor.
-getElemCountFrom :: MonadEditVec vec m => RelativeToCursor -> m Int
-getElemCountFrom = flip modCount id
-
--- The size of the buffer allocation
-getAllocSize :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem) => m Int
-getAllocSize = GMVec.length <$> getVector
-
--- The number of valid elements under the cursor.
-countCursor :: MonadEditVec vec m => m Int
-countCursor = (\ a -> if a then 0 else 1) <$> modCursorIsDefined id
-
--- The number of valid elements in the buffer @('getElemCountFrom' 'Before' + 'getElemCountFrom' 'After')@.
-getElemCount :: MonadEditVec vec m => m Int
-getElemCount = do
-  bef <- getElemCountFrom Before
-  cur <- countCursor
-  aft <- getElemCountFrom After
-  return $ bef + cur + aft
-
--- The number of elements in the buffer that are not valid, @(bufAllocSize - bufLineCount)@
-getUnusedSpace :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem) => m Int
-getUnusedSpace = subtract <$> getElemCount <*> getAllocSize
-
--- Returns a cursor index, although the index may NOT necessarily be pointing to a valid
--- element. Evaluating this function with a value of 'Before' as the argument is the canonical way
--- of getting the current cursor index, and is used in this way throughout this module, even for
--- user-facing functions.
---
--- However evaluating this function with a value of 'After' as the argument __MUST_NOT__ be used to
--- return a value from a user-facing function because the this value is an index into the vector
--- that has no meaning to end-users who should not ever know or care about the actual indicies to
--- which the logical line indicies are mapped.
---
--- This function is defined as the value returned by 'getElemCountFrom' because the 'getElemCountFrom' is
--- not just the count of all elements before the cursor but also the position of the cursor. The
--- element after the cursor is the first element after the contiguous gap of undefined elements in
--- the vector. If there are no elements after the cursor, this function returns the length of the
--- array, which is an invalid index that may result in a vector index exception.
-cursorIndex
-  :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem)
-  => RelativeToCursor -> m Int -- line editors and text editor have different cursors
-cursorIndex rel = case rel of
-  Before -> getElemCountFrom Before
-  After  -> subtract <$> getElemCountFrom After <*> getAllocSize
-
--- Like 'cursorIndex', but evaluates to 'throwLimitErr' if the value __returned__ by 'cursorIndex'
--- is out-of-bounds. __NOTE__ that this function checks the return value, not the input value which
--- is always valid. The reason for this is because this function is usually used by functions that
--- get the index after a cursor motion (like 'pushElem' and 'popElem') which want to return a
--- bounds-checking exception if a value under the cursor is used when the cursor has moved to the
--- very start or very end of the vector.
-cursorIndexChk
-  :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem)
-  => RelativeToCursor -> m Int
-cursorIndexChk rel = do
-  siz <- getAllocSize
-  i   <- cursorIndex rel
-  if 0 <= i && i < siz then return i else throwLimitErr rel
-
--- A predicate checking if the cursor is currently at the beginning or end of the buffer. This is to
--- be used as a check before evaluating 'popElem' to be sure 'popElem' will not evaluate to an
--- exception.
-cursorAtEnd
-  :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem)
-  => RelativeToCursor -> m Bool
-cursorAtEnd rel = do
-  siz <- getAllocSize
-  i   <- cursorIndex rel
-  return $ case rel of { Before -> i <= 0; After -> i + 1 >= siz; }
-
--- Get the index within the vector that is associated with the given 'LineIndex'. Bounds checking is
--- performed.
-getAbsoluteChk :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem) => Absolute Int -> m Int
-getAbsoluteChk (Absolute i) = getAllocSize >>= \ siz ->
-  (if not $ 0 <= i && i < siz then throwIndexErr else getAbsolute . Absolute) i
-
--- Get the index within the vector that is associated with the given index value 'Relative' to the
--- cursor.
-getRelative :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem) => Relative Int -> m Int
-getRelative (Relative count) = (+ count) <$> getElemCountFrom Before
-
--- Get the index within the vector that is associated with the given 'LineIndex'. Bounds checking is
--- __NOT__ performed.
-getAbsolute :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem) => Absolute Int -> m Int
-getAbsolute (Absolute i) =
-  getElemCount >>= \ cur -> if i <= cur then return i else (+ i) <$> getUnusedSpace
-
--- From a 'Relative' index value (relative to the cursor) convert this value to to an 'Absolute'
--- index value. Absolute as in the actual element number, not it's address index in the vector. A
--- 'Relative' value of zero returns the index of the element directly under the cursor.
-getRelToAbs
-  :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem)
-  => Relative Int -> m (Absolute Int)
-getRelToAbs (Relative i) = Absolute . (+ i) <$> getElemCountFrom Before
-
--- Return the starting and ending index of the void region of the buffer, which is the contiguous
--- region of undefined elements within the buffer.
-getVoid
-  :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem)
-  => m (Maybe (Absolute Int, Absolute Int))
-getVoid = do
-  let absSub1 = Absolute . subtract 1
-  rgn <- (,) <$> (absSub1 <$> getElemCountFrom Before) <*> (absSub1 <$> cursorIndex After)
-  return $ guard (uncurry (<=) rgn) >> Just rgn
-
--- Make a slice of elements relative to the current cursor. A negative argument will take elements
--- before and up-to the cursor, a positive argument will take that many elements starting from
--- 'getLineAfterCur'. Pass a boolean value indicating whether or not you would like to perform
--- bounds checking, if so an exception will be raised if the line index goes out of bounds.
-getSlice
-  :: (MonadEditVec (mvec st elem) m, GMVec.MVector mvec elem)
-  => Relative Int -> m (mvec st elem)
-getSlice rel@(Relative count) = do
-  vec <- getVector
-  if rel < 0
-    then do
-      i <- getRelative rel
-      return $ asrtMSlice SafeOp "getSlice" (asrtShow "i" i) (asrtShow "abs count" $ abs count) ("vec", vec)
-    else if rel > 0
-    then do
-      i <- cursorIndex After
-      return $ asrtMSlice SafeOp "getSlice" (asrtShow "i" i) (asrtShow "count" $ count) ("vec", vec)
-    else return $ GMVec.slice 0 0 vec
-
--- Like 'getSlice' but performs bounds checking.
-getSliceChk
-  :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem)
-  => Relative Int -> m (vec st elem)
-getSliceChk rel@(Relative count) = do
-  i <- getRelative rel
-  if count < 0 then when (i < 0) (throwCountErr count) else do
-    nelems <- getElemCount
-    when (i > nelems) (throwCountErr count)
-  getSlice rel
-
--- Make a slice of the void region of the buffer (the contiguous region of invalid elements after
--- the cursor). This can be used as the target of a vector copy. If the buffer is full, 'Nothing' is
--- returned.
-getVoidSlice
-  :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem)
-  => Relative Int -> m (Maybe (vec st elem))
-getVoidSlice (Relative count) = do
-  vec <- (,) "getVector" <$> getVector
-  vsp <- getVoid
-  return $ vsp <&> \ (Absolute lo, Absolute hi) ->
-   if count < 0
-   then asrtMSlice SafeOp "getVoidSlice" (asrtShow "hi+count" $ hi + count) (asrtShow "abs count" $ abs count) vec
-   else if count > 0
-   then asrtMSlice SafeOp "getVoidSlice" (asrtShow "lo" lo) (asrtShow "count" count) vec
-   else asrtMSlice SafeOp "getVoidSlice" asrtZero asrtZero vec
-
--- Obtain a slice (using 'getSlice') for the portion of the vector containing elements before or on
--- the current cursor.
-getLoSlice :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem) => m (vec st elem)
-getLoSlice = getElemCountFrom Before >>= getSlice . Relative . negate
-
--- Obtain a slice (using 'getSliceM') for the portion of the vector containing elements after the
--- current cursor.
-getHiSlice :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem) => m (vec st elem)
-getHiSlice = getElemCountFrom After >>= getSlice . Relative
-
--- Given a region, slice the vector to the region and evaluate one of two given continuations with
--- the slice. If the region spans the gap in the buffer, the first continuation is called. If the
--- region is fully contained to within either sub region on either side of the gap, then the second
--- continuation function is called.
-withRegion
-  :: (GMVec.MVector vec elem, MonadEditVec (vec st elem) m)
-  => Absolute Int -> Absolute Int
-  -> (vec st elem -> vec st elem -> m a)
-  -> (vec st elem -> m a)
-  -> m a
-withRegion (Absolute from) (Absolute to) straddle contained = do
-  vec <- getVector
-  cur <- getElemCount
-  if from <= cur && to <= cur
-   then contained $ asrtMSlice SafeOp "withRegion/below"
-          (asrtShow "from" from) (asrtShow "to-from+1" $ to - from + 1) ("vec", vec)
-   else if from > cur && to > cur
-   then getUnusedSpace >>= \ u ->
-        contained $ asrtMSlice SafeOp "withRegion/above"
-          (asrtShow "from+u" $ from + u) (asrtShow "to+u" $ to + u) ("vec", vec)
-   else (,) <$> getSlice (Relative $ cur - from) <*> getSlice (Relative $ to - cur) >>=
-        uncurry straddle
-
--- Select a region of valid elements given an index and size values, taking into account the
--- position of the cursor, and copy the region into a new contiguous mutable vector that contains no
--- invalid elements.
-copyRegion
-  :: (GMVec.MVector vec elem, MonadEditVec (vec RealWorld elem) m)
-  => Absolute Int -> Relative Int -> m (vec RealWorld elem)
-copyRegion (Absolute i) (Relative count) = if count == 0 then liftIO $ GMVec.new 0 else do
-  let myname = "copyRegion"
-  let sum = i + count
-  let lo  = min i sum
-  let hi  = max i sum
-  let siz = ("abs count", abs count)
-  oldvec <- (,) "oldvec" <$> getVector
-  before <- getElemCountFrom Before
-  if lo >= before
-   then do
-    i <- getAbsolute $ Absolute lo
-    liftIO $ GMVec.clone $ asrtMSlice SafeOp myname (asrtShow "getAbsolute" i) siz oldvec
-   else if hi < before
-   then liftIO $ GMVec.clone $ asrtMSlice SafeOp myname (asrtShow "lo" lo) siz oldvec
-   else do
-    let sublen = before - lo
-    lovec  <- getSlice $ Relative $ negate sublen
-    hivec  <- getSlice $ Relative $ hi - before
-    newvec <- newVector (snd siz)
-    let copy  = (.) liftIO . if unsafeMode then GMVec.unsafeCopy else GMVec.copy
-    flip copy lovec $ asrtMSlice SafeOp myname
-      asrtZero (asrtShow "sublen" sublen) ("newvec", newvec)
-    flip copy hivec $ asrtMSlice SafeOp myname
-      (asrtShow "sublen" sublen) (asrtShow "siz-sublen" $ snd siz - sublen) ("newvec", newvec)
-    return newvec
-
--- Like 'copyRegion', but performs bounds checking.
-copyRegionChk
-  :: (GMVec.MVector vec elem, MonadEditVec (vec RealWorld elem) m)
-  => Absolute Int -> Relative Int -> m (vec RealWorld elem)
-copyRegionChk i0@(Absolute i) count0@(Relative count) =
-  getElemCount >>= \ siz -> let sum = i + count in
-  if i < 0 || (count < 0 && i > siz) || (count > 0 && i >= siz) then throwIndexErr i
-  else if sum < 0 || sum > siz then throwCountErr count
-  else copyRegion i0 count0
-
--- Write an element to a vector index, overwriting whatever was there before. __WARNING__: there is
--- no bounds checking.
-putElemIndex
-  :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem
-     , Show elem --DEBUG
-     )
-  => Int -> elem -> m ()
-putElemIndex i elem =
-  ( asrtMWrite UnsafeOp "putElemIndex"
-      <$> ((,) "getVector" <$> getVector)
-      <*> pure (asrtShow "i" i)
-      <*> pure elem
-  ) >>= liftIO
-
--- Read an element from a vector index. __WARNING__: there is no bounds checking.
-getElemIndex
-  :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem
-     , Show elem --DEBUG
-     )
-  => Int -> m elem
-getElemIndex i =
-  ( asrtMRead UnsafeOp "getElemIndex"
-      <$> ((,) "getVector" <$> getVector)
-      <*> pure (asrtShow "i" i)
-  ) >>= liftIO
-
--- Like 'putElemIndex' but the index to which the element is written is given by a
--- 'RelativeToCursor' value, so the index returned by 'cursorIndex'. The cursor position is not
--- modified.
-putElem
-  :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem
-     , Show elem --DEBUG
-     )
-  => RelativeToCursor -> elem -> m ()
-putElem rel elem = do
-  join $ putElemIndex <$> cursorIndexChk rel <*> pure elem
-  void $ modCursorIsDefined $ const True
-
--- Like 'getElemIndex' but the index from which the element is read is given by a 'RelativeToCursor'
--- value, so the index returned by 'cursorIndex'. The cursor position is not modified.
-getElem
-  :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem
-     , Show elem --DEBUG
-     )
-  => RelativeToCursor -> m elem
-getElem rel = do
-  defined <- modCursorIsDefined id
-  if defined then cursorIndexChk rel >>= getElemIndex else throwLimitErr rel
-
--- Like 'putElem' but the @elem@ value to be put is taken from the 'nullElem' for this 'MonadEditVec'
--- context. The cursor position is not modified.
-delElem
-  :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem
-     , Show elem --DEBUG
-     )
-  => RelativeToCursor -> m ()
-delElem rel = do
-  count <- modCount rel id
-  if count <= 0 then throwLimitErr rel else do
-    join $ putElem rel <$> nullElem
-    modCount rel $ subtract 1
-    when (rel == Before && count == 1) $ void $ modCursorIsDefined $ const False
-
--- Takes two paramters @oldSize@ and @newSize@. This function finds the minimum power of two scalara
--- necessary to scale the @oldSize@ such that it is __greater_than__ the @newSize@. Said another
--- way, this function repeatedly multiplies @oldSize@ by 2 until it is greater than (not equal to)
--- the @newSize@ value.
---
--- Note that this function does ever not return a value equal to @newSize@, the assumption is that
--- this function is used to grow a buffer, not to make it exactly the size required. If you want
--- this function to return a value equal to the exact amount, try passing a @newSize@ value equal to
--- @oldSize * 2^n - 1@ for some integer @n@.
-minPow2ScaledSize :: Int -> Int -> Int
-minPow2ScaledSize oldsiz newsiz = head $ dropWhile (<= newsiz) $ iterate (* 2) $ max 1 oldsiz
-
--- Pass a minimum vector allocation size request as an argument. This function check the allocation
--- size (using 'getAllocSize') of the current buffer vector. If the current allocation is larger
--- than the size request argument, 'Nothing' is returned. If the current allocation is smaller than
--- the size request, a new vector is allocated and returned in a 'Just' constructor. The new buffer
--- is ONLY allocated and returned; the content of the current buffer is NOT copied, the current
--- buffer is not replaced.
-prepLargerVector
-  :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem)
-  => Int -> m (Maybe (vec RealWorld elem))
-prepLargerVector newsiz = do
-  oldsiz <- getAllocSize
-  if oldsiz >= newsiz then return Nothing else
-    Just <$> newVector (minPow2ScaledSize oldsiz newsiz)
-
--- If and only if the vector is full, allocate a new vector with enough space to fit the requested
--- number of elements by doubling the size of the current vector until the size is large enough,
--- then copy the elements from the current vector to the new vector, and then replace the current
--- vector with the new one.
-growVector
-  :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem)
-  => Int -> m ()
-growVector increase = if increase <= 0 then return () else
-  getElemCount >>= \ count -> prepLargerVector (count + increase) >>= \ case
-    Nothing     -> return ()
-    Just newvec -> do
-      oldbef <- getLoSlice
-      oldaft <- getHiSlice
-      modVector $ const newvec
-      newbef <- getLoSlice
-      newaft <- getHiSlice
-      liftIO $ do
-        GMVec.copy newbef oldbef
-        GMVec.copy newaft oldaft
-
--- Push a single element to the index 'Before' (currently on) the cursor, or the index 'After' the
--- cursor, and then shift the cursor to point to the pushed element.
-pushElem
-  :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem
-     , Show elem --DEBUG
-     )
-  => RelativeToCursor -> elem -> m ()
-pushElem rel elem = growVector 1 >> putElem rel elem >> modCount rel (+ 1) >> pure ()
-
--- Push a vector of elements starting at the index 'Before' (currently on) the cursor, or the index
--- 'After' the cursor.
-pushElemVec
-  :: (GVec.Vector vec elem, MonadEditVec (GVec.Mutable vec RealWorld elem) m
-     , Show elem --DEBUG
-     )
-  => RelativeToCursor -> vec elem -> m ()
-pushElemVec rel src = do
-  let len = GVec.length src
-  let copy = if unsafeMode then GVec.unsafeCopy else GVec.copy
-  growVector len
-  targ <- getVoidSlice (Relative $ case rel of { Before -> negate len; After -> len }) >>= \ case
-    Nothing   -> error $ "pushElemVec: internal error, \"growVector\" failed to create space"
-    Just targ -> return targ
-  liftIO $ copy targ src
-  void $ modCount rel (+ len)
-
--- Pop a single element from the index 'Before' (currently on) the cursor, or from the index 'After'
--- the cursor, and then shift the cursor to point to the pushed element.
-popElem
-  :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem
-     , Show elem --DEBUG
-     )
-  => RelativeToCursor -> m elem
-popElem rel = getElem rel <* delElem rel
-
--- Move the cursor, which will shift elements around the vector, using a algorithm of O(n) steps,
--- where @n@ is the 'Relative' shift value. Pass a boolean value indicating whether or not you would
--- like to perform bounds checking, if so an exception will be raised if the line index goes out of
--- bounds.
-shiftCursor
-  :: (GMVec.MVector vec elem, MonadEditVec (vec RealWorld elem) m
-     , Show elem --DEBUG
-     )
-  => Relative Int -> m ()
-shiftCursor (Relative count) =
-  if count == 0 then return () else getVoid >>= \ case
-    Nothing -> done
-    Just ~(Absolute lo, Absolute hi) ->
-      if      count ==  1 then popElem After  >>= pushElem Before
-      else if count == -1 then popElem Before >>= pushElem After
-      else do
-        vec  <- getVector
-        from <- getSlice (Relative count)
-        let to = vec &
-              if      count > 1 then asrtMSlice UnsafeOp myname
-                (asrtShow "lo" lo)
-                (asrtShow "count" count) . (,) "getVector"
-              else if count < 1 then asrtMSlice UnsafeOp myname
-                (asrtShow "hi+count+1" $ hi + count + 1)
-                (asrtShow "negate count" $ negate count) . (,) "getVector"
-              else error "shiftCursor: internal error, this should never happen"
-        liftIO $ GMVec.move to from
-        done
-    where
-      myname = "shiftCursor"
-      done = do
-        before <- modCount Before (+ count)
-        modCount After (subtract count)
-        when (before == 0) $ void $ modCursorIsDefined $ const False
-
--- Like 'shiftCursor' but performs bounds checking. This function does not throw an out-of-range
--- exception, rather it simply calls 'shiftCursor' with the minimal in-range value, as shifting the
--- cursor (in my opinion) should not result in an error.
-shiftCursorChk
-  :: (MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem
-     , Show elem --DEBUG
-     )
-  => Relative Int -> m ()
-shiftCursorChk (Relative count) =
-  getElemCountFrom (if count <= 0 then Before else After) >>=
-  shiftCursor . Relative . ((signum count) *) . min (safeAbs count)
-
--- Copy the current mutable buffer vector to an immutable vector.
-freezeVector
-  :: forall vec elem m
-  . (GVec.Vector vec elem, MonadEditVec (GVec.Mutable vec RealWorld elem) m
-    , Show (vec elem) --DEBUG
-    )
-  => m (vec elem)
-freezeVector = do
-  newvec <- getElemCount >>= newVector
-  bef <- getLoSlice
-  aft <- getHiSlice
-  liftIO $ do
-    flip GMVec.copy bef $ asrtMSlice UnsafeOp "freezeVector"
-      asrtZero
-      (asrtShow "length bef" $ GMVec.length bef)
-      ("newvec", newvec)
-    flip GMVec.copy aft $ asrtMSlice UnsafeOp "freezeVector"
-      (asrtShow "length bef" $ GMVec.length bef)
-      (asrtShow "length aft" $ GMVec.length aft)
-      ("newvec", newvec)
-    GVec.unsafeFreeze newvec
-
-----------------------------------------------------------------------------------------------------
-
 -- | Throughout this module you will find functions that are defined like so:
 --
 -- @
@@ -2137,40 +1562,6 @@ instance MonadEditLine (FoldMapLines r fold) where
 
 ----------------------------------------------------------------------------------------------------
 
--- | Controls whether characters are inserted/deleted before or after the cursor.
-data RelativeToCursor = Before | After
-  deriving (Eq, Ord, Read, Show, Bounded, Enum)
-
-class HasOpposite a where { opposite :: a -> a; }
-instance HasOpposite Bool where { opposite = not; }
-instance HasOpposite Int  where { opposite = negate; }
-instance HasOpposite Integer where { opposite = negate; }
-instance HasOpposite (Either a a) where
-  opposite = \ case { Right a -> Left a; Left a -> Right a; }
-instance HasOpposite RelativeToCursor where
-  opposite = \ case { Before -> After; After -> Before }
-
--- Not for export: creates a deep-copy of a vector with a cursor, in which elements before the
--- cursor are aligned at the start of the vector, and elements after the cursor are aligned at the
--- end of the vector.
-copyVec
-  :: (GMVec.MVector vector a, PrimMonad m)
-  => vector (PrimState m) a
-  -> Int -> Int -> m (vector (PrimState m) a)
-copyVec oldVec0 before after = do
-  let myname  = "copyVec"
-  let oldVec = ("oldVec", oldVec0)
-  let len   = GMVec.length $ snd oldVec
-  let upper = ("len-after", len - after)
-  newVec <- (,) "newVec" <$> GMVec.new len
-  when (before > 0) $ GMVec.copy
-    (asrtMSlice UnsafeOp myname asrtZero (asrtShow "before" before) newVec)
-    (asrtMSlice UnsafeOp myname asrtZero (asrtShow "before" before) oldVec)
-  when (after  > 0) $ GMVec.copy
-    (asrtMSlice UnsafeOp myname upper (asrtShow "after" after) newVec)
-    (asrtMSlice UnsafeOp myname upper (asrtShow "after" after) oldVec)
-  return $ snd newVec
-
 -- | Push a 'TextLine' before or after the cursor. This function does not effect the content of the
 -- 'bufferLineEditor'.
 pushLine
@@ -2194,30 +1585,6 @@ popLine = liftEditText . popElem
 
 ----------------------------------------------------------------------------------------------------
 
-indexToLine :: Int -> Absolute LineIndex
-indexToLine = Absolute . LineIndex . (+ 1)
-
-indexToChar :: Int -> Absolute CharIndex
-indexToChar = Absolute . CharIndex . (+ 1)
-
-countToLine :: Int -> Relative LineIndex
-countToLine = Relative . LineIndex
-
-countToChar :: Int -> Relative CharIndex
-countToChar = Relative . CharIndex
-
-lineToIndex :: Absolute LineIndex -> Int
-lineToIndex (Absolute (LineIndex i)) = i - 1
-
-charToIndex :: Absolute CharIndex -> Int
-charToIndex (Absolute (CharIndex i)) = i - 1
-
-lineToCount :: Relative LineIndex -> Int
-lineToCount (Relative (LineIndex i)) = i
-
-charToCount :: Relative CharIndex -> Int
-charToCount (Relative (CharIndex i)) = i
-
 -- | This function checks if a 'LineIndex' is valid. It first checks if the given index is an
 -- extreme value, 'minBound' or 'maxBound', and returns an in-bounds index at the begninning or end
 -- (respectively) of the valid range. If the value is in bounds or an extreme value, this function
@@ -2231,59 +1598,98 @@ charToCount (Relative (CharIndex i)) = i
 --
 -- This function can be used with either a @('Relative' 'LineIndex')@ or an
 -- @('Absolute' 'LineIndex')@.
-class AnyLineIndex i where
-  throwOutOfRangeIndex :: (MonadIO m , MonadError TextEditError m) => i -> m void
-  testLineIndex
-    :: (MonadIO m
-       , Show tags --DEBUG
-       )
-    => i -> EditText tags m (Bool, Absolute LineIndex)
-  -- TODO: use 'textLineIndex' or 'validateLineIndex' in all public APIs that use indicies.
+class (MonadIO m, MonadEditVec vec m, MonadError TextEditError m) => CheckedIndex i m vec where
 
-instance AnyLineIndex (Absolute LineIndex) where
-  throwOutOfRangeIndex = throwError . LineIndexOutOfRange
-  testLineIndex i0 = getElemCount >>= \ count ->
-    let i = lineToIndex i0 in if count == 0 then throwError BufferIsEmpty else return $
-    if      i0 == minBound then (True, indexToLine 0)
-    else if i0 == maxBound then (True, indexToLine $ count - 1)
-    else if i  >= count    then (False, indexToLine $ count - 1)
-    else if i  <  0        then (False, 1)
-    else                        (True, i0)
+  throwOutOfRangeIndex :: (MonadError TextEditError m) => i -> m void
 
-instance AnyLineIndex (Relative LineIndex) where
-  throwOutOfRangeIndex = throwError . LineCountOutOfRange
-  testLineIndex = relativeToAbsolute >=> testLineIndex
+  testIndex :: i -> m (Bool, i)
+
+  validateIndex :: i -> m i
+  validateIndex i0 = testIndex i0 >>= \ (ok, i) ->
+    if ok then return i else throwOutOfRangeIndex i0
+
+instance
+  (MonadIO m
+  , Show tags --DEBUG
+  ) =>
+  CheckedIndex (Absolute LineIndex) (EditText tags m) (MVec.IOVector (TextLine tags))
+  where
+    throwOutOfRangeIndex = throwError . LineIndexOutOfRange
+    testIndex = fmap (fmap $ \ (Absolute i) -> indexToLine i) . generalTestIndex . Absolute . lineToIndex
+
+instance
+  (MonadIO m
+  , Show tags --DEBUG
+  ) =>
+  CheckedIndex (Absolute CharIndex) (EditLine tags m) (UMVec.IOVector Char)
+  where
+    throwOutOfRangeIndex = throwError . CharIndexOutOfRange
+    testIndex = fmap (fmap $ \ (Absolute i) -> indexToChar i) . generalTestIndex . Absolute . charToIndex
+
+--instance
+--  (MonadIO m
+--  , Show tags --DEBUG
+--  ) =>
+--  CheckedIndex (Relative LineIndex) (EditText tags m) (MVec.IOVector (TextLine tags))
+--  where
+--    throwOutOfRangeIndex = throwError . LineCountOutOfRange
+--    testIndex = relativeToAbsolute >=> testIndex
+--
+--instance
+--  (MonadIO m
+--  , Show tags --DEBUG
+--  ) =>
+--  CheckedIndex (Relative CharIndex) (EditLine tags m) (UMVec.IOVector Char)
+--  where
+--    throwOutOfRangeIndex = throwError . CharCountOutOfRange
+--    testIndex = relativeToAbsolute >=> testIndex
+
+-- | This is the most general index testing function, it is used to instantiate 'testIndex' in the
+-- 'CheckedIndex' class for both the 'EditText' and 'EditLine' monads. The difference between
+-- 'textIndex' and 'testIndex' is that this 'testIndex' function takes a parameter of type
+-- @''Absolute' 'Int')@ whereas 'testIndex' takes a type of @('Absolute' 'LineIndex')@ or
+-- @('Absolute' 'CharIndex')@ depending on the monadic context in which it is called.
+generalTestIndex
+  :: (MonadEditVec vec m, MonadError TextEditError m)
+  => Absolute Int -> m (Bool, Absolute Int)
+generalTestIndex (Absolute i) = countDefined >>= \ (Relative count) ->
+  if count == 0 then throwError BufferIsEmpty else return $
+  if      i == minBound then (True , 0)
+  else if i == maxBound then (True , Absolute $ count - 1)
+  else if i  >= count   then (False, Absolute $ count - 1)
+  else if i  <  0       then (False, 0)
+  else                       (True , Absolute i)
 
 -- | Like 'textLineIndex', but throws a 'LineIndexOutOfRange' exception if the given 'LineIndex' is
 -- out of bounds.
 validateLineIndex
-  :: (MonadIO m, AnyLineIndex i
+  :: (MonadIO m
      , Show tags --DEBUG
      )
-  => i -> EditText tags m (Absolute LineIndex)
-validateLineIndex i0 = testLineIndex i0 >>= \ (ok, i) ->
+  => Absolute LineIndex -> EditText tags m (Absolute LineIndex)
+validateLineIndex i0 = testIndex i0 >>= \ (ok, i) ->
   if ok then return i else throwOutOfRangeIndex i0
 
 -- | Like 'validateLineIndex', but rather than throwing an exception, simply returns 'False' if an
 -- exception would have been thrown, and returns 'True' otherwise.
 lineIndexIsValid
-  :: (MonadIO m, AnyLineIndex i
+  :: (CheckedIndex i (EditText tags m) (MVec.IOVector (TextLine tags))
      , Show tags --DEBUG
      )
   => i -> EditText tags m Bool
-lineIndexIsValid = (`catchError` (const $ return False)) . fmap fst . testLineIndex
+lineIndexIsValid = (`catchError` (const $ return False)) . fmap fst . testIndex
 
 -- | Evaluates 'validateLineIndex' on a given 'LineIndex', and if no exceptions are thrown, also
 -- dereferences the index, returning the 'TextLine' stored at the given valid index.
 validateGetLineIndex
-  :: (MonadIO m, AnyLineIndex i
+  :: (MonadIO m
      , Show tags --DEBUG
      )
-  => i -> EditText tags m (Absolute LineIndex, TextLine tags)
+  => Absolute LineIndex -> EditText tags m (Absolute LineIndex, TextLine tags)
 validateGetLineIndex = validateLineIndex >=> \ i ->
-  (,) i <$> (getAbsolute (Absolute $ lineToIndex i) >>= getElemIndex)
+  (,) i <$> (absoluteIndex (Absolute $ lineToIndex i) >>= getElemIndex)
 
--- | Tests the validity of the 'lineIndex' of a given 'TextLocation' using 'testLineIndex', and if
+-- | Tests the validity of the 'lineIndex' of a given 'TextLocation' using 'testIndex', and if
 -- the 'lineIndex' is valid, also tests if the 'charIndex' is valid. This function only throws an
 -- exception if the 'TextBuffer' is empty. "Extreme" indicies (e.g. 'minBound' or 'maxBound') are
 -- also considered to be valid index values, and are mapped to their nearest respective valid
@@ -2319,10 +1725,10 @@ testLocation
      )
   => TextLocation -> EditText tags m (Either TextLocation (TextLine tags, (Bool, TextLocation)))
 testLocation loc = do
-  (ok, linum) <- testLineIndex $ loc ^. lineIndex
+  (ok, linum) <- testIndex $ loc ^. lineIndex
   loc <- pure (loc & lineIndex .~ linum)
   if not ok then return $ Left loc else do
-    textln <- getAbsolute (Absolute $ lineToIndex linum) >>= getElemIndex
+    textln <- absoluteIndex (Absolute $ lineToIndex linum) >>= getElemIndex
     let (ok, i) = testCharIndex textln $ loc ^. charIndex
     return $ Right (textln, (ok, loc & charIndex .~ i))
 
@@ -2390,7 +1796,7 @@ currentLineNumber
      , Show tags --DEBUG
      )
   => editor tags m (Absolute LineIndex)
-currentLineNumber = liftEditText $ indexToLine <$> getElemCountFrom Before
+currentLineNumber = liftEditText $ indexToLine <$> modCount Before id
 
 -- | Get the current column number of the cursor.
 currentColumnNumber
@@ -2398,7 +1804,7 @@ currentColumnNumber
      , Show tags --DEBUG
      )
   => editor tags m (Absolute CharIndex)
-currentColumnNumber = liftEditLine $ indexToChar <$> getElemCountFrom Before
+currentColumnNumber = liftEditLine $ indexToChar <$> modCount Before id
 
 -- | Get the current cursor position. This function is identical to 'getPosition'.
 currentTextLocation
@@ -2425,9 +1831,9 @@ copyLineEditorText
 copyLineEditorText = liftEditLine copyLineEditor'
 
 -- | Returns 'True' if the given @'Absolute' 'CharIndex'@ value refers to any character after the
--- final non-line-breaking character in the current line, i.e. it points to a line-breaking
--- character or at some point beyond it. If there are no line breaking characters on the current
--- line, this function always returns 'False'.
+-- final non-line-breaking character in the current line, i.e. it points to any of the line-breaking
+-- characters. If there are no line breaking characters on the current line, this function always
+-- returns 'False'.
 pointContainsLineBreak
   :: (MonadEditLine editor, MonadIO (editor tags m), MonadIO m
      , Show tags --DEBUG
@@ -2435,7 +1841,7 @@ pointContainsLineBreak
   => Absolute CharIndex -> editor tags m Bool
 pointContainsLineBreak pt = liftEditLine $ do
   lbrk  <- use cursorBreakSize
-  count <- getElemCount
+  (Relative count) <- countDefined
   return $ lbrk /= 0 && charToIndex pt > count - fromIntegral lbrk
 
 -- | Create a 'TextLine' by copying the characters relative to the cursor.
@@ -2462,9 +1868,8 @@ copyCharsToEnd
      , Show tags --DEBUG
      )
   => RelativeToCursor -> EditLine tags m (TextLine tags)
-copyCharsToEnd rel =
-  (case rel of { Before -> negate; After -> id; }) <$> getElemCountFrom rel >>=
-  copyChars . countToChar  
+copyCharsToEnd rel = modCount rel id >>= copyChars . countToChar .
+  case rel of { Before -> negate; After -> id; }
 
 -- | Create a 'TextLine' by copying the the characters in the given range from the line under the
 -- cursor.
@@ -2472,12 +1877,15 @@ copyCharsRange
   :: (MonadIO m
      , Show tags --DEBUG
      )
-  => Absolute CharIndex -> Relative CharIndex -> EditLine tags m (TextLine tags)
-copyCharsRange i count = do
-  vec <- liftIO . UVec.freeze =<<
-    copyRegionChk (Absolute $ charToIndex i) (Relative $ charToCount count)
-  break <- pointContainsLineBreak $
-    (\ (Absolute i, Relative count) -> Absolute $ i + count) (i, count)
+  => Absolute CharIndex -> Absolute CharIndex -> EditLine tags m (TextLine tags)
+copyCharsRange from to = do
+  (from, to) <- (,) <$> validateIndex from <*> validateIndex to
+  (from, to) <- pure (min from to, max from to)
+  break <- pointContainsLineBreak to
+  to    <- if not break then pure to else do
+    (Relative count) <- countDefined
+    return $ indexToChar $ count - 1
+  vec   <- copyRegion (charToIndex from) (charToIndex to) >>= liftIO . UVec.freeze
   tags  <- use lineEditorTags
   lbrk  <- use cursorBreakSize
   return TextLine
@@ -2503,7 +1911,7 @@ getLineIndex
      , Show tags --DEBUG
      )
   => Absolute LineIndex -> editor tags m (TextLine tags)
-getLineIndex i = liftEditText $ getAbsoluteChk (Absolute $ lineToIndex i) >>= getElemIndex
+getLineIndex i = liftEditText $ absoluteIndexChk (Absolute $ lineToIndex i) >>= getElemIndex
 
 -- | Write a 'TextLine' (as produced by 'copyLineEditorText' or getLineIndex') to an @('Absolute'
 -- 'LineIndex')@ address.
@@ -2513,7 +1921,7 @@ putLineIndex
      )
   => Absolute LineIndex -> TextLine tags -> editor tags m ()
 putLineIndex i line = liftEditText $
-  getAbsoluteChk (Absolute $ lineToIndex i) >>= flip putElemIndex line
+  absoluteIndexChk (Absolute $ lineToIndex i) >>= flip putElemIndex line
 
 -- | Replace the content in the 'bufferLineEditor' with the content in the given 'TextLine'. Pass
 -- an integer value indicating where the cursor position should be set. This function does not
@@ -2664,7 +2072,7 @@ bufferLineCount
      , Show tags --DEBUG
      )
   => editor tags m (Relative LineIndex)
-bufferLineCount = liftEditText $ countToLine <$> getElemCount
+bufferLineCount = liftEditText $ countToLine <$> countDefined
 
 -- | Returns a boolean indicating whether there is no content in the current buffer.
 bufferIsEmpty
@@ -2696,10 +2104,10 @@ modifyColumn
   -> editor tags m (Absolute CharIndex)
 modifyColumn f = liftEditLine $ do
   oldch  <- currentColumnNumber
-  weight <- getElemCount
+  weight <- countDefined
   lbrksz <- fromIntegral <$> use cursorBreakSize
   shiftCursor $ Relative $ charToCount $ f oldch $ indexToChar $ weight - lbrksz
-  indexToChar <$> getElemCountFrom Before
+  indexToChar <$> indexNearCursor Before
 
 -- | Usually when you move the cursor to a different line using 'gotoPosition', 'gotoLine',
 -- 'moveByLine', or 'moveCursor', you expect the content of the 'LineEditor' to remain on the
@@ -2860,8 +2268,8 @@ gotoLine
   => Absolute LineIndex -> editor tags m (Absolute LineIndex)
 gotoLine ln0 = liftEditText $ do
   let ln = lineToIndex ln0
-  cur   <- getElemCountFrom Before
-  count <- getElemCount
+  cur   <- indexNearCursor Before
+  count <- countDefined
   i <- moveByLine $ countToLine $ max 0 (min ln count) - cur
   use bufferTargetCol >>= gotoChar
   return i
@@ -2921,7 +2329,7 @@ overwriteAtCursor rel concatTags line = case line of
    } -> do
     let myname = "overwriteAtCursor"
     modCount rel $ const 0 -- this "deletes" the chars Before/After the cursor
-    count <- getElemCount
+    count <- countDefined
     alloc <- getAllocSize
     let linelen  = UVec.length line
     let adjusted = linelen - case rel of { Before -> fromIntegral lbrksz; After -> 0; }
@@ -2961,14 +2369,14 @@ deleteChars req@(TextCursorSpan n) =
         }
   in liftEditLine $
   if n < 0 then do -- TODO: make this code less copy-pastey
-    before <- getElemCountFrom Before
+    before <- indexNearCursor Before
     let count = negate $ min before $ abs n 
     modCount Before $ const $ before + count
     when (count /= 0) $ lineEditorIsClean .= False
     done count
   else if n > 0 then do
     lbrksz <- fromIntegral <$> use cursorBreakSize
-    after  <- getElemCountFrom After
+    after  <- indexNearCursor After
     let count = negate $ min n $ max 0 $ after - lbrksz
     modCount After $ const $ after + count
     when (count /= 0) $ lineEditorIsClean .= False
@@ -3430,14 +2838,14 @@ instance
   , Show tags --DEBUG
   ) => RelativeToAbsoluteCursor LineIndex (EditText tags m) where
   relativeToAbsolute = liftEditText .
-    fmap (indexToLine . (\ (Absolute i) -> i)) . getRelToAbs . Relative . lineToCount
+    relativeIndex . fmap lineToCount >=> fmap (fmap indexToLine) . absoluteIndex
 
 instance
   (MonadIO m
   , Show tags --DEBUG
   ) => RelativeToAbsoluteCursor CharIndex (EditLine tags m) where
   relativeToAbsolute = liftEditLine .
-    fmap (indexToChar . (\ (Absolute i) -> i)) . getRelToAbs . Relative . charToCount
+    relativeIndex . fmap charToCount >=> fmap (fmap indexToChar) . absoluteIndex
 
 ----------------------------------------------------------------------------------------------------
 
