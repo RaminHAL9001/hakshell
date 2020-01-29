@@ -7,7 +7,7 @@ module Hakshell.GapBuffer
     VecIndex(..), VecLength(..), indexAfterRange, indexAtRangeEnd,
     Relative(..), RelativeToCursor(..), relative, unwrapRelative,
     Absolute(..), absoluteIndex, indexToAbsolute,
-    MonadEditVec(..), MonadMutateVec(..), getVector,
+    MonadEditVec(..), MonadGapBuffer(..), getVector,
     indexNearCursor, cursorIndex, cursorAtEnd, relativeIndex, guardVecIndex,
     countOnCursor, countDefined, countUndefined,
     getVoid, sliceFromCursor, sliceBetween, safeSliceBetween, withVoidSlice, getSlice,
@@ -332,7 +332,7 @@ class Monad m => MonadEditVec vec m | m -> vec where
   -- equivalent to the vector length value.
   getCursorIsDefined :: m Bool
 
-class MonadEditVec vec m => MonadMutateVec vec m | m -> vec where
+class MonadEditVec vec m => MonadGapBuffer vec m | m -> vec where
   nullElem  :: vec ~ v elem => m elem
   newVector :: VecLength -> m vec
   setCursorIsDefined :: Bool -> m ()
@@ -507,7 +507,7 @@ withFullSlices f = evalSliceSafely $ join $ f <$> getLoSlice <*> getHiSlice
 -- if the cursor would be out of bounds. Once the continuation function completes, restore the prior
 -- state and return the new vector.
 withNewVector
-  :: (MonadIO m, GMVec.MVector vec elem, MonadMutateVec (vec RealWorld elem) m)
+  :: (MonadIO m, GMVec.MVector vec elem, MonadGapBuffer (vec RealWorld elem) m)
   => VecLength -> SafeEvalSlice m () -> m (vec RealWorld elem)
 withNewVector size f = do
   oldvec <- modVector id
@@ -526,7 +526,7 @@ withNewVector size f = do
 -- invalid elements. It is usually expected that the mutable vector will be frozen by the function
 -- which called 'copyRegion'.
 copyRegion
-  :: (MonadIO m, GMVec.MVector vec elem, MonadMutateVec (vec RealWorld elem) m)
+  :: (MonadIO m, GMVec.MVector vec elem, MonadGapBuffer (vec RealWorld elem) m)
   => VecIndex -> VecIndex -> m (vec RealWorld elem)
 copyRegion from to = withRegion from to $ \ oldLo oldHi -> lift $ do
   withNewVector (sliceSize GMVec.length oldLo + sliceSize GMVec.length oldHi) $ lift $ do
@@ -564,7 +564,7 @@ getElemIndex i =
 
 -- | Put an element at the cursor. This function evaluates (modCursorIsDefined $ const True).
 putElem
-  :: (MonadIO m, MonadMutateVec (vec RealWorld elem) m, GMVec.MVector vec elem
+  :: (MonadIO m, MonadGapBuffer (vec RealWorld elem) m, GMVec.MVector vec elem
      , Show elem --DEBUG
      )
   => elem -> m ()
@@ -575,7 +575,7 @@ putElem elem = do
 -- | Get an element from the cursor. If the element is not defined ((modCursorIsDefined id) returns
 -- false), an exception is thrown.
 getElem
-  :: (MonadIO m, MonadMutateVec (vec RealWorld elem) m, GMVec.MVector vec elem
+  :: (MonadIO m, MonadGapBuffer (vec RealWorld elem) m, GMVec.MVector vec elem
      , Show elem --DEBUG
      )
   => m elem
@@ -585,7 +585,7 @@ getElem = do
 
 -- | Sets the element under the cursor to an undefined value.
 delElem
-  :: (MonadIO m, MonadMutateVec (vec RealWorld elem) m, GMVec.MVector vec elem
+  :: (MonadIO m, MonadGapBuffer (vec RealWorld elem) m, GMVec.MVector vec elem
      , Show elem --DEBUG
      )
   => m ()
@@ -612,7 +612,7 @@ minPow2ScaledSize oldsiz newsiz = head $ dropWhile (<= newsiz) $ iterate (* 2) $
 -- constructor. The new buffer is ONLY allocated and returned; the content of the current buffer is
 -- NOT copied, the current buffer is not replaced.
 prepLargerVector
-  :: (MonadMutateVec (vec RealWorld elem) m, GMVec.MVector vec elem)
+  :: (MonadGapBuffer (vec RealWorld elem) m, GMVec.MVector vec elem)
   => VecLength -> m (Maybe (vec RealWorld elem))
 prepLargerVector newsiz = do
   oldsiz <- getAllocSize
@@ -624,7 +624,7 @@ prepLargerVector newsiz = do
 -- then copy the elements from the current vector to the new vector, and then replace the current
 -- vector with the new one.
 growVector
-  :: (MonadIO m, MonadMutateVec (vec RealWorld elem) m, GMVec.MVector vec elem)
+  :: (MonadIO m, MonadGapBuffer (vec RealWorld elem) m, GMVec.MVector vec elem)
   => VecLength -> m ()
 growVector increase = if increase <= 0 then return () else
   countDefined >>= \ count -> prepLargerVector (count <> increase) >>= \ case
@@ -637,7 +637,7 @@ growVector increase = if increase <= 0 then return () else
 -- | Push a single element to the index 'Before' (currently on) the cursor, or the index 'After' the
 -- cursor, and then shift the cursor to point to the pushed element.
 pushElem
-  :: (MonadIO m, MonadMutateVec (vec RealWorld elem) m, GMVec.MVector vec elem
+  :: (MonadIO m, MonadGapBuffer (vec RealWorld elem) m, GMVec.MVector vec elem
      , Show elem --DEBUG
      )
   => RelativeToCursor -> elem -> m ()
@@ -648,7 +648,7 @@ pushElem rel elem = growVector 1 >> modCount rel (+ 1) >>= \ i -> case rel of
 -- | Push a vector of elements starting at the index 'Before' (currently on) the cursor, or the
 -- index 'After' the cursor.
 pushElemVec
-  :: (MonadIO m, GVec.Vector vec elem, MonadMutateVec (GVec.Mutable vec RealWorld elem) m
+  :: (MonadIO m, GVec.Vector vec elem, MonadGapBuffer (GVec.Mutable vec RealWorld elem) m
      , Show elem --DEBUG
      )
   => RelativeToCursor -> vec elem -> m ()
@@ -662,7 +662,7 @@ pushElemVec rel src = do
 -- | Pop a single element from the index 'Before' (currently on) the cursor, or from the index 'After'
 -- the cursor, and then shift the cursor to point to the pushed element.
 popElem
-  :: (MonadIO m, MonadMutateVec (vec RealWorld elem) m, GMVec.MVector vec elem
+  :: (MonadIO m, MonadGapBuffer (vec RealWorld elem) m, GMVec.MVector vec elem
      , Show elem --DEBUG
      )
   => RelativeToCursor -> m elem
@@ -680,7 +680,7 @@ popElem = \ case
 -- like to perform bounds checking, if so an exception will be raised if the line index goes out of
 -- bounds.
 shiftCursor
-  :: (MonadIO m, MonadMutateVec (GVec.Mutable vec RealWorld elem) m,
+  :: (MonadIO m, MonadGapBuffer (GVec.Mutable vec RealWorld elem) m,
       GMVec.MVector (GVec.Mutable vec) elem,
       GVec.Vector vec elem
      , Show elem --DEBUG
@@ -713,7 +713,7 @@ shiftCursor count0 =
 
 -- | Copy the current mutable buffer vector to an immutable vector.
 freezeVector
-  :: (MonadIO m, GVec.Vector vec elem, MonadMutateVec (GVec.Mutable vec RealWorld elem) m)
+  :: (MonadIO m, GVec.Vector vec elem, MonadGapBuffer (GVec.Mutable vec RealWorld elem) m)
   => m (vec elem)
 freezeVector = do
   oldvec <- getVector
