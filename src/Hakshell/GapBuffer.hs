@@ -10,9 +10,9 @@ module Hakshell.GapBuffer
     MonadEditVec(..), MonadMutateVec(..), getVector,
     indexNearCursor, cursorIndex, cursorAtEnd, relativeIndex, guardVecIndex,
     countOnCursor, countDefined, countUndefined,
-    getVoid, sliceFromCursor, sliceBetween, withVoidSlice, getSlice,
+    getVoid, sliceFromCursor, sliceBetween, safeSliceBetween, withVoidSlice, getSlice,
     UnsafeSlice, SafeEvalSlice, SafeSliceEvaluator,
-    withRegion, copyRegion,
+    withFullSlices, withRegion, withNewVector, copyRegion,
     putElemIndex, getElemIndex, putElem, getElem, delElem,
     pushElem, pushElemVec, popElem, shiftCursor,
     minPow2ScaledSize, prepLargerVector, growVector, freezeVector, copyVec,
@@ -66,28 +66,6 @@ checkAssertion = \ case { Info{} -> True; Assertion _ ok -> ok; }
 
 reportAssertion :: Assertion -> [String]
 reportAssertion = \ case { Info msg -> [msg]; Assertion msg ok -> if ok then [] else [msg]; }
-
-asrtGSlice
-  :: (vec -> Int)
-  -> (Int -> Int -> vec -> vec)
-  -> (Int -> Int -> vec -> vec)
-  -> UseSafeOp -> FunctionName
-  -> LabeledValue VecIndex -> LabeledValue VecLength -> LabeledValue vec -> vec
-asrtGSlice length safe unsafe safety funcName (ilbl, VecIndex i) (sizlbl, VecLength siz) (veclbl, vec) =
-  let len = ("(length "++veclbl++")", length vec) in
-  let top = ( "(indexAfterRange "++ ilbl ++ ' ' : sizlbl ++ ")", i + siz) in
-  assert funcName
-    [asrtZero `le` (ilbl, i), (ilbl, i) `le` len, asrtZero `le` top, top `le` len]
-    ((if not unsafeMode || safety == SafeOp then safe else unsafe) i siz vec)
-{-# INLINE asrtGSlice #-}
-
--- TODO: wrap this function up in a MonadEditVec function
-asrtMSlice
-  :: (GMVec.MVector vec elem)
-  => UseSafeOp -> FunctionName
-  -> LabeledValue VecIndex -> LabeledValue VecLength -> LabeledValue (vec st elem) -> vec st elem
-asrtMSlice = asrtGSlice GMVec.length GMVec.slice GMVec.unsafeSlice
-{-# INLINE asrtMSlice #-}
 
 -- TODO: wrap this function up in a MonadEditVec function
 asrtGReadWrite
@@ -464,8 +442,8 @@ sliceBetween from = evalSliceSafely . sliceVectorSafe from . indexDistance from 
 safeSliceBetween
   :: MonadEditVec vec m
   => VecIndex -> VecIndex
-  -> (UnsafeSlice vec -> SafeEvalSlice m ())
-  -> m ()
+  -> (UnsafeSlice vec -> SafeEvalSlice m a)
+  -> m a
 safeSliceBetween from to = evalSliceSafely . ((sliceVectorSafe from $ indexDistance from to) >>=)
 
 -- | Make a slice of the void region of the buffer (the contiguous region of invalid elements after
@@ -502,8 +480,8 @@ getHiSlice = lift (countCursor After) >>= sliceFromCursor
 withRegion
   :: MonadEditVec vec m
   => VecIndex -> VecIndex
-  -> (UnsafeSlice vec -> UnsafeSlice vec -> SafeEvalSlice m ())
-  -> m ()
+  -> (UnsafeSlice vec -> UnsafeSlice vec -> SafeEvalSlice m a)
+  -> m a
 withRegion from0 to0 f =
   cursorIndex >>= \ cur ->
   absoluteIndex (min from0 to0) >>= \ from ->
@@ -523,6 +501,26 @@ withFullSlices
   -> m a
 withFullSlices f = evalSliceSafely $ join $ f <$> getLoSlice <*> getHiSlice
 
+-- | Create a new vector, copy the portion of the state tracking the old vector and the cursor
+-- positions onto the stack, then evaluate a continuation function of type @m@ with the new vector
+-- in place. Note that the cursor is not modified when evaluation of the continuation begins, even
+-- if the cursor would be out of bounds. Once the continuation function completes, restore the prior
+-- state and return the new vector.
+withNewVector
+  :: (MonadIO m, GMVec.MVector vec elem, MonadMutateVec (vec RealWorld elem) m)
+  => VecLength -> SafeEvalSlice m () -> m (vec RealWorld elem)
+withNewVector size f = do
+  oldvec <- modVector id
+  before <- modCount Before id
+  after  <- modCount After  id
+  newvec <- newVector size
+  modVector (const newvec)
+  () <- evalSliceSafely f
+  modCount Before (const before)
+  modCount After  (const after )
+  modVector (const oldvec)
+  return newvec
+
 -- | Select a region of valid elements given an index and size values, taking into account the
 -- position of the cursor, and copy the region into a new contiguous mutable vector that contains no
 -- invalid elements. It is usually expected that the mutable vector will be frozen by the function
@@ -530,20 +528,13 @@ withFullSlices f = evalSliceSafely $ join $ f <$> getLoSlice <*> getHiSlice
 copyRegion
   :: (MonadIO m, GMVec.MVector vec elem, MonadMutateVec (vec RealWorld elem) m)
   => VecIndex -> VecIndex -> m (vec RealWorld elem)
-copyRegion from to = do
-  oldvec <- modVector id
-  before <- modCount Before id
-  after  <- modCount After  id
-  newvec <- countDefined >>= newVector
-  withRegion from to $ \ lovec hivec -> lift $ do
-    modVector $ const newvec
-    modCount Before $ const $ sliceSize GMVec.length lovec
-    modCount After  $ const $ sliceSize GMVec.length hivec
-    withFullSlices $ \ newlo newhi -> mutableCopy lovec newlo >> mutableCopy hivec newhi
-  modVector $ const oldvec
-  modCount Before $ const before
-  modCount After  $ const after
-  return newvec
+copyRegion from to = withRegion from to $ \ oldLo oldHi -> lift $ do
+  withNewVector (sliceSize GMVec.length oldLo + sliceSize GMVec.length oldHi) $ lift $ do
+    modCount Before $ const $ sliceSize GMVec.length oldLo
+    modCount After  $ const $ sliceSize GMVec.length oldHi
+    withFullSlices $ \ newLo newHi -> do
+      mutableCopy newLo oldLo
+      mutableCopy newHi oldHi
 
 -- | Write an element to a vector index, overwriting whatever was there before. __WARNING__: there
 -- is no bounds checking.
@@ -741,19 +732,14 @@ copyVec
   :: (GMVec.MVector vector a, PrimMonad m)
   => vector (PrimState m) a
   -> VecLength -> VecLength -> m (vector (PrimState m) a)
-copyVec oldVec0 before0 after0 = do
-  let myname = "copyVec"
-  let oldVec = ("oldVec", oldVec0)
-  let len    = VecLength $ GMVec.length $ snd oldVec
-  let upper  = asrtShow "indexAfterRange 0 (len - after)" $
-                 indexAfterRange 0 $ len - after0
-  let before = asrtShow "before" before0
-  let after  = asrtShow "after"  after0
-  newVec <- (,) "newVec" <$> GMVec.new (fromLength len)
-  when (snd before > 0) $ GMVec.copy
-    (asrtMSlice UnsafeOp myname asrtZero before newVec)
-    (asrtMSlice UnsafeOp myname asrtZero before oldVec)
-  when (snd after  > 0) $ GMVec.copy
-    (asrtMSlice UnsafeOp myname upper after newVec)
-    (asrtMSlice UnsafeOp myname upper after oldVec)
-  return $ snd newVec
+copyVec oldVec (VecLength before) (VecLength after) = do
+  let len = VecLength $ GMVec.length oldVec
+  let (VecIndex upper) = indexAfterRange 0 $ len - VecLength after
+  newVec <- GMVec.new (fromLength len)
+  when (before > 0) $ GMVec.copy
+    (GMVec.unsafeSlice 0 before newVec)
+    (GMVec.unsafeSlice 0 before oldVec)
+  when (after  > 0) $ GMVec.copy
+    (GMVec.unsafeSlice upper after newVec)
+    (GMVec.unsafeSlice upper after oldVec)
+  return newVec
