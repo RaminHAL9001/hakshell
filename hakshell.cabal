@@ -35,6 +35,7 @@ library
   other-modules:
     Paths_hakshell
   default-extensions:
+    DataKinds
     DeriveDataTypeable
     DeriveFunctor
     ExistentialQuantification
@@ -48,9 +49,11 @@ library
     MultiParamTypeClasses
     NoMonomorphismRestriction
     OverloadedStrings
+    PolyKinds
     RankNTypes
     ScopedTypeVariables
     StandaloneDeriving
+    TypeFamilies
   ghc-options:
     -Wall -fno-warn-name-shadowing -fno-warn-unused-do-bind -O0
   build-depends:
@@ -80,6 +83,7 @@ test-suite HakshellTests
   other-modules:
     Paths_hakshell
   default-extensions:
+    DataKinds
     DeriveDataTypeable
     DeriveFunctor
     ExistentialQuantification
@@ -93,9 +97,11 @@ test-suite HakshellTests
     MultiParamTypeClasses
     NoMonomorphismRestriction
     OverloadedStrings
+    PolyKinds
     RankNTypes
     ScopedTypeVariables
     StandaloneDeriving
+    TypeFamilies
   ghc-options:
      -Wall -fno-warn-name-shadowing -fno-warn-unused-do-bind -threaded
   build-depends:
