@@ -17,7 +17,8 @@ module Hakshell.GapBuffer
     pushElem, pushElemVec, popElem, shiftCursor,
     minPow2ScaledSize, prepLargerVector, growVector, freezeVector, copyVec,
     ----
-    GapBuffer(..), GapBufferState(..), BufferError(..),
+    GapBuffer(..), GapBufferState(..), BufferError(..), bufferError,
+    IIBuffer(..), IIBufferState(..),
   ) where
 
 import           Control.Arrow
@@ -758,6 +759,11 @@ data BufferError vec
   | BufferIndexBounds vec VecIndex
   | BufferIndexRange  vec VecIndex VecLength
 
+bufferError
+  :: (MonadError (BufferError vec) m, MonadEditVec vec m)
+  => (vec -> a -> BufferError vec) -> a -> m void
+bufferError constr a = constr <$> modVector id <*> pure a >>= throwError
+
 ----------------------------------------------------------------------------------------------------
 
 data GapBufferState vec
@@ -822,5 +828,54 @@ instance (PrimMonad m, GMVec.MVector vec elem, st ~ PrimState m) =>
       GMVec.copy (GMVec.unsafeSlice     0 sizeA newvec) a
       GMVec.copy (GMVec.unsafeSlice sizeA sizeB newvec) b
       return newvec
-    throwLimitErr rel = BufferLimitError <$> use gapBufferVector <*> pure rel >>= throwError
+    throwLimitErr = bufferError BufferLimitError
     getCursorIsDefined = use gapBufferCursorIsDefined
+
+----------------------------------------------------------------------------------------------------
+
+-- | The buffer within is immutable and there is no gap, and it is indexed with a cursor. The "II"
+-- in "IIBuffer" means "indexed immutable."
+data IIBufferState vec
+  = IIBufferState
+    { theIIBufferVector :: !vec
+    , theIIBufferCursor :: !VecLength
+    }
+
+iiBufferVector :: Lens' (IIBufferState vec) vec
+iiBufferVector = lens theIIBufferVector $ \ a b -> a{ theIIBufferVector = b }
+
+iiBufferCursor :: Lens' (IIBufferState vec) VecLength
+iiBufferCursor = lens theIIBufferCursor $ \ a b -> a{ theIIBufferCursor = b }
+
+----------------------------------------------------------------------------------------------------
+
+newtype IIBuffer vec m a
+  = IIBuffer{ unwrapIIBuffer :: ExceptT (BufferError vec) (StateT (IIBufferState vec) m) a }
+  deriving (Functor, Applicative, Monad, MonadIO)
+
+instance Monad m => MonadError (BufferError vec) (IIBuffer vec m) where
+  throwError = IIBuffer . throwError
+  catchError (IIBuffer try) catch = IIBuffer $ catchError try $ unwrapIIBuffer . catch
+
+instance Monad m => MonadState (IIBufferState vec) (IIBuffer vec m) where
+  state = IIBuffer . state
+
+instance MonadTrans (IIBuffer vec) where { lift = IIBuffer . lift . lift; }
+
+instance PrimMonad m => PrimMonad (IIBuffer vec m) where
+  type PrimState (IIBuffer vec m) = PrimState m
+  primitive = lift . primitive
+
+instance (Monad m, GVec.Vector vec elem) => MonadEditVec (vec elem) (IIBuffer (vec elem) m) where
+  getAllocSize = VecLength . GVec.length <$> use iiBufferVector
+  modVector f = iiBufferVector %= f >> use iiBufferVector
+  modCount = \ case
+    Before -> \ f -> iiBufferCursor %= f >> use iiBufferCursor
+    After  -> \ f -> getAllocSize >>= \ siz ->
+      iiBufferCursor %= (siz -) . f . (siz -) >> use iiBufferCursor
+  sliceVector constr (VecIndex i) (VecLength len) = lift $
+    constr . GVec.unsafeSlice i len <$> use iiBufferVector
+  cloneVector = pure
+  appendVectors a b = pure $ a GVec.++ b
+  throwLimitErr = bufferError BufferLimitError
+  getCursorIsDefined = (/= 0) <$> getAllocSize
