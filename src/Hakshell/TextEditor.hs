@@ -81,6 +81,9 @@ module Hakshell.TextEditor
     -- 'deleteCharsWrap' functions.
 
     TextBuffer, newTextBuffer, copyTextBuffer,
+    bufferLineBreaker, bufferDefaultTags,
+
+    module Hakshell.TextEditor.LineBreaker,
 
     -- ** The 'LineEditor' data type.
     --
@@ -247,14 +250,6 @@ module Hakshell.TextEditor
 
     MonadEditText(..), MonadEditLine(..),
 
-    -- * Line Break Behavior
-    --
-    -- The line break behavior of the 'TextBuffer' can be programmed to behave differently from the
-    -- ordinary default behavior of breaking input strings on the @'\n'@ character.
-
-    LineBreaker(..), bufferLineBreaker, lineBreaker, lineBreakPredicate,
-    defaultLineBreak, bufferLineEditor, bufferDefaultTags, lineBreakerNLCR,
-
     -- * Parser Stream
     --
     -- To perform parsing of text, use the "Hakshell.TextEditor.Parser" module. The 'StreamCursor'
@@ -283,6 +278,7 @@ module Hakshell.TextEditor
 
 import           Hakshell.GapBuffer
 import           Hakshell.String
+import           Hakshell.TextEditor.LineBreaker
 
 import           Control.Arrow
 import           Control.Concurrent.MVar
@@ -325,9 +321,18 @@ iter2way from to =
 
 ----------------------------------------------------------------------------------------------------
 
-class Monad m => MonadIndexError idx m | m -> idx where
-  throwIndexErr :: idx -> m void
-  throwCountErr :: idx -> m void
+data TextEditError
+  = BufferIsEmpty
+  | TextEditError       !StrictBytes
+  | EndOfLineBuffer     !RelativeToCursor
+  | EndOfCharBuffer     !RelativeToCursor
+  | LineIndexOutOfRange !(Absolute LineIndex)
+  | LineCountOutOfRange !(Relative LineIndex)
+  | CharIndexOutOfRange !(Absolute CharIndex)
+  | CharCountOutOfRange !(Relative CharIndex)
+  deriving (Eq, Ord, Show)
+
+----------------------------------------------------------------------------------------------------
 
 -- | This function checks if a 'LineIndex' is valid. It first checks if the given index is an
 -- extreme value, 'minBound' or 'maxBound', and returns an in-bounds index at the begninning or end
@@ -672,14 +677,10 @@ instance MonadIO m => MonadEditVec (MVec.IOVector (TextLine tags)) (EditText tag
   getCursorIsDefined = use lineCursorIsDefined
   throwLimitErr = throwError . EndOfLineBuffer
 
-instance MonadIO m => MonadMutateVec (MVec.IOVector (TextLine tags)) (EditText tags m) where
+instance MonadIO m => MonadGapBuffer (MVec.IOVector (TextLine tags)) (EditText tags m) where
   nullElem = pure TextLineUndefined
   newVector (VecLength siz) = nullElem >>= liftIO . MVec.replicate siz
   setCursorIsDefined = assign lineCursorIsDefined
-
-instance Monad m => MonadIndexError LineIndex (EditText tags m) where
-  throwIndexErr = throwError . LineIndexOutOfRange . Absolute
-  throwCountErr = throwError . LineCountOutOfRange . Relative
 
 instance
   (MonadIO m
@@ -752,10 +753,6 @@ instance MonadIO m => MonadEditVec (MVec.IOVector (TextLine tags)) (FoldLines r 
   modVector          = foldLiftEditText . modVector
   modCount dir       = foldLiftEditText . modCount dir
   throwLimitErr      = foldLiftEditText . throwLimitErr
-
-instance Monad m => MonadIndexError LineIndex (FoldLines r fold tags m) where
-  throwIndexErr      = foldLiftEditText . throwIndexErr
-  throwCountErr      = foldLiftEditText . throwCountErr
 
 foldLiftEditText :: Monad m => EditText tags m a -> FoldLines r fold tags m a
 foldLiftEditText = FoldLines . lift . lift . lift
@@ -889,10 +886,6 @@ instance MonadIO m => MonadEditVec (MVec.IOVector (TextLine tags)) (FoldMapLines
   modCount dir       = foldMapLiftEditText . modCount dir
   throwLimitErr      = foldMapLiftEditText . throwLimitErr
 
-instance Monad m => MonadIndexError LineIndex (FoldMapLines r fold tags m) where
-  throwIndexErr      = foldMapLiftEditText . throwIndexErr
-  throwCountErr      = foldMapLiftEditText . throwCountErr
-
 foldMapLiftEditText :: Monad m => EditText tags m a -> FoldMapLines r fold tags m a
 foldMapLiftEditText = FoldMapLines . lift . lift . lift
 
@@ -970,14 +963,10 @@ instance MonadIO m => MonadEditVec (UMVec.IOVector Char) (EditLine tags m) where
   getCursorIsDefined = use charCursorIsDefined
   throwLimitErr = throwError . EndOfCharBuffer
 
-instance MonadIO m => MonadMutateVec (UMVec.IOVector Char) (EditLine tags m) where
+instance MonadIO m => MonadGapBuffer (UMVec.IOVector Char) (EditLine tags m) where
   nullElem = pure '\0'
   newVector (VecLength siz) = nullElem >>= liftIO . UMVec.replicate siz
   setCursorIsDefined = assign charCursorIsDefined
-
-instance Monad m => MonadIndexError CharIndex (EditLine tags m) where
-  throwIndexErr = throwError . CharIndexOutOfRange . Absolute
-  throwCountErr = throwError . CharCountOutOfRange . Relative
 
 instance
   (MonadIO m
@@ -1147,41 +1136,6 @@ data TextBufferState tags
     , theBufferTargetCol     :: !(Absolute CharIndex)
       -- ^ When moving the cursor up and down the 'TextBuffer' (e.g. using 'gotoPosition'), the
       -- cursor should generally remain at the same character column position.
-    }
-
-data TextEditError
-  = BufferIsEmpty
-  | TextEditError       !StrictBytes
-  | EndOfLineBuffer     !RelativeToCursor
-  | EndOfCharBuffer     !RelativeToCursor
-  | LineIndexOutOfRange !(Absolute LineIndex)
-  | LineCountOutOfRange !(Relative LineIndex)
-  | CharIndexOutOfRange !(Absolute CharIndex)
-  | CharCountOutOfRange !(Relative CharIndex)
-  deriving (Eq, Ord, Show)
-
--- | A pair of functions used to break strings into lines. This function is called every time a
--- string is transferred from 'theBufferLineEditor' to to 'theLinesAbove' or 'theLinesBelow' to ensure
--- all strings entered into a buffer have no more than one line terminating character sequence at
--- the end of them.
---
--- If you choose to use your own 'LineBreaker' function, be sure that the function obeys this law:
---
--- @
--- 'Prelude.concat' ('lineBreakerNLCR' str) == str
--- @
-data LineBreaker
-  = LineBreaker
-    { theLineBreakPredicate :: Char -> Bool
-      -- ^ This function is called by 'insertChar' to determine if the 'bufferLineEditor' should be
-      -- terminated.
-    , theLineBreaker :: String -> [(String, String)]
-      -- ^ This function scans through a string finding character sequences that delimit the end of
-      -- a line of text. For each returned tuple, the first element of the tuple should be a string
-      -- without line breaks, the second element should contain a string with only line breaks, or
-      -- an empty string if the string was not terminated with a line break.
-    , theDefaultLineBreak :: !CharVector
-      -- ^ This defines the default line break to be used by the line breaking function.
     }
 
 ----------------------------------------------------------------------------------------------------
@@ -1647,24 +1601,6 @@ getUnitCount = liftEditText $ lineEditorUnitCount <$> use bufferLineEditor
 --      , theLineEditorTags      = theTextLineTags line
 --      }
 
--- | This is the default line break function. It will split the line on the character sequence
--- @"\\n"@, or @"\\r"@, or @"\\n\\r"@, or @"\\r\\n"@. The line terminators must be included at the
--- end of each broken string, so that the rule that the law @'Prelude.concat' ('theLineBreaker'
--- 'lineBreakerNLCR' str) == str@ is obeyed.
-lineBreakerNLCR :: LineBreaker
-lineBreakerNLCR = LineBreaker
-  { theLineBreakPredicate = nlcr
-  , theLineBreaker = lines
-  , theDefaultLineBreak = UVec.fromList "\n"
-  } where
-    nlcr c = c == '\n' || c == '\r'
-    lines  = break nlcr >>> \ case
-      (""  , "") -> []
-      (line, "") -> [(line, "")]
-      (line, '\n':'\r':more) -> (line, "\n\r") : lines more
-      (line, '\r':'\n':more) -> (line, "\r\n") : lines more
-      (line, c:more)         -> (line, [c])    : lines more
-
 -- Not for export: this is only used to set empty lines in the buffer.
 bufferDefaultLine :: Lens' (TextBufferState tags) (TextLine tags)
 bufferDefaultLine = lens theBufferDefaultLine $ \ a b -> a{ theBufferDefaultLine = b }
@@ -1688,20 +1624,6 @@ bufferDefaultTags = bufferDefaultLine . textLineTags
 -- @
 bufferLineBreaker :: Lens' (TextBufferState tags) LineBreaker
 bufferLineBreaker = lens theBufferLineBreaker $ \ a b -> a{ theBufferLineBreaker = b }
-
--- | This function is called by 'insertChar' to determine if the 'bufferLineEditor' should be
--- terminated.
-lineBreakPredicate :: Lens' LineBreaker (Char -> Bool)
-lineBreakPredicate = lens theLineBreakPredicate $ \ a b -> a{ theLineBreakPredicate = b }
-
--- | This function scans through a string finding character sequences that delimit the end of a line
--- of text.
-lineBreaker :: Lens' LineBreaker (String -> [(String, String)])
-lineBreaker = lens theLineBreaker $ \ a b -> a{ theLineBreaker = b }
-
--- | This defines the default line break to be used by the line breaking function.
-defaultLineBreak :: Lens' LineBreaker CharVector
-defaultLineBreak = lens theDefaultLineBreak $ \ a b -> a{ theDefaultLineBreak = b }
 
 -- Not for export: requires correct accounting of line numbers to avoid segment faults.
 linesAboveCursor :: Lens' (TextBufferState tags) VecLength
