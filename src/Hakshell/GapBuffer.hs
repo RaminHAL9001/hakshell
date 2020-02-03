@@ -18,6 +18,7 @@ module Hakshell.GapBuffer
     minPow2ScaledSize, prepLargerVector, growVector, freezeVector, copyVec,
     ----
     GapBuffer(..), GapBufferState(..), BufferError(..), bufferError,
+    runGapBufferNew, runGapBuffer,
     IIBuffer(..), IIBufferState(..),
   ) where
 
@@ -794,14 +795,18 @@ newtype GapBuffer vec m a
     { unwrapGapBuffer ::
         ExceptT (BufferError vec) (StateT (GapBufferState vec) m) a
     }
-  deriving (Functor, Applicative, Monad, MonadIO)
+  deriving
+    ( Functor, Applicative, Monad, MonadIO,
+      MonadState (GapBufferState vec),
+      MonadError (BufferError vec)
+    )
 
-instance Monad m => MonadError (BufferError vec) (GapBuffer vec m) where
-  throwError = GapBuffer . throwError
-  catchError (GapBuffer try) catch = GapBuffer $ catchError try $ unwrapGapBuffer . catch
-
-instance Monad m => MonadState (GapBufferState vec) (GapBuffer vec m) where
-  state = GapBuffer . state
+--instance Monad m => MonadError (BufferError vec) (GapBuffer vec m) where
+--  throwError = GapBuffer . throwError
+--  catchError (GapBuffer try) catch = GapBuffer $ catchError try $ unwrapGapBuffer . catch
+--
+--instance Monad m => MonadState (GapBufferState vec) (GapBuffer vec m) where
+--  state = GapBuffer . state
 
 instance MonadTrans (GapBuffer vec) where { lift = GapBuffer . lift . lift; }
 
@@ -830,6 +835,26 @@ instance (PrimMonad m, GMVec.MVector vec elem, st ~ PrimState m) =>
       return newvec
     throwLimitErr = bufferError BufferLimitError
     getCursorIsDefined = use gapBufferCursorIsDefined
+
+-- | Evaluate a 'GapBuffer' function providing it a new vector with which to instantiate the
+-- 'GapBufferState'.
+runGapBufferNew
+  :: vec -> GapBuffer vec m a
+  -> m (Either (BufferError vec) a, GapBufferState vec)
+runGapBufferNew vec (GapBuffer (ExceptT f)) = runStateT f GapBufferState
+  { theGapBufferVector          = vec
+  , theGapBufferCursorIsDefined = False
+  , theGapBufferBeforeCursor    = 0
+  , theGapBufferAfterCursor     = 0
+  }
+
+-- | Evaluate a 'GapBuffer' using a 'GapBufferState' value from a prior run of a 'GapBuffer'
+-- function.
+runGapBuffer
+  :: GapBuffer vec m a
+  -> GapBufferState vec
+  -> m (Either (BufferError vec) a, GapBufferState vec)
+runGapBuffer (GapBuffer (ExceptT f)) = runStateT f
 
 ----------------------------------------------------------------------------------------------------
 
