@@ -28,6 +28,7 @@ library
     Hakshell.Struct
     Hakshell.System
     Hakshell.TextEditor
+    Hakshell.TextEditor.FoldMap
     Hakshell.TextEditor.LineBreaker
     Hakshell.TextEditor.Parser
     Hakshell.UTFUnit
