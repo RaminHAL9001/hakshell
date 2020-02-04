@@ -456,3 +456,104 @@ forLinesInBuffer = mapLinesInBuffer
 -- 'mapLinesInRange, but takes the 'MapLines' continuation as the final parameter.
 forLines :: Monad m => RelativeToCursor -> MapLines tags m a -> EditText tags m a
 forLines = flip mapLines
+
+----------------------------------------------------------------------------------------------------
+
+-- | This is a read-only folding function, unlikes 'FoldMapLines' or 'MapLines' which can perform
+-- updates to the text in the buffer. 'FoldLines' functions will never change the position of the
+-- text cursor, but you must be sure to call 'flushLineEditor' before evaluating 'foldLines' or
+-- 'foldLinesInRange' if you want the latest updates to the 'LineEditor' to be included in the fold
+-- result.
+newtype FoldLines r fold tags m a
+  = FoldLines
+    { unwrapFoldLines :: ContT r (ExceptT TextEditError (StateT fold (EditText tags m))) a }
+  deriving (Functor, Applicative, Monad, MonadIO)
+
+instance Monad m => MonadState fold (FoldLines r fold tags m) where
+  state = FoldLines . lift . lift . state
+
+instance Monad m => MonadError TextEditError (FoldLines r fold tags m) where
+  throwError = FoldLines . lift . throwError
+  catchError (FoldLines try) catch =
+    FoldLines $ ContT $ \ next ->
+    catchError (runContT try next) $ \ err ->
+    runContT (unwrapFoldLines $ catch err) next
+
+instance Monad m => MonadCont (FoldLines r fold tags m) where
+  callCC f = FoldLines $ callCC $ unwrapFoldLines . f . fmap FoldLines
+
+instance MonadTrans (FoldLines r fold tags) where
+  lift = FoldLines . lift . lift . lift . lift
+
+instance Semigroup a => Semigroup (FoldLines r fold tags m a) where
+  a <> b = (<>) <$> a <*> b
+
+instance Monoid a => Monoid (FoldLines r fold tags m a) where
+  mappend a b = mappend <$> a <*> b
+  mempty = return mempty
+
+instance MonadEditText (FoldLines r fold) where { liftEditText = foldLiftEditText; }
+
+foldLiftEditText :: Monad m => EditText tags m a -> FoldLines r fold tags m a
+foldLiftEditText = FoldLines . lift . lift . lift
+
+-- | Evaluate a 'FoldLines' function to a 'EditText' function without performing any looping.
+runFoldLinesStep :: Monad m => FoldLines a fold tags m a -> fold -> EditText tags m (a, fold)
+runFoldLinesStep (FoldLines f) = runStateT (runExceptT $ runContT f return) >=> \ case
+  (Left err, _   ) -> throwError err
+  (Right  a, fold) -> return (a, fold)
+
+-- | Evaluate a 'FoldLines' function between two @('Absolute' 'LineIndex')@ markers, including the
+-- given line indicies.
+foldLinesInRange
+  :: (MonadIO m
+     , Show tags --DEBUG
+     )
+  => Absolute LineIndex
+  -> Absolute LineIndex
+  -> fold
+  -> ((() -> FoldLines () fold tags m void)
+      -> Absolute LineIndex -> TextLine tags -> FoldLines () fold tags m ())
+  -> EditText tags m fold
+foldLinesInRange from to st fold = do
+  top  <- indexNearCursor Before
+  from <- validateIndex from
+  to   <- validateIndex to
+  let top slice = toIndex $ GMVec.length slice - 1
+  let mid neg start = (start +) . neg . top
+  let runFold = fmap snd . flip runFoldLinesStep st . callCC
+  let runLoop (from, to) slice halt =
+        mapM_ (\ (ln, i) -> getElemIndex i >>= fold halt ln) $
+        zip (iter2way from to) $ (if from <= to then id else flip) iter2way 0 $ top slice
+  let contained _ = runFold . runLoop (from, to)
+  let straddle a b = runFold $ \ halt -> do
+        let (rngA, rngB) = if from <= to
+              then let m = mid  id  from a in ((from, m), (m + 1, to))
+              else let m = mid negate to b in ((to, m), (m - 1, from))
+        runLoop rngA a halt
+        runLoop rngB b halt
+  join $ withRegion contained straddle <$> absoluteIndex from <*> absoluteIndex to
+
+foldLines
+  :: (MonadIO m
+     , Show tags --DEBUG
+     )
+  => Relative LineIndex
+  -> fold
+  -> ((() -> FoldLines () fold tags m void)
+      -> Absolute LineIndex -> TextLine tags -> FoldLines () fold tags m ())
+  -> EditText tags m fold
+foldLines rel fold f = do
+  from <- currentLineNumber
+  let to = shiftAbsolute from rel
+  foldLinesInRange from to fold f
+
+foldLinesInBuffer
+  :: (MonadIO m
+     , Show tags --DEBUG
+     )
+  => fold
+  -> ((() -> FoldLines () fold tags m void)
+      -> Absolute LineIndex -> TextLine tags -> FoldLines () fold tags m ())
+  -> EditText tags m fold
+foldLinesInBuffer = foldLinesInRange minBound maxBound

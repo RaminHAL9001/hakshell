@@ -4,30 +4,33 @@
 -- /n/ is the distance of the cursor movement.
 module Hakshell.GapBuffer
   ( IsIndex(..), IsLength(..), HasOpposite(..),
-    VecIndex(..), VecLength(..), indexAfterRange, indexAtRangeEnd,
+    VecIndex(..), VecLength(..),
+    indexAfterRange, indexAtRangeEnd, indexDistance, distanceFromOrigin,
     Relative(..), RelativeToCursor(..), relative, unwrapRelative,
     Absolute(..), absoluteIndex, indexToAbsolute,
     MonadEditVec(..), MonadGapBuffer(..), getVector,
-    indexNearCursor, cursorIndex, cursorAtEnd, relativeIndex, guardVecIndex,
+    indexNearCursor, cursorIndex, cursorAtEnd, relativeIndex,
+    testIndex, validateIndex,
     countOnCursor, countDefined, countUndefined,
     getVoid, sliceFromCursor, sliceBetween, safeSliceBetween, withVoidSlice, getSlice,
-    UnsafeSlice,
+    UnsafeSlice, safeFreeze, safeClone, mutableCopy, safeCopy, sliceSize,
     withFullSlices, withRegion, withNewVector, copyRegion,
     putElemIndex, getElemIndex, putElem, getElem, delElem,
     pushElem, pushElemVec, popElem, shiftCursor,
     minPow2ScaledSize, prepLargerVector, growVector, freezeVector, copyVec,
     ----
-    GapBuffer(..), GapBufferState(..), BufferError(..), bufferError,
+    GapBuffer(..), GapBufferState(..), BufferError(..),
     runGapBufferNew, runGapBuffer, cloneGapBufferState,
     gapBufferBeforeCursor, gapBufferAfterCursor, gapBufferCursorIsDefined, gapBufferVector,
     IIBuffer(..), IIBufferState(..),
+    iiBufferCursor, iiBufferVector, runIIBuffer, gapBufferLiftIIBuffer,
   ) where
 
 import           Control.Arrow
 import           Control.Lens
 import           Control.Monad.Except
 import           Control.Monad.Primitive
---import           Control.Monad.ST
+import           Control.Monad.ST
 import           Control.Monad.State
 
 --import qualified Data.Vector                 as Vec
@@ -37,7 +40,7 @@ import           Control.Monad.State
 --import qualified Data.Vector.Unboxed         as UVec
 import qualified Data.Vector.Generic         as GVec
 import qualified Data.Vector.Generic.Mutable as GMVec
---import qualified Data.Vector.Generic.New     as GNew
+import qualified Data.Vector.Generic.New     as GNew
 
 ----------------------------------------------------------------------------------------------------
 
@@ -229,6 +232,11 @@ indexAtRangeEnd i0 len = let (VecIndex i) = indexAfterRange i0 len in VecIndex (
 indexDistance :: VecIndex -> VecIndex -> VecLength
 indexDistance (VecIndex a) (VecIndex b) = VecLength $ 1 + abs (subtract a b)
 
+-- | Returng a 'VecLength' indicating the distance the given 'VecIndex' is from the beginning of the
+-- buffer.
+distanceFromOrigin :: VecIndex -> VecLength
+distanceFromOrigin (VecIndex a) = VecLength a
+
 ----------------------------------------------------------------------------------------------------
 
 -- | This is an opaque wrapper which is used to wrap unsafe copies of vectors, these are duplicates
@@ -241,48 +249,51 @@ sliceSize :: (vec -> Int) -> UnsafeSlice vec -> VecLength
 sliceSize length (UnsafeSlice vec) = VecLength $ length vec
 
 safeFreeze
-  :: (MonadIO m, GVec.Vector vec elem)
-  => UnsafeSlice (GVec.Mutable vec RealWorld elem) -> m (vec elem)
-safeFreeze (UnsafeSlice vec) = liftIO (GVec.freeze vec)
+  :: (PrimMonad m, GVec.Vector vec elem)
+  => UnsafeSlice (GVec.Mutable vec (PrimState m) elem) -> m (vec elem)
+safeFreeze (UnsafeSlice vec) = GVec.freeze vec
 
 --mutableClone
---  :: (MonadIO m, GMVec.MVector vec elem)
---  => UnsafeSlice (vec RealWorld elem)
---  -> SafeEvalSlice m (vec RealWorld elem)
+--  :: (PrimMonad m, GMVec.MVector vec elem)
+--  => UnsafeSlice (vec (PrimState m) elem)
+--  -> SafeEvalSlice m (vec (PrimState m) elem)
 --mutableClone (UnsafeSlice vec) = liftIO (GMVec.clone vec)
 
---clone :: GVec.Vector vec elem => (vec elem) -> vec elem
---clone vec = runST (GNew.run (GVec.clone vec) >>= GVec.freeze)
-
-copy
-  :: (MonadIO m, GVec.Vector vec elem)
-  => UnsafeSlice (GVec.Mutable vec RealWorld elem)
-  -> UnsafeSlice (vec elem)
-  -> m ()
-copy (UnsafeSlice mvec) (UnsafeSlice vec) = liftIO (GVec.copy mvec vec)
+safeClone :: GVec.Vector vec elem => UnsafeSlice (vec elem) -> vec elem
+safeClone (UnsafeSlice vec) = runST (GNew.run (GVec.clone vec) >>= GVec.freeze)
 
 -- | The expression @('mutableCopy' a b)@ copies the elements from @b@ into the elements of @a@,
 -- overwriting what was in @a@ before, and leaving @b@ unchanged.
 mutableCopy
-  :: (MonadIO m, GMVec.MVector vec elem)
-  => UnsafeSlice (vec RealWorld elem)
-  -> UnsafeSlice (vec RealWorld elem)
+  :: (PrimMonad m, GMVec.MVector vec elem)
+  => UnsafeSlice (vec (PrimState m) elem)
+  -> UnsafeSlice (vec (PrimState m) elem)
   -> m ()
-mutableCopy (UnsafeSlice a) (UnsafeSlice b) = liftIO (GMVec.copy a b)
+mutableCopy (UnsafeSlice a) (UnsafeSlice b) = GMVec.copy a b
+
+-- | The expression @('mutableCopy' a b)@ copies the elements from an immutable buffer @b@ into the
+-- mutable elements of @a@, overwriting what was in @a@ before. This is similar to 'mutableCopy' but
+-- takes an immutable input vector instead of a mutable one.
+safeCopy
+  :: (PrimMonad m, GVec.Vector vec elem)
+  => UnsafeSlice (GVec.Mutable vec (PrimState m) elem)
+  -> UnsafeSlice (vec elem)
+  -> m ()
+safeCopy (UnsafeSlice to) (UnsafeSlice from) = GVec.copy to from
 
 mutableMove
-  :: (MonadIO m, GVec.Vector vec elem)
-  => UnsafeSlice (GVec.Mutable vec RealWorld elem)
-  -> UnsafeSlice (GVec.Mutable vec RealWorld elem)
+  :: (PrimMonad m, GMVec.MVector vec elem)
+  => UnsafeSlice (vec (PrimState m) elem)
+  -> UnsafeSlice (vec (PrimState m) elem)
   -> m ()
-mutableMove (UnsafeSlice a) (UnsafeSlice b) = liftIO (GMVec.move a b)
+mutableMove (UnsafeSlice a) (UnsafeSlice b) = GMVec.move a b
 
 -- | Creates a deep-copy of a vector with a cursor, in which elements before the cursor are aligned
 -- at the start of the vector, and elements after the cursor are aligned at the end of the vector.
 copyVec
-  :: (GMVec.MVector vec a, PrimMonad m)
-  => vec (PrimState m) a
-  -> VecLength -> VecLength -> m (vec (PrimState m) a)
+  :: (GMVec.MVector vec elem, PrimMonad m)
+  => vec (PrimState m) elem
+  -> VecLength -> VecLength -> m (vec (PrimState m) elem)
 copyVec oldVec (VecLength before) (VecLength after) = do
   let len = VecLength $ GMVec.length oldVec
   let (VecIndex upper) = indexAfterRange 0 $ len - VecLength after
@@ -290,18 +301,6 @@ copyVec oldVec (VecLength before) (VecLength after) = do
   GMVec.copy (GMVec.unsafeSlice     0 before newVec) (GMVec.unsafeSlice     0 before oldVec)
   GMVec.copy (GMVec.unsafeSlice upper after  newVec) (GMVec.unsafeSlice upper after  oldVec)
   return newVec
-
---foldVec
---  :: (GVec.Vector vec elem, Monad m)
---  => (fold -> elem -> m fold) -> fold -> UnsafeSlice (vec elem)
---  -> m fold
---foldVec f st (UnsafeSlice vec) = lift (GVec.foldM' f st vec)
-
---foldMutable
---  :: MonadIO m
---  => (fold -> elem -> m fold) -> fold -> UnsafeSlice (GVec.Mutable vec RealWorld elem)
---  -> m fold
---foldMutable f st (UnsafeSlice vec) = 
 
 ----------------------------------------------------------------------------------------------------
 
@@ -366,7 +365,7 @@ getVector = modVector id
 -- gap in the gap buffer.
 indexNearCursor :: MonadEditVec vec m => RelativeToCursor -> m VecIndex
 indexNearCursor = \ case
-  Before -> indexAfterRange 0 <$> modCount Before id
+  Before -> cursorIndex
   After  -> indexAtRangeEnd 0 <$> (subtract <$> modCount After id <*> getAllocSize)
 
 -- | The number of valid elements under the cursor, this number is either 0 or 1.
@@ -387,7 +386,8 @@ countDefined = (<>) <$> countCursor Before <*> countOnCursor
 countUndefined :: MonadEditVec vec m => m VecLength
 countUndefined = subtract <$> countDefined <*> getAllocSize
 
--- | The cursor position, regardless of whether the element under the cursor is valid.
+-- | The  cursor position,  regardless of whether  the element  under the cursor  is valid.  This is
+-- equivalent to @('indexNearCursor' 'Before'@.
 cursorIndex :: MonadEditVec vec m => m VecIndex
 cursorIndex = indexAfterRange 0 <$> modCount Before id
 
@@ -395,7 +395,7 @@ cursorIndex = indexAfterRange 0 <$> modCount Before id
 -- to be used as a check before evaluating 'popElem' to be sure 'popElem' will not evaluate to an
 -- exception.
 cursorAtEnd
-  :: (Semigroup (m (Relative Int)), MonadEditVec (vec st elem) m, GMVec.MVector vec elem)
+  :: (MonadEditVec (vec st elem) m, GMVec.MVector vec elem)
   => RelativeToCursor -> m Bool
 cursorAtEnd = fmap (0 ==) . flip modCount id
 
@@ -421,10 +421,41 @@ relativeIndex :: (Ord i, IsLength i, MonadEditVec vec m) => i -> m VecIndex
 relativeIndex = (. unwrapRelative) $ \ i ->
   flip indexAfterRange i <$> indexNearCursor (if i <= 0 then Before else After)
 
--- | Throw an error if the 'VecIndex' is out of bounds.
-guardVecIndex :: (MonadError err m, MonadEditVec vec m) => err -> VecIndex -> m VecIndex
-guardVecIndex err i = if i < 0 then throwError err else getAllocSize >>= \ siz ->
-  if i >= indexAfterRange 0 siz then throwError err else return i
+-- | This function computes the normalized, physical 'VecIndex' for any logical index value @i@ as
+-- long as @i@ instantiates the 'IsIndex'. The type @i@ is usually @('Absolute' 'LineIndex')@ when
+-- @m@ is 'Hakshell.TextEditor.TextEdit' or @('Absolute' 'CharIndex')@ when @m@ is
+-- 'Hakshell.TextEditor.LineEdit'. A "normalized" 'VecIndex' value means 'minBound' is clamped to
+-- zero, 'maxBound' is clamped to the top of the state 'GVec.Vector' of @m@.
+--
+-- This function returns a pair of values. The first value returned is a 'Bool' indicating whether
+-- the 'VecIndex' value computed from @i@ is in-bounds with respect to the state 'GVec.Vector' of
+-- @m@ ('False' means it is invalid). The second value returned the normalized 'VecIndex' value
+-- which has been clamped to the nearest in-bounds value for the state 'GVec.Vector' of @m@.
+--
+-- You can ignore the returned 'Bool' value and use this function to simply force values of @i@ to
+-- be in-bounds. You can use the 'validateIndex' function if you want a function which throws an
+-- catchable exception when the value @i@ is out-of-bounds.
+testIndex
+  :: (Ord i, Bounded i, IsIndex i,
+      Monad m, MonadEditVec vec m, MonadError BufferError m
+     )
+  => i -> m (Bool, VecIndex)
+testIndex i = countDefined >>= \ count ->
+  if count == 0         then throwError BufferIsEmpty
+  else if i == minBound then return (True, 0)
+  else if i == maxBound then return (True, indexAtRangeEnd 0 count)
+  else absoluteIndex i >>= \ i -> return $ let top = indexAtRangeEnd 0 count in
+    if i > top then (False, top) else if i < 0 then (False, 0) else (True , i)
+
+-- | This function inspects the 'Bool' value of the pair returned by 'testIndex'. If the 'Bool'
+-- value is 'False', an exception is thrown, otherwise the normalized 'VecIndex' is returned.
+validateIndex
+  :: (Ord i, Bounded i, IsIndex i,
+      Monad m, MonadEditVec vec m, MonadError BufferError m
+     )
+  => i -> m VecIndex
+validateIndex = testIndex >=> \ (ok, i) ->
+  if ok then return i else throwError (BufferIndexBounds i)
 
 -- | Return the starting and ending index of the void region of the buffer, which is the contiguous
 -- region of undefined elements within the buffer.
@@ -464,9 +495,9 @@ safeSliceBetween from to = ((sliceVectorSafe from $ indexDistance from to) >>=)
 -- the cursor). This can be used as the target of a vector copy. If the buffer is full, 'Nothing' is
 -- returned.
 withVoidSlice
-  :: MonadEditVec vec m
+  :: (GMVec.MVector vec elem, MonadEditVec (vec (PrimState m) elem) m)
   => VecLength
-  -> (UnsafeSlice vec -> m ())
+  -> (UnsafeSlice (vec (PrimState m) elem) -> m ())
   -> m Bool
 withVoidSlice count f = getVoid >>= maybe (pure False) cont where
   cont (lo, hi) = do
@@ -521,8 +552,8 @@ withFullSlices f = join $ f <$> getLoSlice <*> getHiSlice
 -- if the cursor would be out of bounds. Once the continuation function completes, restore the prior
 -- state and return the new vector.
 withNewVector
-  :: (MonadIO m, GMVec.MVector vec elem, MonadGapBuffer (vec RealWorld elem) m)
-  => VecLength -> m () -> m (vec RealWorld elem)
+  :: (PrimMonad m, GMVec.MVector vec elem, MonadGapBuffer (vec (PrimState m) elem) m)
+  => VecLength -> m () -> m (vec (PrimState m) elem)
 withNewVector size f = do
   oldvec <- modVector id
   before <- modCount Before id
@@ -540,8 +571,8 @@ withNewVector size f = do
 -- invalid elements. It is usually expected that the mutable vector will be frozen by the function
 -- which called 'copyRegion'.
 copyRegion
-  :: (MonadIO m, GMVec.MVector vec elem, MonadGapBuffer (vec RealWorld elem) m)
-  => VecIndex -> VecIndex -> m (vec RealWorld elem)
+  :: (PrimMonad m, GMVec.MVector vec elem, MonadGapBuffer (vec (PrimState m) elem) m)
+  => VecIndex -> VecIndex -> m (vec (PrimState m) elem)
 copyRegion from to = withRegion from to $ \ oldLo oldHi -> do
   withNewVector (sliceSize GMVec.length oldLo + sliceSize GMVec.length oldHi) $ do
     modCount Before $ const $ sliceSize GMVec.length oldLo
@@ -553,58 +584,44 @@ copyRegion from to = withRegion from to $ \ oldLo oldHi -> do
 -- | Write an element to a vector index, overwriting whatever was there before. __WARNING__: there
 -- is no bounds checking.
 putElemIndex
-  :: (MonadIO m, MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem
-     , Show elem --DEBUG
-     )
+  :: (PrimMonad m, GMVec.MVector vec elem, MonadEditVec (vec (PrimState m) elem) m)
   => VecIndex -> elem -> m ()
-putElemIndex i elem =
-  ( asrtMWrite UnsafeOp "putElemIndex"
-      <$> ((,) "getVector" <$> getVector)
-      <*> pure (asrtShow "i" i)
-      <*> pure elem
-  ) >>= liftIO
+putElemIndex i elem = join $ asrtMWrite UnsafeOp "putElemIndex"
+  <$> ((,) "getVector" <$> getVector)
+  <*> pure (asrtShow "i" i)
+  <*> pure elem
 
 -- | Read an element from a vector index. __WARNING__: there is no bounds checking.
 getElemIndex
-  :: (MonadIO m, MonadEditVec (vec RealWorld elem) m, GMVec.MVector vec elem
-     , Show elem --DEBUG
-     )
+  :: (PrimMonad m, GMVec.MVector vec elem, MonadEditVec (vec (PrimState m) elem) m)
   => VecIndex -> m elem
-getElemIndex i =
-  ( asrtMRead UnsafeOp "getElemIndex"
-      <$> ((,) "getVector" <$> getVector)
-      <*> pure (asrtShow "i" i)
-  ) >>= liftIO
+getElemIndex i = join $ asrtMRead UnsafeOp "getElemIndex"
+  <$> ((,) "getVector" <$> getVector)
+  <*> pure (asrtShow "i" i)
 
 -- | Put an element at the cursor. This function evaluates (modCursorIsDefined $ const True).
 putElem
-  :: (MonadIO m, MonadGapBuffer (vec RealWorld elem) m, GMVec.MVector vec elem
-     , Show elem --DEBUG
-     )
-  => elem -> m ()
-putElem elem = do
-  cursorIndex >>= flip putElemIndex elem
+  :: (PrimMonad m, GMVec.MVector vec elem, MonadGapBuffer (vec (PrimState m) elem) m)
+  => RelativeToCursor -> elem -> m ()
+putElem rel elem = do
+  indexNearCursor rel >>= flip putElemIndex elem
   setCursorIsDefined True
 
 -- | Get an element from the cursor. If the element is not defined ((modCursorIsDefined id) returns
 -- false), an exception is thrown.
 getElem
-  :: (MonadIO m, MonadGapBuffer (vec RealWorld elem) m, GMVec.MVector vec elem
-     , Show elem --DEBUG
-     )
-  => m elem
-getElem = do
+  :: (PrimMonad m, GMVec.MVector vec elem, MonadGapBuffer (vec (PrimState m) elem) m)
+  => RelativeToCursor -> m elem
+getElem rel = do
   defined <- getCursorIsDefined
-  if defined then cursorIndex >>= getElemIndex else throwLimitErr Before
+  if defined then indexNearCursor rel >>= getElemIndex else throwLimitErr Before
 
--- | Sets the element under the cursor to an undefined value.
+-- | Sets the element under the cursor to an undefined value, but does not move the cursor.
 delElem
-  :: (MonadIO m, MonadGapBuffer (vec RealWorld elem) m, GMVec.MVector vec elem
-     , Show elem --DEBUG
-     )
-  => m ()
-delElem = do
-  join $ putElemIndex <$> cursorIndex <*> nullElem
+  :: (PrimMonad m, GMVec.MVector vec elem, MonadGapBuffer (vec (PrimState m) elem) m)
+  => RelativeToCursor -> m ()
+delElem rel = do
+  join $ putElemIndex <$> indexNearCursor rel <*> nullElem
   setCursorIsDefined False
 
 -- | Takes two paramters @oldSize@ and @newSize@. This function finds the minimum power of two
@@ -626,8 +643,8 @@ minPow2ScaledSize oldsiz newsiz = head $ dropWhile (<= newsiz) $ iterate (* 2) $
 -- constructor. The new buffer is ONLY allocated and returned; the content of the current buffer is
 -- NOT copied, the current buffer is not replaced.
 prepLargerVector
-  :: (MonadGapBuffer (vec RealWorld elem) m, GMVec.MVector vec elem)
-  => VecLength -> m (Maybe (vec RealWorld elem))
+  :: (GMVec.MVector vec elem, MonadGapBuffer (vec (PrimState m) elem) m)
+  => VecLength -> m (Maybe (vec (PrimState m) elem))
 prepLargerVector newsiz = do
   oldsiz <- getAllocSize
   if oldsiz >= newsiz then return Nothing else
@@ -638,7 +655,7 @@ prepLargerVector newsiz = do
 -- then copy the elements from the current vector to the new vector, and then replace the current
 -- vector with the new one.
 growVector
-  :: (MonadIO m, MonadGapBuffer (vec RealWorld elem) m, GMVec.MVector vec elem)
+  :: (PrimMonad m, GMVec.MVector vec elem, MonadGapBuffer (vec (PrimState m) elem) m)
   => VecLength -> m ()
 growVector increase = if increase <= 0 then return () else
   countDefined >>= \ count -> prepLargerVector (count <> increase) >>= \ case
@@ -651,53 +668,43 @@ growVector increase = if increase <= 0 then return () else
 -- | Push a single element to the index 'Before' (currently on) the cursor, or the index 'After' the
 -- cursor, and then shift the cursor to point to the pushed element.
 pushElem
-  :: (MonadIO m, MonadGapBuffer (vec RealWorld elem) m, GMVec.MVector vec elem
-     , Show elem --DEBUG
-     )
+  :: (PrimMonad m, GMVec.MVector vec elem, MonadGapBuffer (vec (PrimState m) elem) m)
   => RelativeToCursor -> elem -> m ()
-pushElem rel elem = growVector 1 >> modCount rel (+ 1) >>= \ i -> case rel of
-  Before -> putElem elem
-  After  -> putElemIndex (indexAfterRange 0 i) elem
+pushElem rel elem = growVector 1 >> modCount rel (+ 1) >>
+  indexNearCursor rel >>= flip putElemIndex elem
 
 -- | Push a vector of elements starting at the index 'Before' (currently on) the cursor, or the
 -- index 'After' the cursor.
 pushElemVec
-  :: (MonadIO m, GVec.Vector vec elem, MonadGapBuffer (GVec.Mutable vec RealWorld elem) m
-     , Show elem --DEBUG
+  :: (PrimMonad m, GVec.Vector vec elem,
+      mvec (PrimState m) elem ~ GVec.Mutable vec (PrimState m) elem,
+      MonadGapBuffer (mvec (PrimState m) elem) m
      )
   => RelativeToCursor -> vec elem -> m ()
 pushElemVec rel src = do
-  let len = VecLength $ GVec.length src
+  let len = VecLength $ (case rel of{ Before -> negate; After -> id; }) $ GVec.length src
   growVector len
-  ok <- withVoidSlice (case rel of{ Before -> negate len; After -> len; }) $ \ targ ->
-    modCount rel (+ len) >> copy targ (UnsafeSlice src)
+  ok <- withVoidSlice len $ \ (UnsafeSlice targ) -> modCount rel (+ len) >> GVec.copy targ src
   unless ok $ error $ "pushElemVec: internal error, \"growVector\" failed to create space"
 
 -- | Pop a single element from the index 'Before' (currently on) the cursor, or from the index 'After'
 -- the cursor, and then shift the cursor to point to the pushed element.
 popElem
-  :: (MonadIO m, MonadGapBuffer (vec RealWorld elem) m, GMVec.MVector vec elem
-     , Show elem --DEBUG
-     )
+  :: (PrimMonad m, GMVec.MVector vec elem,
+      MonadError BufferError m,
+      MonadGapBuffer (vec (PrimState m) elem) m)
   => RelativeToCursor -> m elem
-popElem = \ case
-  Before -> getElem <* delElem
-  After  -> do
-    count <- modCount After id
-    if count <= 0 then throwLimitErr After else do
-      siz <- getAllocSize
-      getElemIndex (indexAtRangeEnd (indexAfterRange 0 siz) (negate count))
-        <* modCount After (subtract 1)
+popElem rel = cursorAtEnd rel >>= flip when (throwError $ BufferLimitError rel) >>
+  getElem rel <* delElem rel <* modCount rel (subtract 1)
 
 -- | Move the cursor, which will shift elements around the vector, using a algorithm of O(n) steps,
 -- where @n@ is the 'Relative' shift value. Pass a boolean value indicating whether or not you would
 -- like to perform bounds checking, if so an exception will be raised if the line index goes out of
 -- bounds.
 shiftCursor
-  :: (MonadIO m, MonadGapBuffer (GVec.Mutable vec RealWorld elem) m,
-      GMVec.MVector (GVec.Mutable vec) elem,
-      GVec.Vector vec elem
-     , Show elem --DEBUG
+  :: (PrimMonad m, GMVec.MVector vec elem,
+      MonadGapBuffer (vec (PrimState m) elem) m,
+      MonadError BufferError m
      )
   => VecLength -> m ()
 shiftCursor count0 =
@@ -727,7 +734,9 @@ shiftCursor count0 =
 
 -- | Copy the current mutable buffer vector to an immutable vector.
 freezeVector
-  :: (MonadIO m, GVec.Vector vec elem, MonadGapBuffer (GVec.Mutable vec RealWorld elem) m)
+  :: (PrimMonad m, GMVec.MVector mvec elem, GVec.Vector vec elem,
+      mvec (PrimState m) elem ~ GVec.Mutable vec (PrimState m) elem,
+      MonadGapBuffer (mvec (PrimState m) elem) m)
   => m (vec elem)
 freezeVector = do
   oldvec <- getVector
@@ -740,16 +749,13 @@ freezeVector = do
 
 ----------------------------------------------------------------------------------------------------
 
-data BufferError vec
-  = UndefinedElement  vec VecIndex
-  | BufferLimitError  vec RelativeToCursor
-  | BufferIndexBounds vec VecIndex
-  | BufferIndexRange  vec VecIndex VecLength
-
-bufferError
-  :: (MonadError (BufferError vec) m, MonadEditVec vec m)
-  => (vec -> a -> BufferError vec) -> a -> m void
-bufferError constr a = constr <$> modVector id <*> pure a >>= throwError
+data BufferError
+  = BufferIsEmpty
+  | UndefinedElement  VecIndex
+  | BufferLimitError  RelativeToCursor
+  | BufferIndexBounds VecIndex
+  | BufferIndexRange  VecIndex VecLength
+  deriving (Eq, Ord, Show)
 
 ----------------------------------------------------------------------------------------------------
 
@@ -779,12 +785,12 @@ gapBufferAfterCursor = lens theGapBufferAfterCursor $ \ a b -> a{ theGapBufferAf
 newtype GapBuffer vec m a
   = GapBuffer
     { unwrapGapBuffer ::
-        ExceptT (BufferError vec) (StateT (GapBufferState vec) m) a
+        ExceptT BufferError (StateT (GapBufferState vec) m) a
     }
   deriving
     ( Functor, Applicative, Monad, MonadIO,
       MonadState (GapBufferState vec),
-      MonadError (BufferError vec)
+      MonadError BufferError
     )
 
 --instance Monad m => MonadError (BufferError vec) (GapBuffer vec m) where
@@ -819,14 +825,14 @@ instance (PrimMonad m, GMVec.MVector vec elem, st ~ PrimState m) =>
       GMVec.copy (GMVec.unsafeSlice     0 sizeA newvec) a
       GMVec.copy (GMVec.unsafeSlice sizeA sizeB newvec) b
       return newvec
-    throwLimitErr = bufferError BufferLimitError
+    throwLimitErr = throwError . BufferLimitError
     getCursorIsDefined = use gapBufferCursorIsDefined
 
 -- | Evaluate a 'GapBuffer' function providing it a new vector with which to instantiate the
 -- 'GapBufferState'.
 runGapBufferNew
   :: vec -> GapBuffer vec m a
-  -> m (Either (BufferError vec) a, GapBufferState vec)
+  -> m (Either BufferError a, GapBufferState vec)
 runGapBufferNew vec (GapBuffer (ExceptT f)) = runStateT f GapBufferState
   { theGapBufferVector          = vec
   , theGapBufferCursorIsDefined = False
@@ -839,7 +845,7 @@ runGapBufferNew vec (GapBuffer (ExceptT f)) = runStateT f GapBufferState
 runGapBuffer
   :: GapBuffer vec m a
   -> GapBufferState vec
-  -> m (Either (BufferError vec) a, GapBufferState vec)
+  -> m (Either BufferError a, GapBufferState vec)
 runGapBuffer (GapBuffer (ExceptT f)) = runStateT f
 
 cloneGapBufferState
@@ -872,10 +878,10 @@ iiBufferCursor = lens theIIBufferCursor $ \ a b -> a{ theIIBufferCursor = b }
 ----------------------------------------------------------------------------------------------------
 
 newtype IIBuffer vec m a
-  = IIBuffer{ unwrapIIBuffer :: ExceptT (BufferError vec) (StateT (IIBufferState vec) m) a }
+  = IIBuffer{ unwrapIIBuffer :: ExceptT BufferError (StateT (IIBufferState vec) m) a }
   deriving (Functor, Applicative, Monad, MonadIO)
 
-instance Monad m => MonadError (BufferError vec) (IIBuffer vec m) where
+instance Monad m => MonadError BufferError (IIBuffer vec m) where
   throwError = IIBuffer . throwError
   catchError (IIBuffer try) catch = IIBuffer $ catchError try $ unwrapIIBuffer . catch
 
@@ -899,5 +905,20 @@ instance (Monad m, GVec.Vector vec elem) => MonadEditVec (vec elem) (IIBuffer (v
     constr . GVec.unsafeSlice i len <$> use iiBufferVector
   cloneVector = pure
   appendVectors a b = pure $ a GVec.++ b
-  throwLimitErr = bufferError BufferLimitError
+  throwLimitErr = throwError . BufferLimitError
   getCursorIsDefined = (/= 0) <$> getAllocSize
+
+runIIBuffer
+  :: Monad m
+  => IIBuffer vec m a
+  -> IIBufferState vec
+  -> m (Either BufferError a, IIBufferState vec)
+runIIBuffer (IIBuffer (ExceptT f)) = runStateT f
+
+gapBufferLiftIIBuffer
+  :: Monad m
+  => IIBuffer vec m a
+  -> IIBufferState vec
+  -> GapBuffer mvec m (a, IIBufferState vec)
+gapBufferLiftIIBuffer f st = lift (runIIBuffer f st) >>= \ (a, st) ->
+  flip (,) st <$> (throwError ||| pure) a
