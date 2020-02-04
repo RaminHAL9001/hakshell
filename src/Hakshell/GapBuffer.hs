@@ -856,6 +856,17 @@ runGapBuffer
   -> m (Either (BufferError vec) a, GapBufferState vec)
 runGapBuffer (GapBuffer (ExceptT f)) = runStateT f
 
+cloneGapBufferState
+  :: (GMVec.MVector vec elem, PrimMonad m)
+  => GapBuffer (vec (PrimState m) elem) m (GapBufferState (vec (PrimState m) elem))
+cloneGapBufferState = do
+  gbst   <- get
+  newVec <- copyVec
+    (theGapBufferVector gbst)
+    (theGapBufferBeforeCursor gbst)
+    (theGapBufferAfterCursor gbst)
+  return $ gbst{ theGapBufferVector = newVec }
+
 ----------------------------------------------------------------------------------------------------
 
 -- | The buffer within is immutable and there is no gap, and it is indexed with a cursor. The "II"
