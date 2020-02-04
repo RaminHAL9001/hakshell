@@ -11,14 +11,15 @@ module Hakshell.GapBuffer
     indexNearCursor, cursorIndex, cursorAtEnd, relativeIndex, guardVecIndex,
     countOnCursor, countDefined, countUndefined,
     getVoid, sliceFromCursor, sliceBetween, safeSliceBetween, withVoidSlice, getSlice,
-    UnsafeSlice, SafeEvalSlice, SafeSliceEvaluator,
+    UnsafeSlice,
     withFullSlices, withRegion, withNewVector, copyRegion,
     putElemIndex, getElemIndex, putElem, getElem, delElem,
     pushElem, pushElemVec, popElem, shiftCursor,
     minPow2ScaledSize, prepLargerVector, growVector, freezeVector, copyVec,
     ----
     GapBuffer(..), GapBufferState(..), BufferError(..), bufferError,
-    runGapBufferNew, runGapBuffer,
+    runGapBufferNew, runGapBuffer, cloneGapBufferState,
+    gapBufferBeforeCursor, gapBufferAfterCursor, gapBufferCursorIsDefined, gapBufferVector,
     IIBuffer(..), IIBufferState(..),
   ) where
 
@@ -236,25 +237,12 @@ indexDistance (VecIndex a) (VecIndex b) = VecLength $ 1 + abs (subtract a b)
 -- restrict the functions in which it can be used.
 newtype UnsafeSlice vec = UnsafeSlice { unwrapUnsafeSlice :: vec }
 
--- | This is a simple monadic context in which an 'UnsafeSlice' can be manipulated safely. Some APIs
--- in this module take a continuation of this function type and evalaute it, ensuring evaluation
--- exists within the limits of the calling context to which the continuation was passed.
-newtype SafeEvalSlice m a = SafeEvalSlice{ evalSliceSafely :: m a }
-  deriving (Functor, Applicative, Monad, MonadIO)
-
-instance MonadTrans SafeEvalSlice where { lift = SafeEvalSlice; }
-
--- | A function of this type is usually passed to a 'SafeEvalSlice' continuation function. This
--- allows you to unwrap other 'SafeEvalSlice' functions, but only within the context of the
--- continuation so that safety is not lost.
-type SafeSliceEvaluator m a = SafeEvalSlice m a -> m a
-
 sliceSize :: (vec -> Int) -> UnsafeSlice vec -> VecLength
 sliceSize length (UnsafeSlice vec) = VecLength $ length vec
 
 safeFreeze
   :: (MonadIO m, GVec.Vector vec elem)
-  => UnsafeSlice (GVec.Mutable vec RealWorld elem) -> SafeEvalSlice m (vec elem)
+  => UnsafeSlice (GVec.Mutable vec RealWorld elem) -> m (vec elem)
 safeFreeze (UnsafeSlice vec) = liftIO (GVec.freeze vec)
 
 --mutableClone
@@ -263,14 +251,14 @@ safeFreeze (UnsafeSlice vec) = liftIO (GVec.freeze vec)
 --  -> SafeEvalSlice m (vec RealWorld elem)
 --mutableClone (UnsafeSlice vec) = liftIO (GMVec.clone vec)
 
---clone :: GVec.Vector vec elem => UnsafeSlice (vec elem) -> vec elem
---clone (UnsafeSlice vec) = runST (GNew.run (GVec.clone vec) >>= GVec.freeze)
+--clone :: GVec.Vector vec elem => (vec elem) -> vec elem
+--clone vec = runST (GNew.run (GVec.clone vec) >>= GVec.freeze)
 
 copy
   :: (MonadIO m, GVec.Vector vec elem)
   => UnsafeSlice (GVec.Mutable vec RealWorld elem)
   -> UnsafeSlice (vec elem)
-  -> SafeEvalSlice m ()
+  -> m ()
 copy (UnsafeSlice mvec) (UnsafeSlice vec) = liftIO (GVec.copy mvec vec)
 
 -- | The expression @('mutableCopy' a b)@ copies the elements from @b@ into the elements of @a@,
@@ -279,22 +267,22 @@ mutableCopy
   :: (MonadIO m, GMVec.MVector vec elem)
   => UnsafeSlice (vec RealWorld elem)
   -> UnsafeSlice (vec RealWorld elem)
-  -> SafeEvalSlice m ()
+  -> m ()
 mutableCopy (UnsafeSlice a) (UnsafeSlice b) = liftIO (GMVec.copy a b)
 
 mutableMove
   :: (MonadIO m, GVec.Vector vec elem)
   => UnsafeSlice (GVec.Mutable vec RealWorld elem)
   -> UnsafeSlice (GVec.Mutable vec RealWorld elem)
-  -> SafeEvalSlice m ()
+  -> m ()
 mutableMove (UnsafeSlice a) (UnsafeSlice b) = liftIO (GMVec.move a b)
 
 -- | Creates a deep-copy of a vector with a cursor, in which elements before the cursor are aligned
 -- at the start of the vector, and elements after the cursor are aligned at the end of the vector.
 copyVec
-  :: (GMVec.MVector vector a, PrimMonad m)
-  => vector (PrimState m) a
-  -> VecLength -> VecLength -> m (vector (PrimState m) a)
+  :: (GMVec.MVector vec a, PrimMonad m)
+  => vec (PrimState m) a
+  -> VecLength -> VecLength -> m (vec (PrimState m) a)
 copyVec oldVec (VecLength before) (VecLength after) = do
   let len = VecLength $ GMVec.length oldVec
   let (VecIndex upper) = indexAfterRange 0 $ len - VecLength after
@@ -306,13 +294,13 @@ copyVec oldVec (VecLength before) (VecLength after) = do
 --foldVec
 --  :: (GVec.Vector vec elem, Monad m)
 --  => (fold -> elem -> m fold) -> fold -> UnsafeSlice (vec elem)
---  -> SafeEvalSlice m fold
+--  -> m fold
 --foldVec f st (UnsafeSlice vec) = lift (GVec.foldM' f st vec)
 
 --foldMutable
 --  :: MonadIO m
 --  => (fold -> elem -> m fold) -> fold -> UnsafeSlice (GVec.Mutable vec RealWorld elem)
---  -> SafeEvalSlice m fold
+--  -> m fold
 --foldMutable f st (UnsafeSlice vec) = 
 
 ----------------------------------------------------------------------------------------------------
@@ -344,12 +332,11 @@ class Monad m => MonadEditVec vec m | m -> vec where
   -- | This is a value relative to the cursor, the integer value returned does not include the value
   -- under the cursor itself, as the value under the cursor may or may not exist.
   modCount  :: RelativeToCursor -> (VecLength -> VecLength) -> m VecLength
-  -- | Isolate a sub-vector within the current vector using 'GMVec.slice' or 'GVec.slice'. You will
-  -- have to 'lift' the result to construct the 'SafeEvalSlice' function type.
+  -- | Isolate a sub-vector within the current vector using 'GMVec.slice' or 'GVec.slice'.
   sliceVector
     :: (vec -> UnsafeSlice vec)
     -> VecIndex -> VecLength
-    -> SafeEvalSlice m (UnsafeSlice vec)
+    -> m (UnsafeSlice vec)
   -- | Create a deep-copy of the @vec@. This function should just point to one of the various
   -- @clone@ functions in the @vector@ library. 
   cloneVector :: vec -> m vec
@@ -367,7 +354,7 @@ class MonadEditVec vec m => MonadGapBuffer vec m | m -> vec where
 -- not for export
 --
 -- Calls 'sliceVector' passing the private 'UnsafeSlice' constructor.
-sliceVectorSafe :: MonadEditVec vec m => VecIndex -> VecLength -> SafeEvalSlice m (UnsafeSlice vec)
+sliceVectorSafe :: MonadEditVec vec m => VecIndex -> VecLength -> m (UnsafeSlice vec)
 sliceVectorSafe = sliceVector UnsafeSlice
 
 -- | The vector of the text buffer.
@@ -450,18 +437,18 @@ getVoid = do
 -- before and up-to the cursor, a positive argument will take that many elements starting from
 -- 'getLineAfterCur'. Pass a boolean value indicating whether or not you would like to perform
 -- bounds checking, if so an exception will be raised if the line index goes out of bounds.
-sliceFromCursor :: MonadEditVec vec m => VecLength -> SafeEvalSlice m (UnsafeSlice vec)
+sliceFromCursor :: MonadEditVec vec m => VecLength -> m (UnsafeSlice vec)
 sliceFromCursor count =
-  if count < 0 then lift (indexNearCursor Before) >>=
+  if count < 0 then indexNearCursor Before >>=
     flip sliceVectorSafe (abs count) . flip indexAfterRange count
-  else if count > 0 then lift (indexNearCursor After) >>= flip sliceVectorSafe count
+  else if count > 0 then indexNearCursor After >>= flip sliceVectorSafe count
   else sliceVectorSafe 0 0
 
 -- | Create a slice between two indicies, creating a clone array with the content of the slice. The
 -- slice is never empty because if both indicies are the same, a vector containing that single
 -- element at that index is returned.
 sliceBetween :: MonadEditVec vec m => VecIndex -> VecIndex -> m vec
-sliceBetween from = evalSliceSafely . sliceVectorSafe from . indexDistance from >=>
+sliceBetween from = sliceVectorSafe from . indexDistance from >=>
   cloneVector . unwrapUnsafeSlice
 
 -- | Like 'sliceBetween' but does not create a clone of the vector, so the returned vector is unsafe
@@ -469,9 +456,9 @@ sliceBetween from = evalSliceSafely . sliceVectorSafe from . indexDistance from 
 safeSliceBetween
   :: MonadEditVec vec m
   => VecIndex -> VecIndex
-  -> (UnsafeSlice vec -> SafeEvalSlice m a)
+  -> (UnsafeSlice vec -> m a)
   -> m a
-safeSliceBetween from to = evalSliceSafely . ((sliceVectorSafe from $ indexDistance from to) >>=)
+safeSliceBetween from to = ((sliceVectorSafe from $ indexDistance from to) >>=)
 
 -- | Make a slice of the void region of the buffer (the contiguous region of invalid elements after
 -- the cursor). This can be used as the target of a vector copy. If the buffer is full, 'Nothing' is
@@ -479,26 +466,26 @@ safeSliceBetween from to = evalSliceSafely . ((sliceVectorSafe from $ indexDista
 withVoidSlice
   :: MonadEditVec vec m
   => VecLength
-  -> (UnsafeSlice vec -> SafeEvalSlice m ())
+  -> (UnsafeSlice vec -> m ())
   -> m Bool
 withVoidSlice count f = getVoid >>= maybe (pure False) cont where
-  cont (lo, hi) = evalSliceSafely $ do
+  cont (lo, hi) = do
     if count >= 0 then sliceVectorSafe lo count >>= f else
       sliceVectorSafe (indexAfterRange hi count) (negate count) >>= f
     return True
 
-getSlice :: MonadEditVec vec m => RelativeToCursor -> SafeEvalSlice m (UnsafeSlice vec)
+getSlice :: MonadEditVec vec m => RelativeToCursor -> m (UnsafeSlice vec)
 getSlice = \ case { Before -> getLoSlice; After -> getHiSlice; }
 
 -- | Obtain a slice (using 'sliceFromCursor') for the portion of the vector containing elements
 -- before or on the current cursor.
-getLoSlice :: MonadEditVec vec m => SafeEvalSlice m (UnsafeSlice vec)
-getLoSlice = lift (countCursor Before) >>= sliceFromCursor . negate
+getLoSlice :: MonadEditVec vec m => m (UnsafeSlice vec)
+getLoSlice = countCursor Before >>= sliceFromCursor . negate
 
 -- | Obtain a slice (using 'sliceFromCursorM') for the portion of the vector containing elements
 -- after the current cursor.
-getHiSlice :: MonadEditVec vec m => SafeEvalSlice m (UnsafeSlice vec)
-getHiSlice = lift (countCursor After) >>= sliceFromCursor
+getHiSlice :: MonadEditVec vec m => m (UnsafeSlice vec)
+getHiSlice = countCursor After >>= sliceFromCursor
 
 -- | Given a region, slice the vector to the region and evaluate one of two given continuations with
 -- the slice. If the region spans the gap in the buffer, the first continuation is called. If the
@@ -507,26 +494,26 @@ getHiSlice = lift (countCursor After) >>= sliceFromCursor
 withRegion
   :: MonadEditVec vec m
   => VecIndex -> VecIndex
-  -> (UnsafeSlice vec -> UnsafeSlice vec -> SafeEvalSlice m a)
+  -> (UnsafeSlice vec -> UnsafeSlice vec -> m a)
   -> m a
 withRegion from0 to0 f =
   cursorIndex >>= \ cur ->
   absoluteIndex (min from0 to0) >>= \ from ->
   absoluteIndex (max from0 to0) >>= \ to ->
   let contained =  safeSliceBetween from to in
-  if      from <= cur && to <= cur then contained $ lift . safeSliceBetween 0 0 . f
-  else if from >  cur && to >  cur then contained $ lift . safeSliceBetween 0 0 . flip f
+  if      from <= cur && to <= cur then contained $ safeSliceBetween 0 0 . f
+  else if from >  cur && to >  cur then contained $ safeSliceBetween 0 0 . flip f
   else do
     bef <- indexNearCursor Before
     aft <- indexNearCursor After
-    safeSliceBetween from bef $ lift . safeSliceBetween aft to . f
+    safeSliceBetween from bef $ safeSliceBetween aft to . f
 
 -- | Similar to 'withRegion' but operates on the entire defined region of the buffer.
 withFullSlices
   :: MonadEditVec vec m
-  => (UnsafeSlice vec -> UnsafeSlice vec -> SafeEvalSlice m a)
+  => (UnsafeSlice vec -> UnsafeSlice vec -> m a)
   -> m a
-withFullSlices f = evalSliceSafely $ join $ f <$> getLoSlice <*> getHiSlice
+withFullSlices f = join $ f <$> getLoSlice <*> getHiSlice
 
 -- | Create a new vector, copy the portion of the state tracking the old vector and the cursor
 -- positions onto the stack, then evaluate a continuation function of type @m@ with the new vector
@@ -535,14 +522,14 @@ withFullSlices f = evalSliceSafely $ join $ f <$> getLoSlice <*> getHiSlice
 -- state and return the new vector.
 withNewVector
   :: (MonadIO m, GMVec.MVector vec elem, MonadGapBuffer (vec RealWorld elem) m)
-  => VecLength -> SafeEvalSlice m () -> m (vec RealWorld elem)
+  => VecLength -> m () -> m (vec RealWorld elem)
 withNewVector size f = do
   oldvec <- modVector id
   before <- modCount Before id
   after  <- modCount After  id
   newvec <- newVector size
   modVector (const newvec)
-  () <- evalSliceSafely f
+  () <- f
   modCount Before (const before)
   modCount After  (const after )
   modVector (const oldvec)
@@ -555,8 +542,8 @@ withNewVector size f = do
 copyRegion
   :: (MonadIO m, GMVec.MVector vec elem, MonadGapBuffer (vec RealWorld elem) m)
   => VecIndex -> VecIndex -> m (vec RealWorld elem)
-copyRegion from to = withRegion from to $ \ oldLo oldHi -> lift $ do
-  withNewVector (sliceSize GMVec.length oldLo + sliceSize GMVec.length oldHi) $ lift $ do
+copyRegion from to = withRegion from to $ \ oldLo oldHi -> do
+  withNewVector (sliceSize GMVec.length oldLo + sliceSize GMVec.length oldHi) $ do
     modCount Before $ const $ sliceSize GMVec.length oldLo
     modCount After  $ const $ sliceSize GMVec.length oldHi
     withFullSlices $ \ newLo newHi -> do
@@ -656,7 +643,7 @@ growVector
 growVector increase = if increase <= 0 then return () else
   countDefined >>= \ count -> prepLargerVector (count <> increase) >>= \ case
     Nothing     -> return ()
-    Just newvec -> withFullSlices $ \ oldbef oldaft -> lift $ do
+    Just newvec -> withFullSlices $ \ oldbef oldaft -> do
       modVector $ const newvec
       withFullSlices $ \ newbef newaft ->
         mutableCopy newbef oldbef >> mutableCopy newaft oldaft
@@ -683,7 +670,7 @@ pushElemVec rel src = do
   let len = VecLength $ GVec.length src
   growVector len
   ok <- withVoidSlice (case rel of{ Before -> negate len; After -> len; }) $ \ targ ->
-    lift (modCount rel (+ len)) >> copy targ (UnsafeSlice src)
+    modCount rel (+ len) >> copy targ (UnsafeSlice src)
   unless ok $ error $ "pushElemVec: internal error, \"growVector\" failed to create space"
 
 -- | Pop a single element from the index 'Before' (currently on) the cursor, or from the index 'After'
@@ -723,14 +710,14 @@ shiftCursor count0 =
     Just ~(lo, hi) ->
       if      count ==  1 then popElem After  >>= pushElem Before
       else if count == -1 then popElem Before >>= pushElem After
-      else evalSliceSafely $ do
+      else do
         from <- sliceFromCursor count
         to   <-
           if      count >  1 then sliceVectorSafe lo count
           else if count < -1 then sliceVectorSafe (indexAfterRange (hi + 1) count) (negate count)
           else error "shiftCursor: internal error, this should never happen"
         mutableMove to from
-        lift done
+        done
     where
       count  = unwrapRelative count0
       done   = do
@@ -746,10 +733,9 @@ freezeVector = do
   oldvec <- getVector
   newvec <- countDefined >>= newVector
   withFullSlices $ \ oldLo oldHi -> do
-    lift $ do
-      modVector (const newvec)
-      withFullSlices $ \ newLo newHi -> mutableCopy newLo oldLo >> mutableCopy newHi oldHi
-      modVector (const oldvec)
+    modVector (const newvec)
+    withFullSlices $ \ newLo newHi -> mutableCopy newLo oldLo >> mutableCopy newHi oldHi
+    modVector (const oldvec)
     safeFreeze (UnsafeSlice newvec)
 
 ----------------------------------------------------------------------------------------------------
@@ -823,7 +809,7 @@ instance (PrimMonad m, GMVec.MVector vec elem, st ~ PrimState m) =>
       Before -> modifyAndUse gapBufferBeforeCursor
       After  -> modifyAndUse gapBufferAfterCursor
     cloneVector  = lift . GMVec.clone
-    sliceVector constr (VecIndex from) (VecLength size) = lift $
+    sliceVector constr (VecIndex from) (VecLength size) =
       constr . GMVec.unsafeSlice from size <$> use gapBufferVector
     appendVectors a b = do
       let sizeA   = GMVec.length a
@@ -909,7 +895,7 @@ instance (Monad m, GVec.Vector vec elem) => MonadEditVec (vec elem) (IIBuffer (v
     Before -> \ f -> iiBufferCursor %= f >> use iiBufferCursor
     After  -> \ f -> getAllocSize >>= \ siz ->
       iiBufferCursor %= (siz -) . f . (siz -) >> use iiBufferCursor
-  sliceVector constr (VecIndex i) (VecLength len) = lift $
+  sliceVector constr (VecIndex i) (VecLength len) =
     constr . GVec.unsafeSlice i len <$> use iiBufferVector
   cloneVector = pure
   appendVectors a b = pure $ a GVec.++ b
