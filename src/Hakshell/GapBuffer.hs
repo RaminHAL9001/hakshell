@@ -19,7 +19,7 @@ module Hakshell.GapBuffer
     pushElem, pushElemVec, popElem, shiftCursor,
     minPow2ScaledSize, prepLargerVector, growVector, freezeVector, copyVec,
     ----
-    GapBuffer(..), GapBufferState(..), BufferError(..),
+    GapBuffer(..), GapBufferState(..), BufferError(..), gapBufferLength,
     runGapBufferNew, runGapBuffer, cloneGapBufferState,
     gapBufferBeforeCursor, gapBufferAfterCursor, gapBufferCursorIsDefined, gapBufferVector,
     IIBuffer(..), IIBufferState(..),
@@ -779,6 +779,9 @@ gapBufferBeforeCursor = lens theGapBufferBeforeCursor $ \ a b -> a{ theGapBuffer
 
 gapBufferAfterCursor :: Lens' (GapBufferState vec) VecLength
 gapBufferAfterCursor = lens theGapBufferAfterCursor $ \ a b -> a{ theGapBufferAfterCursor = b }
+
+gapBufferLength :: GMVec.MVector vec elem => GapBufferState (vec st elem) -> VecLength
+gapBufferLength = VecLength . GMVec.length . theGapBufferVector
 
 ----------------------------------------------------------------------------------------------------
 

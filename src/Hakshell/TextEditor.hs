@@ -493,9 +493,9 @@ liftMutableGapBuffer gapBufferState convertErr liftPrim constr f = constr $ Exce
 data TextLine tags
   = TextLineUndefined
   | TextLine
-    { theTextLineString    :: !CharVector
-    , theTextLineBreakSize :: !Word16
-    , theTextLineTags      :: !tags
+    { theTextLineString      :: !CharVector
+    , theTextLineBreakSymbol :: !LineBreakSymbol
+    , theTextLineTags        :: !tags
     }
   deriving Functor
 
@@ -512,8 +512,8 @@ instance Unpackable (TextLine tags) where
 instance Show tags => Show (TextLine tags) where
   show = \ case
     TextLineUndefined -> "(null)"
-    TextLine{theTextLineString=vec,theTextLineTags=tags,theTextLineBreakSize=lbrksz} ->
-      '(' : show (unpack vec) ++ ' ' : show lbrksz ++ ' ' : show tags ++ ")"
+    TextLine{theTextLineString=vec,theTextLineTags=tags,theTextLineBreakSymbol=lbrksym} ->
+      '(' : show (unpack vec) ++ ' ' : show (show lbrksym) ++ ' ' : show tags ++ ")"
 
 -- | The null-terminated, UTF-8 encoded string of bytes stored in this line of text.
 textLineString :: Lens' (TextLine tags) CharVector
@@ -526,22 +526,21 @@ textLineTags :: Lens' (TextLine tags) tags
 textLineTags = lens theTextLineTags $ \ a b -> a{ theTextLineTags = b }
 
 -- not for export
-textLineBreakSize :: Lens' (TextLine tags) Word16
-textLineBreakSize = lens theTextLineBreakSize $ \ a b -> a{ theTextLineBreakSize = b }
+textLineBreakSymbol :: Lens' (TextLine tags) LineBreakSymbol
+textLineBreakSymbol = lens theTextLineBreakSymbol $ \ a b -> a{ theTextLineBreakSymbol = b }
 
 -- | Like 'unpack', but removes the terminating line-breaking characters.
 textLineChomp :: TextLine tags -> String
 textLineChomp = \ case
   TextLineUndefined -> ""
-  TextLine{theTextLineString=vec,theTextLineBreakSize=lbrksz} ->
-    UVec.toList $ UVec.slice 0 (UVec.length vec - fromIntegral lbrksz) vec
+  TextLine{theTextLineString=vec} -> UVec.toList $ UVec.slice 0 (UVec.length vec - 1) vec
 
 -- | The empty 'TextLine' value.
 emptyTextLine :: tags -> TextLine tags
 emptyTextLine tags = TextLine
-  { theTextLineString    = UVec.empty
-  , theTextLineTags      = tags
-  , theTextLineBreakSize = 0
+  { theTextLineString      = UVec.empty
+  , theTextLineTags        = tags
+  , theTextLineBreakSymbol = NoLineBreak
   }
 
 -- | Evaluates to 'True' if the 'TextLine' is empty. Undefined lines also evaluate to 'True'. (Use
@@ -577,13 +576,18 @@ textLineIsUndefined = \ case { TextLineUndefined -> True; _ -> False; }
 -- there are no line breaking characters, or if there is only one line breaking character, the
 -- 'textLineCursorSpan' is identical to the value given by 'intSize'.
 textLineCursorSpan :: TextLine tags -> TextCursorSpan
-textLineCursorSpan line = TextCursorSpan $ intSize line - breaksize + min 1 (max 0 breaksize) where
-  breaksize = fromIntegral $ theTextLineBreakSize line
+textLineCursorSpan line = TextCursorSpan $ intSize line where
+  -- TODO: delete this. Now that we use an internal representation that always uses '\n' for line
+  -- breaks, 'textLineCursorSpan' is identical to 'intSize'.
+  --
+  -- Instead of this, use 'intSize', but do provide a function that returns the number of characters
+  -- that at 'TextLine' would take up when converted to a 'String', which would account for the
+  -- number of line breaking characters.
 
 -- | Return index of the top-most non-line-breaking character. The size of the string not including
 -- the line breaking characters is equal to the result of this function evaluated by 'charToIndex'.
 textLineTop :: TextLine tags -> Absolute CharIndex
-textLineTop line = toIndex $ intSize line - (fromIntegral $ theTextLineBreakSize line)
+textLineTop = toIndex . subtract 1 . intSize
 
 -- | Get a character at the @('Absolute' 'CharIndex')@ of a 'TextLine'. This may read into the line
 -- breaking character without evaluating to 'Nothing'.
@@ -767,11 +771,11 @@ data LineEditor tags
       -- currently being referred to by the 'currentLineNumber'. If the content of
       -- 'theBufferLineEditor' has been modified by 'insertChar' or 'deleteChars', or if cursor has
       -- been moved to a different line, this field is set to 'False'.
-    , theCursorBreakSize     :: !Word16
+    , theCursorBreakSymbol   :: !LineBreakSymbol
     , theLineEditorTags      :: tags
     }
 
-instance IntSized (LineEditor tags) where { intSize = fromLength . lineEditorCharCount; }
+instance IntSized (LineEditor tags) where { intSize = lineEditorCharCount; }
 
 lineEditGapBuffer :: Lens' (LineEditor tags) (GapBufferState (UMVec.IOVector Char))
 lineEditGapBuffer = lens theLineEditGapBuffer $ \ a b -> a{ theLineEditGapBuffer = b }
@@ -794,8 +798,8 @@ charsAfterCursor = lineEditGapBuffer . gapBufferAfterCursor
 -- is non-zero, it indicates that the line breaking characters do exist after the cursor at some
 -- point, and if additional line breaks are inserted the characters after the cursor need to be
 -- split off into a new 'TextLine'.
-cursorBreakSize :: Lens' (LineEditor tags) Word16
-cursorBreakSize = lens theCursorBreakSize $ \ a b -> a{ theCursorBreakSize = b }
+cursorBreakSymbol :: Lens' (LineEditor tags) LineBreakSymbol
+cursorBreakSymbol = lens theCursorBreakSymbol $ \ a b -> a{ theCursorBreakSymbol = b }
 
 -- | A 'Control.Lens.Lens' to get or set tags for the line currently under the cursor. To use or
 -- modify the tags value of the line under the cursor, evaluate one of the functions 'use',
@@ -1015,16 +1019,18 @@ viewerCursorTo = viewLineLiftIIBuffer .
 
 -- Not for export
 --
--- Copies the tags and updates the line break size
-similarLine :: Monad m => (Word16 -> Word16) -> CharVector -> ViewLine tags m (TextLine tags)
+-- Copies the tags and updates the line break symbol
+similarLine
+  :: Monad m
+  => (LineBreakSymbol -> LineBreakSymbol) -> CharVector -> ViewLine tags m (TextLine tags)
 similarLine onLbrk vec = do
   line <- use viewerLine
-  pure $ (textLineBreakSize %~ onLbrk) . (textLineString .~ vec) $ line
+  pure $ (textLineBreakSymbol %~ onLbrk) . (textLineString .~ vec) $ line
 
 -- | Cut and remove a line at some index, keeping the characters 'Before' or 'After' the index.
 sliceLineToEnd :: Monad m => RelativeToCursor -> ViewLine tags m (TextLine tags)
 sliceLineToEnd rel = let s = view textLineString in splitLine >>= case rel of
-  Before -> similarLine (const 0) . s . fst
+  Before -> similarLine (const NoLineBreak) . s . fst
   After  -> similarLine id . s . snd
 
 -- | Splits the current 'TextLine' at the current cursor position.
@@ -1032,7 +1038,7 @@ splitLine :: Monad m => ViewLine tags m (TextLine tags, TextLine tags)
 splitLine = do
   (before, after) <- viewLineLiftIIBuffer $ withFullSlices $ \ before after ->
     return (safeClone before, safeClone after)
-  (,) <$> similarLine (const 0) before <*> similarLine id after
+  (,) <$> similarLine (const NoLineBreak) before <*> similarLine id after
 
 ----------------------------------------------------------------------------------------------------
 
@@ -1149,9 +1155,9 @@ newTextBufferState this initSize tags = do
     Left  err  -> fail $ show err
     Right gbst -> return TextBufferState
       { theBufferDefaultLine   = TextLine
-          { theTextLineTags      = tags
-          , theTextLineString    = mempty
-          , theTextLineBreakSize = 0
+          { theTextLineTags        = tags
+          , theTextLineString      = mempty
+          , theTextLineBreakSymbol = NoLineBreak
           }
       , theBufferLineBreaker   = lineBreakerNLCR
       , theTextGapBufferState  = gbst
@@ -1176,7 +1182,7 @@ newLineEditorIO parent initSize tag = do
       { parentTextEditor     = parent
       , theLineEditGapBuffer = gbst
       , theLineEditorIsClean = False
-      , theCursorBreakSize   = 0
+      , theCursorBreakSymbol = NoLineBreak
       , theLineEditorTags    = tag
       }
 
@@ -1191,22 +1197,28 @@ copyLineEditorIO cur =
     Left  err    -> fail $ show err -- 'cloneGapBuffer' should never throw an exception
     Right newBuf -> return cur{ theLineEditGapBuffer = newBuf }
 
--- | A pure function you can use to determine how many characters have been stored into this buffer.
-lineEditorCharCount :: LineEditor tags -> Relative CharIndex
-lineEditorCharCount = toLength . fromLength .
-  uncurry (+) . (theGapBufferBeforeCursor &&& theGapBufferAfterCursor) . theLineEditGapBuffer
+-- | A pure function you can use to determine how many characters have been stored into this
+-- buffer. This function returns an 'Int' value because it is generally not to be used with other
+-- functions in this module. The 'lineEditorLength' function returns a @'Relative' 'CharIndex'@ that
+-- can be used with other functions.
+lineEditorCharCount :: LineEditor tags -> Int
+lineEditorCharCount line = fromLength count + adjust where
+  buf    = line ^. lineEditGapBuffer
+  count  = buf ^. gapBufferBeforeCursor + buf ^. gapBufferAfterCursor
+  adjust = case line ^. cursorBreakSymbol of
+    NoLineBreak -> 0
+    sym         -> lineBreakSize sym - 1
 
 -- | This funcion returns the same value as 'textLineCursorSpan' but for a 'LineEditor'.
-lineEditorUnitCount :: LineEditor tags -> TextCursorSpan
-lineEditorUnitCount ed = TextCursorSpan $ fromLength $
-  lineEditorCharCount ed - fromIntegral (theCursorBreakSize ed)
+lineEditorUnitCount :: LineEditor tags -> Relative CharIndex
+lineEditorUnitCount = relative . gapBufferLength . theLineEditGapBuffer
 
 -- | Gets the 'lineEditorCharCount' value for the current 'LineEditor'.
 getLineCharCount
   :: (MonadIO m
      , Show tags --DEBUG
      )
-  => EditText tags m (Relative CharIndex)
+  => EditText tags m Int
 getLineCharCount = lineEditorCharCount <$> use bufferLineEditor
 
 -- | Gets the 'lineEditorUnitCount' value for the current 'LineEditor'.
@@ -1214,7 +1226,7 @@ getUnitCount
   :: (MonadIO m
      , Show tags --DEBUG
      )
-  => EditText tags m TextCursorSpan
+  => EditText tags m (Relative CharIndex)
 getUnitCount = lineEditorUnitCount <$> use bufferLineEditor
 
 -- TODO: uncomment this, rewrite it
@@ -1238,7 +1250,7 @@ getUnitCount = lineEditorUnitCount <$> use bufferLineEditor
 --    let myname = "newLineEditorAt"
 --    let str = ("textLineString", line ^. textLineString)
 --    let strlen = intSize $ snd str
---    let breakSize = line ^. textLineBreakSize
+--    let breakSize = line ^. textLineBreakSymbol
 --    let cur = charToIndex $ loc ^. charIndex
 --    cur <- pure $ min (max 0 $ strlen - fromIntegral breakSize) $ max 0 cur
 --    let buflen = head $ takeWhile (< strlen) $ iterate (* 2) 1024
@@ -1273,7 +1285,7 @@ instance
     getLineAllocation = editLineLiftGapBuffer getAllocSize
 
 instance Monad m => MonadLineViewer (ViewLine tags m) where
-  getLineBreakSize  = VecLength . fromIntegral . theTextLineBreakSize <$> use viewerLine
+  getLineBreakSize  = lineBreakSize . theTextLineBreakSymbol <$> use viewerLine
   getLineAllocation = viewLineLiftIIBuffer getAllocSize
 
 -- Not for export
@@ -1367,9 +1379,9 @@ makeLineWithSlice onLbrk slice = do
   lbrk  <- use cursorBreakSize
   tags  <- use lineEditorTags
   return $ textLineBreakSize %~ onLbrk $ TextLine
-    { theTextLineString    = slice
-    , theTextLineTags      = tags
-    , theTextLineBreakSize = lbrk
+    { theTextLineString      = slice
+    , theTextLineTags        = tags
+    , theTextLineBreakSymbol = lbrk
     }
 
 -- | Create a 'TextLine' by copying the characters relative to the cursor.
@@ -1512,9 +1524,9 @@ copyLineEditor = do
   editLine $ editLineLiftGapBuffer $ do
     buf <- freezeVector
     return TextLine
-      { theTextLineString    = buf
-      , theTextLineBreakSize = cur ^. cursorBreakSize
-      , theTextLineTags      = cur ^. lineEditorTags
+      { theTextLineString      = buf
+      , theTextLineBreakSymbol = cur ^. cursorBreakSize
+      , theTextLineTags        = cur ^. lineEditorTags
       }
 
 -- | This function copies the current 'LineEditor' state back to the 'TextBuffer', and sets a flag
@@ -1803,9 +1815,9 @@ overwriteAtCursor rel concatTags line = case line of
   TextLineUndefined ->
     error $ "overwriteAtCursor "++show rel++": received undefined TextLine"
   TextLine
-   { theTextLineString    = line
-   , theTextLineBreakSize = lbrksz
-   , theTextLineTags      = tagsB
+   { theTextLineString      = line
+   , theTextLineBreakSymbol = lbrksz
+   , theTextLineTags        = tagsB
    } -> do
     let myname = "overwriteAtCursor"
     modCount rel $ const 0 -- this "deletes" the chars Before/After the cursor
@@ -2019,9 +2031,9 @@ lineBreak rel = do
       str <- liftIO $! UVec.freeze $! asrtMSlice SafeOp "lineBreak"
         asrtZero (asrtShow "cur" cur) ("lineEditBuffer", vec)
       pushLine Before $ TextLine
-        { theTextLineTags      = cursor ^. lineEditorTags
-        , theTextLineString    = str
-        , theTextLineBreakSize = lbrkSize
+        { theTextLineTags        = cursor ^. lineEditorTags
+        , theTextLineString      = str
+        , theTextLineBreakSymbol = lbrkSize
         }
       bufferLineEditor . charsBeforeCursor .= 0
     After  -> do
@@ -2036,9 +2048,9 @@ lineBreak rel = do
           (asrtShow "cur" cur)
           ("lineEditBuffer", vec)
         pushLine After $ TextLine
-          { theTextLineTags      = cursor ^. lineEditorTags
-          , theTextLineString    = str
-          , theTextLineBreakSize = lbrkSize
+          { theTextLineTags        = cursor ^. lineEditorTags
+          , theTextLineString      = str
+          , theTextLineBreakSymbol = lbrkSize
           }
         bufferLineEditor . charsAfterCursor .= 0
       editLine $ pushElemVec After lbrk
@@ -2195,14 +2207,11 @@ textViewToList = Vec.toList . textViewVector
 -- | Decompose a 'TextView' into a list of tagged 'String's. The 'String' is paired with a 'Word16'
 -- count of the number of line-breaking characters exist at the end of the string, and the @tags@
 -- assoicated with the text.
-textViewToStrings :: TextView tags -> [(String, (Word16, tags))]
+textViewToStrings :: TextView tags -> [(String, tags)]
 textViewToStrings = textViewToList >=> \ case
   TextLineUndefined -> []
-  TextLine
-   { theTextLineString=vec
-   , theTextLineTags=tags
-   , theTextLineBreakSize=lbrksiz
-   } -> [(unpack vec, (lbrksiz, tags))]
+  line@(TextLine{theTextLineTags=tags,theTextLineBreakSymbol=lbrksym}) ->
+    [(textLineChomp line ++ show lbrksym, tags)]
 
 -- | An empty 'TextView', containing zero lines of text.
 emptyTextView :: TextView tags
@@ -2233,7 +2242,7 @@ textViewAppend appendTags
                           TextLineUndefined -> theTextLineString lastA
                           firstB            -> theTextLineString lastA <> theTextLineString firstB
                     , theTextLineTags = appendTags (theTextLineTags lastA) (theTextLineTags firstB)
-                    , theTextLineBreakSize = theTextLineBreakSize firstB
+                    , theTextLineBreakSymbol = theTextLineBreakSymbol firstB
                     }
               let listA = Vec.toList $ asrtSlice SafeOp myname
                     asrtZero (asrtShow "lenA-1" $ lenA - 1) ("vecA", vecA)

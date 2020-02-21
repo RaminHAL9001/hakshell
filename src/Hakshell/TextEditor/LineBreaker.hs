@@ -3,7 +3,7 @@ module Hakshell.TextEditor.LineBreaker
     --
     -- The line break behavior of the 'TextBuffer' can be programmed to behave differently from the
     -- ordinary default behavior of breaking input strings on the @'\n'@ character.
-
+    LineBreakSymbol(..), lineBreakSize,
     LineBreaker(..), lineBreaker, lineBreakPredicate, defaultLineBreak, lineBreakerNLCR,
   ) where
 
@@ -15,6 +15,43 @@ import qualified Data.Vector.Unboxed as UVec
 import           Hakshell.String
 
 ----------------------------------------------------------------------------------------------------
+
+data LineBreakSymbol
+  = NoLineBreak
+  | LineBreakNL
+  | LineBreakCR
+  | LineBreakNUL
+  | LineBreakNLCR
+  | LineBreakCRNL
+  deriving (Eq, Ord, Enum)
+
+instance Show LineBreakSymbol where
+  show = \ case
+    NoLineBreak   -> ""
+    LineBreakNL   -> "\n"
+    LineBreakCR   -> "\r"
+    LineBreakNUL  -> "\0"
+    LineBreakNLCR -> "\n\r"
+    LineBreakCRNL -> "\r\n"
+
+instance Read LineBreakSymbol where
+  readsPrec _ = \ case
+    ""            -> [(NoLineBreak, "")]
+    '\n':'\r':str -> [(LineBreakNLCR, str)]
+    '\r':'\n':str -> [(LineBreakCRNL, str)]
+    '\n':str      -> [(LineBreakNL, str)]
+    '\r':str      -> [(LineBreakCR, str)]
+    '\0':str      -> [(LineBreakNUL, str)]
+    _             -> []
+
+lineBreakSize :: Num n => LineBreakSymbol -> n
+lineBreakSize = \ case
+  NoLineBreak   -> 0
+  LineBreakNL   -> 1
+  LineBreakCR   -> 1
+  LineBreakNUL  -> 1
+  LineBreakNLCR -> 2
+  LineBreakCRNL -> 2
 
 -- | A pair of functions used to break strings into lines. This function is called every time a
 -- string is transferred from 'theBufferLineEditor' to to 'theLinesAbove' or 'theLinesBelow' to ensure
