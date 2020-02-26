@@ -65,12 +65,10 @@ module Hakshell.TextEditor
     -- 'TextLine' at that address into a 'LineEditor'. You can then edit the text in a 'LineEditor'
     -- by evaluating a function of type 'EditLine' with the 'editLine' function.
 
-    TextLine, emptyTextLine, nullTextLine, textLineCursorSpan, textLineGetChar,
+    TextLine, emptyTextLine, textLineBreakSymbol,
+    nullTextLine, textLineCursorSpan, textLineGetChar,
     textLineTop, textLineIsUndefined, sliceLineToEnd, splitLine,
-
-    -- *** 'TextLine' lenses
-
-    textLineString, textLineTags, textLineChomp,
+    textLineTags, textLineChomp, showTextLine,
 
     -- ** The 'TextBuffer' data type
     --
@@ -490,6 +488,17 @@ liftMutableGapBuffer gapBufferState convertErr liftPrim constr f = constr $ Exce
 --
 -- Note that when a user user is editing text interactively, they are not operating on a
 -- 'TextLine', but on a 'Prelude.String' (list of 'Char's) stored in the 'TextBufferState' state.
+--
+-- __NOTE:__
+-- 
+-- * Use the 'unpack' function to convert a 'TextLine' back to it's 'String' value.
+--
+-- * Evaluating 'intSize' on a 'TextLine' returns the number of actual 'Char' values stored within
+--   it, so 'textLineBreakSymbol' is a symbol representing two characters (e.g. "\n\r"), 'intSize'
+--   will appear yield one character more than you might expect -- an empty line with only a line
+--   break will return an 'intSize' of 2. Use 'textLineCursorSpan' to get the number of logical
+--   character values, in which a line-break is considered to be a single unit character.
+--
 data TextLine tags
   = TextLineUndefined
   | TextLine
@@ -502,20 +511,25 @@ data TextLine tags
 instance IntSized (TextLine tags) where
   intSize = \ case
     TextLineUndefined               -> 0
-    TextLine{theTextLineString=str} -> UVec.length str
+    TextLine{theTextLineString=str,theTextLineBreakSymbol=sym} ->
+      let len = UVec.length str in case sym of
+        NoLineBreak   -> len
+        LineBreakNL   -> len
+        LineBreakCR   -> len
+        LineBreakNUL  -> len
+        LineBreakNLCR -> len + 1
+        LineBreakCRNL -> len + 1
 
 instance Unpackable (TextLine tags) where
   unpack = \ case
     TextLineUndefined               -> ""
-    TextLine{theTextLineString=str} -> UVec.toList str
+    TextLine{theTextLineString=str,theTextLineBreakSymbol=sym} ->
+      UVec.toList (UVec.slice 0 (UVec.length str - 1) str) ++ show sym
 
 instance Show tags => Show (TextLine tags) where
-  show = \ case
-    TextLineUndefined -> "(null)"
-    TextLine{theTextLineString=vec,theTextLineTags=tags,theTextLineBreakSymbol=lbrksym} ->
-      '(' : show (unpack vec) ++ ' ' : show (show lbrksym) ++ ' ' : show tags ++ ")"
+  show = showTextLine show
 
--- | The null-terminated, UTF-8 encoded string of bytes stored in this line of text.
+-- The null-terminated, UTF-8 encoded string of bytes stored in this line of text.
 textLineString :: Lens' (TextLine tags) CharVector
 textLineString = lens theTextLineString $ \ a b -> a{ theTextLineString = b }
 
@@ -524,6 +538,13 @@ textLineString = lens theTextLineString $ \ a b -> a{ theTextLineString = b }
 -- diff of changes made, or all of the above.
 textLineTags :: Lens' (TextLine tags) tags
 textLineTags = lens theTextLineTags $ \ a b -> a{ theTextLineTags = b }
+
+showTextLine :: (tags -> String) -> TextLine tags -> String
+showTextLine showTags = \ case
+  TextLineUndefined -> "(null)"
+  TextLine{theTextLineString=vec,theTextLineTags=tags,theTextLineBreakSymbol=lbrksym} ->
+    '(' : show (unpack vec) ++ ' ' : show (show lbrksym) ++
+    (let tagstr = showTags tags in if null tagstr then "" else ' ' : tagstr) ++ ")"
 
 -- not for export
 textLineBreakSymbol :: Lens' (TextLine tags) LineBreakSymbol
@@ -550,8 +571,9 @@ emptyTextLine tags = TextLine
 nullTextLine :: (tags -> Bool) -> TextLine tags -> Bool
 nullTextLine nullTags = \ case
   TextLineUndefined -> True
-  line              ->
-    if UVec.null (theTextLineString line) then nullTags (theTextLineTags line) else False
+  line              -> UVec.null (theTextLineString line)
+    && theTextLineBreakSymbol line == NoLineBreak
+    && nullTags (theTextLineTags line)
 
 -- | Evaluates to True if the 'TextLine' is undefined. An undefined 'TextLine' is different from an
 -- empty string, it is similar to the 'Prelude.Nothing' constructor.
@@ -576,13 +598,9 @@ textLineIsUndefined = \ case { TextLineUndefined -> True; _ -> False; }
 -- there are no line breaking characters, or if there is only one line breaking character, the
 -- 'textLineCursorSpan' is identical to the value given by 'intSize'.
 textLineCursorSpan :: TextLine tags -> TextCursorSpan
-textLineCursorSpan line = TextCursorSpan $ intSize line where
-  -- TODO: delete this. Now that we use an internal representation that always uses '\n' for line
-  -- breaks, 'textLineCursorSpan' is identical to 'intSize'.
-  --
-  -- Instead of this, use 'intSize', but do provide a function that returns the number of characters
-  -- that at 'TextLine' would take up when converted to a 'String', which would account for the
-  -- number of line breaking characters.
+textLineCursorSpan = TextCursorSpan . \ case
+  TextLineUndefined -> error "textLineCursorSpan: undefined line"
+  TextLine{theTextLineString=vec} -> UVec.length vec
 
 -- | Return index of the top-most non-line-breaking character. The size of the string not including
 -- the line breaking characters is equal to the result of this function evaluated by 'charToIndex'.
@@ -1690,14 +1708,12 @@ gotoChar = editLine . editLineLiftGapBuffer . moveCursorTo
 -- meaning the given character is a line breaking character, this function does nothing. To insert
 -- line breaks, using 'insertString'. Returns the number of characters added to the buffer.
 insertChar
-  :: (MonadIO m
-     , Show tags --DEBUG
-     )
-  => RelativeToCursor -> Char -> EditText tags m (Relative CharIndex)
-insertChar rel c = Relative . CharIndex <$> do
+  :: (MonadIO m, PrimMonad m, PrimState m ~ RealWorld)
+  => RelativeToCursor -> Char -> EditText tags m TextCursorSpan
+insertChar rel c = TextCursorSpan <$> do
   isBreak <- use $ bufferLineBreaker . lineBreakPredicate
   if isBreak c then return 0 else do
-    editLine (pushElem rel c)
+    editLine $ editLineLiftGapBuffer $ pushElem rel c
     bufferLineEditor . lineEditorIsClean .= False
     return 1
 
@@ -1709,34 +1725,28 @@ insertChar rel c = Relative . CharIndex <$> do
 -- the line. This function returns the number of characters actually deleted as a negative number
 -- (or zero), indicating a change in the number of characters in the buffer.
 deleteChars
-  :: (MonadIO m
-     , Show tags --DEBUG
-     )
+  :: (MonadIO m, PrimMonad m, PrimState m ~ RealWorld)
   => TextCursorSpan -> EditLine tags m CharStats
-deleteChars req@(TextCursorSpan n) =
-  let done count = return
-        CharStats
-        { cursorStepCount = signum req * TextCursorSpan count
-        , deltaCharCount  = Relative $ CharIndex $ negate count
-        }
-  in editLine $
-  if n < 0 then do -- TODO: make this code less copy-pastey
-    before <- indexNearCursor Before
-    let count = negate $ min before $ abs n 
-    modCount Before $ const $ before + count
-    when (count /= 0) $ lineEditorIsClean .= False
-    done count
-  else if n > 0 then do
-    lbrksz <- fromIntegral <$> use cursorBreakSize
-    after  <- indexNearCursor After
-    let count = negate $ min n $ max 0 $ after - lbrksz
-    modCount After $ const $ after + count
-    when (count /= 0) $ lineEditorIsClean .= False
-    done count
-  else done 0
+deleteChars req@(TextCursorSpan curspan0) = do
+  let curspan = VecLength curspan0
+  let done count = return (count, when (count /= 0) $ lineEditorIsClean .= False)
+  sym <- use cursorBreakSymbol
+  (VecLength count, setUncleanFlag) <- editLineLiftGapBuffer $
+    if      req < 0 then do
+      count <- validateLength curspan
+      modCount Before (+ count) >> done count
+    else if req > 0 then do
+      let adjust n = when (sym == NoLineBreak) $ void $ modCount After (+ n)
+      adjust (-1)
+      count <- validateLength curspan
+      modCount After $ subtract count
+      adjust 1
+      done count
+    else return (0, pure ())
+  setUncleanFlag
   return CharStats
-    { cursorStepCount = TextCursorSpan $ after - lbrksz + 1
-    , deltaCharCount  = negate $ Relative $ CharIndex after
+    { cursorStepCount = signum req * TextCursorSpan count
+    , deltaCharCount  = Relative $ CharIndex $ negate count
     }
 
 -- | This function evaluates the 'lineBreaker' function on the given string, and beginning from the

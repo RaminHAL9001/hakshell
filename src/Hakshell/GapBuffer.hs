@@ -10,7 +10,7 @@ module Hakshell.GapBuffer
     Absolute(..), absoluteIndex, indexToAbsolute,
     MonadEditVec(..), MonadGapBuffer(..), getVector,
     indexNearCursor, cursorIndex, distanceFromCursor, cursorAtEnd, relativeIndex,
-    testIndex, validateIndex,
+    testIndex, validateIndex, validateLength,
     countOnCursor, countDefined, countUndefined,
     getVoid, sliceFromCursor, sliceBetween, safeSliceBetween, withVoidSlice, getSlice,
     UnsafeSlice, safeFreeze, safeClone, mutableCopy, safeCopy, sliceSize,
@@ -470,6 +470,24 @@ validateIndex
 validateIndex = testIndex >=> \ (ok, i) ->
   if ok then return i else throwError (BufferIndexBounds i)
 
+-- | This function is similar to 'validateIndex', but checks the given relative index value, which
+-- is used to compute an absolute index that is checked with 'testIndex', which must be valid in
+-- order for the given relative index value to be valid. This function throws an exception if the
+  -- relative index is invalid, and returns a valid 'VecLength'.
+validateLength
+  :: (Ord rel, IsLength rel,
+      Monad m, MonadError BufferError m,
+      MonadGapBuffer vec m
+     )
+  => rel -> m VecLength
+validateLength rel0 = do
+  let rel = unwrapRelative rel0
+  (ok, _) <- relativeIndex rel0 >>= testIndex
+  unless ok $ do
+    i <- cursorIndex
+    throwError $ BufferIndexRange i $ unwrapRelative rel
+  return rel
+
 -- | Return the starting and ending index of the void region of the buffer, which is the contiguous
 -- region of undefined elements within the buffer.
 getVoid :: MonadEditVec vec m => m (Maybe (VecIndex, VecIndex))
@@ -755,14 +773,7 @@ moveCursorBy
       MonadGapBuffer (vec (PrimState m) elem) m
      )
   => rel -> m i
-moveCursorBy rel0 = do
-  let rel = unwrapRelative rel0
-  (ok, _) <- relativeIndex rel0 >>= testIndex
-  unless ok $ do
-    i <- cursorIndex
-    throwError $ BufferIndexRange i $ unwrapRelative rel
-  shiftCursor rel
-  cursorIndex >>= indexToAbsolute
+moveCursorBy = validateLength >=> shiftCursor >=> const (cursorIndex >>= indexToAbsolute)
 
 moveCursorTo
   :: (Ord i, Bounded i, IsIndex i,
