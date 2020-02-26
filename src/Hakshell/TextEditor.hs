@@ -1281,7 +1281,7 @@ instance
   (MonadIO m, PrimMonad m, PrimState m ~ RealWorld) =>
   MonadLineViewer (EditLine tags m)
   where
-    getLineBreakSize  = VecLength . fromIntegral <$> use cursorBreakSize
+    getLineBreakSize  = lineBreakSize <$> use cursorBreakSize
     getLineAllocation = editLineLiftGapBuffer getAllocSize
 
 instance Monad m => MonadLineViewer (ViewLine tags m) where
@@ -1672,82 +1672,6 @@ moveByChar rel = editLine $ do
     throwError $ CharCountOutOfRange i rel
   editLineLiftGapBuffer $ shiftCursor $ unwrapRelative rel
   currentColumnNumber
- 
--- | Compute the 'TextCursorSpan' between two 'TextLocation's. The 'TextCursorSpan' is the number of
--- steps the text cursor must take to get from point @a@ to point @b@. For the most part, this is
--- equal to the number of characters that exist between point @a@ and point @b@, except when line
--- break characters consist of two characters (like the @'\\r\\n'@ combination) and, only in this
--- case, two characters are treated as one cursor step.
---
--- This function __DOES_NOT__ evlauate 'flushLineEditor', so you may get a results you are not
--- expecting if the text between the two given 'TextLocation's contains the line currently being
--- edited by the 'LineEditor'. If you want to make sure text in the 'LineEditor' is properly
--- accounted for in the result of this function, be sure to evaluate 'flushLineEditor' before
--- evaluating this function.
-distanceBetween
-  :: (MonadIO m
-     , Show tags --DEBUG
-     )
-  => TextLocation -> TextLocation -> EditText tags m TextCursorSpan
-distanceBetween a0 b0 = do
-  (a, lineA) <- validateLocation a0
-  (b, lineB) <- validateLocation b0
-  let forward = a <= b
-  let ci = theLocationCharIndex
-  let li = theLocationLineIndex
-  let (liA, liB) = (li a, li b)
-  let (sp, tcs) = (textLineCursorSpan, TextCursorSpan)
-  let edge line a b = sp line - tcs (charToIndex $ ci a) + tcs (charToIndex $ ci b)
-  let edgeSize = if forward then edge lineA a b else edge lineB b a
-  let (nextA, prevB) = if forward then (liA + 1, liB - 1) else (liA - 1, liB + 1)
-  (if forward then id else negate) <$>
-    if liA == liB then return $ tcs $ charToIndex (ci b) - charToIndex (ci a)
-    else if nextA == liB || prevB == liA then return edgeSize
-    else foldLinesInRange nextA prevB edgeSize (\ _halt _i -> modify . (+) . sp)
-
--- | Compute the 'TextLocation' where the cursor would end up if you were to count a given number of
--- cursor steps (a value given by 'TextCursorSpan') from an initial 'TextLocation'. Also returns the
--- number of characters that were actually spanned, which may be less than the requested number.
---
--- This function __DOES_NOT__ evlauate 'flushLineEditor', so you may get a results you are not
--- expecting if the text between the two given 'TextLocation's contains the line currently being
--- edited by the 'LineEditor'. If you want to make sure text in the 'LineEditor' is properly
--- accounted for in the result of this function, be sure to evaluate 'flushLineEditor' before
--- evaluating this function.
-spanDistance
-  :: (MonadIO m
-     , Show tags --DEBUG
-     )
-  => TextLocation -> TextCursorSpan -> EditText tags m (TextLocation, TextCursorSpan)
-spanDistance a dist = do
-  let absDist = abs dist
-  let forward = dist >= 0
-  let constr size ln ch =
-        (TextLocation{ theLocationLineIndex = ln, theLocationCharIndex = ch }, size)
-  let distChar (TextCursorSpan i) = indexToChar i
-  foldLinesInRange (theLocationLineIndex a)
-    (if forward then maxBound else minBound) (a, 0) $ \ halt i line -> do
-      let lineSize = textLineCursorSpan line
-      oldCount <- gets snd
-      let newCount = oldCount + lineSize
-      let update = put $ constr newCount (if forward then i + 1 else i) 1
-      if newCount == absDist then update >> halt ()
-      else if newCount > absDist then do
-        put $ constr absDist i $ distChar $
-          if forward then absDist - oldCount else newCount - absDist
-        halt ()
-      else update
-
--- | Like 'moveByChar' but will wrap up to the previous line and continue moving on the
--- previous/next line if the value is large enough to move the cursor past the start\/end of the
--- line.
-moveByCharWrap
-  :: (MonadIO m
-     , Show tags --DEBUG
-     )
-  => TextCursorSpan -> EditText tags m TextLocation
-moveByCharWrap dist = liftEditText $
-  currentTextLocation >>= flip spanDistance dist >>= gotoPosition . fst
 
 -- | Go to an absolute line number, the first line is 1 (line 0 and below all send the cursor to
 -- line 1), the last line is 'Prelude.maxBound'.
