@@ -5,18 +5,18 @@
 module Hakshell.GapBuffer
   ( IsIndex(..), IsLength(..), HasOpposite(..),
     VecIndex(..), VecLength(..),
-    indexAfterRange, indexAtRangeEnd, indexDistance, distanceFromOrigin,
+    indexAfterRange, indexAtRangeEnd, indexDistance, indexRange, distanceFromOrigin,
     Relative(..), RelativeToCursor(..), relative, unwrapRelative,
     Absolute(..), absoluteIndex, indexToAbsolute,
     MonadEditVec(..), MonadGapBuffer(..), getVector,
-    indexNearCursor, cursorIndex, cursorAtEnd, relativeIndex,
+    indexNearCursor, cursorIndex, distanceFromCursor, cursorAtEnd, relativeIndex,
     testIndex, validateIndex,
     countOnCursor, countDefined, countUndefined,
     getVoid, sliceFromCursor, sliceBetween, safeSliceBetween, withVoidSlice, getSlice,
     UnsafeSlice, safeFreeze, safeClone, mutableCopy, safeCopy, sliceSize,
     withFullSlices, withRegion, withNewVector, copyRegion,
     putElemIndex, getElemIndex, putElem, getElem, delElem,
-    pushElem, pushElemVec, popElem, shiftCursor,
+    pushElem, pushElemVec, popElem, shiftCursor, moveCursorBy, moveCursorTo,
     minPow2ScaledSize, prepLargerVector, growVector, freezeVector, copyVec,
     ----
     GapBuffer(..), GapBufferState(..), BufferError(..), gapBufferLength,
@@ -226,11 +226,19 @@ indexAfterRange (VecIndex i) (VecLength len) = VecIndex (i + len)
 indexAtRangeEnd :: VecIndex -> VecLength -> VecIndex
 indexAtRangeEnd i0 len = let (VecIndex i) = indexAfterRange i0 len in VecIndex (i - 1)
 
--- | Distance between two 'VecIndex' values. This function always returns a positive (non-zero)
--- number because it is designed to produce a 'VecLength' value that selects all elements between
--- two delimiting indicies, including the elements at the delimited indicies.
+-- | Compute the distance of the first index parameter __relative to__ the second index
+-- parameter. This function is similar to the function 'Prelude.subtract'. See also 'indexRange'
+-- which is similar to this function but used in situations where you want to cover a range of
+-- indicies, rather than compute the distance between indicies.
 indexDistance :: VecIndex -> VecIndex -> VecLength
-indexDistance (VecIndex a) (VecIndex b) = VecLength $ 1 + abs (subtract a b)
+indexDistance (VecIndex a) (VecIndex b) = VecLength $ subtract a b
+
+-- | Compute the length __covered by the range of indicies__ between two 'VecIndex' values. Unline
+-- 'indexDistance' this function always returns a positive (non-zero) number because it is designed
+-- to produce a 'VecLength' value that selects all elements between two delimiting indicies,
+-- including the elements at the delimited indicies.
+indexRange :: VecIndex -> VecIndex -> VecLength
+indexRange (VecIndex a) (VecIndex b) = VecLength $ 1 + abs (subtract a b)
 
 -- | Returng a 'VecLength' indicating the distance the given 'VecIndex' is from the beginning of the
 -- buffer.
@@ -421,6 +429,11 @@ relativeIndex :: (Ord i, IsLength i, MonadEditVec vec m) => i -> m VecIndex
 relativeIndex = (. unwrapRelative) $ \ i ->
   flip indexAfterRange i <$> indexNearCursor (if i <= 0 then Before else After)
 
+-- | Given an index value, return a 'VecLength' indicating the distance the given index is from the
+-- gap buffer cursor.
+distanceFromCursor :: MonadEditVec vec m => VecIndex -> m VecLength
+distanceFromCursor i = indexDistance i <$> cursorIndex
+
 -- | This function computes the normalized, physical 'VecIndex' for any logical index value @i@ as
 -- long as @i@ instantiates the 'IsIndex'. The type @i@ is usually @('Absolute' 'LineIndex')@ when
 -- @m@ is 'Hakshell.TextEditor.TextEdit' or @('Absolute' 'CharIndex')@ when @m@ is
@@ -479,7 +492,7 @@ sliceFromCursor count =
 -- slice is never empty because if both indicies are the same, a vector containing that single
 -- element at that index is returned.
 sliceBetween :: MonadEditVec vec m => VecIndex -> VecIndex -> m vec
-sliceBetween from = sliceVectorSafe from . indexDistance from >=>
+sliceBetween from = sliceVectorSafe from . indexRange from >=>
   cloneVector . unwrapUnsafeSlice
 
 -- | Like 'sliceBetween' but does not create a clone of the vector, so the returned vector is unsafe
@@ -489,7 +502,7 @@ safeSliceBetween
   => VecIndex -> VecIndex
   -> (UnsafeSlice vec -> m a)
   -> m a
-safeSliceBetween from to = ((sliceVectorSafe from $ indexDistance from to) >>=)
+safeSliceBetween from to = ((sliceVectorSafe from $ indexRange from to) >>=)
 
 -- | Make a slice of the void region of the buffer (the contiguous region of invalid elements after
 -- the cursor). This can be used as the target of a vector copy. If the buffer is full, 'Nothing' is
@@ -731,6 +744,36 @@ shiftCursor count0 =
         before <- modCount Before (+ count)
         modCount After (subtract count)
         when (before == 0) $ setCursorIsDefined False
+
+moveCursorBy
+  :: (Ord i, Bounded i, IsIndex i,
+      Ord rel, IsLength rel,
+      GMVec.MVector vec elem,
+      Monad m, PrimMonad m,
+      MonadError BufferError m,
+      MonadEditVec (vec (PrimState m) elem) m,
+      MonadGapBuffer (vec (PrimState m) elem) m
+     )
+  => rel -> m i
+moveCursorBy rel0 = do
+  let rel = unwrapRelative rel0
+  (ok, _) <- relativeIndex rel0 >>= testIndex
+  unless ok $ do
+    i <- cursorIndex
+    throwError $ BufferIndexRange i $ unwrapRelative rel
+  shiftCursor rel
+  cursorIndex >>= indexToAbsolute
+
+moveCursorTo
+  :: (Ord i, Bounded i, IsIndex i,
+      PrimMonad m, GMVec.MVector vec elem,
+      MonadGapBuffer (vec (PrimState m) elem) m,
+      MonadError BufferError m
+     )
+  => i -> m i
+moveCursorTo =
+  validateIndex >=> distanceFromCursor >=> shiftCursor >=>
+  const (cursorIndex >>= indexToAbsolute)
 
 -- | Copy the current mutable buffer vector to an immutable vector.
 freezeVector
