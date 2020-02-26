@@ -9,14 +9,14 @@ module Hakshell.GapBuffer
     Relative(..), RelativeToCursor(..), relative, unwrapRelative,
     Absolute(..), absoluteIndex, indexToAbsolute,
     MonadEditVec(..), MonadGapBuffer(..), getVector,
-    indexNearCursor, cursorIndex, distanceFromCursor, cursorAtEnd, relativeIndex,
+    indexNearCursor, cursorIndex, distanceFromCursor, cursorAtEnd, relativeIndex, indexToRelative,
     testIndex, validateIndex, validateLength,
     countOnCursor, countDefined, countUndefined,
     getVoid, sliceFromCursor, sliceBetween, safeSliceBetween, withVoidSlice, getSlice,
     UnsafeSlice, safeFreeze, safeClone, mutableCopy, safeCopy, sliceSize,
     withFullSlices, withRegion, withNewVector, copyRegion,
     putElemIndex, getElemIndex, putElem, getElem, delElem,
-    pushElem, pushElemVec, popElem, shiftCursor, moveCursorBy, moveCursorTo,
+    pushElem, pushElemVec, popElem, shiftCursor, moveCursorBy, moveCursorTo, moveCursorNear,
     minPow2ScaledSize, prepLargerVector, growVector, freezeVector, copyVec,
     ----
     GapBuffer(..), GapBufferState(..), BufferError(..), gapBufferLength,
@@ -429,6 +429,14 @@ relativeIndex :: (Ord i, IsLength i, MonadEditVec vec m) => i -> m VecIndex
 relativeIndex = (. unwrapRelative) $ \ i ->
   flip indexAfterRange i <$> indexNearCursor (if i <= 0 then Before else After)
 
+indexToRelative
+  :: (Ord i, IsIndex i, Bounded i,
+      IsLength rel,
+      MonadEditVec vec m
+     )
+  => i -> m rel
+indexToRelative = fmap relative . (absoluteIndex >=> distanceFromCursor)
+
 -- | Given an index value, return a 'VecLength' indicating the distance the given index is from the
 -- gap buffer cursor.
 distanceFromCursor :: MonadEditVec vec m => VecIndex -> m VecLength
@@ -763,6 +771,7 @@ shiftCursor count0 =
         modCount After (subtract count)
         when (before == 0) $ setCursorIsDefined False
 
+-- | Move the cursor by some number of indicies.
 moveCursorBy
   :: (Ord i, Bounded i, IsIndex i,
       Ord rel, IsLength rel,
@@ -775,6 +784,9 @@ moveCursorBy
   => rel -> m i
 moveCursorBy = validateLength >=> shiftCursor >=> const (cursorIndex >>= indexToAbsolute)
 
+-- | Move the cursor by to an absolute (logical) index value. This function throws an exception if
+-- the index is out-of-bounds. Use 'moveCursorNear' to move the cursor to the nearest in-bounds
+-- logical index.
 moveCursorTo
   :: (Ord i, Bounded i, IsIndex i,
       PrimMonad m, GMVec.MVector vec elem,
@@ -784,6 +796,20 @@ moveCursorTo
   => i -> m i
 moveCursorTo =
   validateIndex >=> distanceFromCursor >=> shiftCursor >=>
+  const (cursorIndex >>= indexToAbsolute)
+
+-- | Like 'moveCursorBy' but never throws an exception if the given absolute (logical) index value
+-- is out of bounds, rather the cursor will be moved to the in-bound index nearest to the given
+-- logical index.
+moveCursorNear
+  :: (Ord i, Bounded i, IsIndex i,
+      PrimMonad m, GMVec.MVector vec elem,
+      MonadGapBuffer (vec (PrimState m) elem) m,
+      MonadError BufferError m
+     )
+  => i -> m i
+moveCursorNear =
+  testIndex >=> distanceFromCursor . snd >=> shiftCursor >=>
   const (cursorIndex >>= indexToAbsolute)
 
 -- | Copy the current mutable buffer vector to an immutable vector.

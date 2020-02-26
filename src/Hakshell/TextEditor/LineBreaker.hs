@@ -4,15 +4,12 @@ module Hakshell.TextEditor.LineBreaker
     -- The line break behavior of the 'TextBuffer' can be programmed to behave differently from the
     -- ordinary default behavior of breaking input strings on the @'\n'@ character.
     LineBreakSymbol(..), lineBreakSize,
-    LineBreaker(..), lineBreaker, lineBreakPredicate, defaultLineBreak, lineBreakerNLCR,
+    LineBreaker(..), lineBreaker, lineBreakPredicate, defaultLineBreak,
+    lineBreakerNLCR, lineBreakerNL, lineBreakerCR, lineBreakerNUL,
   ) where
 
 import           Control.Arrow ((>>>))
 import           Control.Lens
-
-import qualified Data.Vector.Unboxed as UVec
-
-import           Hakshell.String
 
 ----------------------------------------------------------------------------------------------------
 
@@ -68,17 +65,17 @@ data LineBreaker
     { theLineBreakPredicate :: Char -> Bool
       -- ^ This function is called by 'insertChar' to determine if the 'bufferLineEditor' should be
       -- terminated.
-    , theLineBreaker :: String -> [(String, String)]
+    , theLineBreaker :: String -> [(String, LineBreakSymbol)]
       -- ^ This function scans through a string finding character sequences that delimit the end of
       -- a line of text. For each returned tuple, the first element of the tuple should be a string
       -- without line breaks, the second element should contain a string with only line breaks, or
       -- an empty string if the string was not terminated with a line break.
-    , theDefaultLineBreak :: !CharVector
+    , theDefaultLineBreak :: !LineBreakSymbol
       -- ^ This defines the default line break to be used by the line breaking function.
     }
 
 -- | This defines the default line break to be used by the line breaking function.
-defaultLineBreak :: Lens' LineBreaker CharVector
+defaultLineBreak :: Lens' LineBreaker LineBreakSymbol
 defaultLineBreak = lens theDefaultLineBreak $ \ a b -> a{ theDefaultLineBreak = b }
 
 -- | This function is called by 'insertChar' to determine if the 'bufferLineEditor' should be
@@ -88,7 +85,7 @@ lineBreakPredicate = lens theLineBreakPredicate $ \ a b -> a{ theLineBreakPredic
 
 -- | This function scans through a string finding character sequences that delimit the end of a line
 -- of text.
-lineBreaker :: Lens' LineBreaker (String -> [(String, String)])
+lineBreaker :: Lens' LineBreaker (String -> [(String, LineBreakSymbol)])
 lineBreaker = lens theLineBreaker $ \ a b -> a{ theLineBreaker = b }
 
 -- | This is the default line break function. It will split the line on the character sequence
@@ -98,13 +95,43 @@ lineBreaker = lens theLineBreaker $ \ a b -> a{ theLineBreaker = b }
 lineBreakerNLCR :: LineBreaker
 lineBreakerNLCR = LineBreaker
   { theLineBreakPredicate = nlcr
-  , theLineBreaker = lines
-  , theDefaultLineBreak = UVec.fromList "\n"
+  , theLineBreaker        = lines
+  , theDefaultLineBreak   = LineBreakNL
   } where
     nlcr c = c == '\n' || c == '\r'
     lines  = break nlcr >>> \ case
       (""  , "") -> []
-      (line, "") -> [(line, "")]
-      (line, '\n':'\r':more) -> (line, "\n\r") : lines more
-      (line, '\r':'\n':more) -> (line, "\r\n") : lines more
-      (line, c:more)         -> (line, [c])    : lines more
+      (line, '\n':'\r':more) -> (line, LineBreakNLCR) : lines more
+      (line, '\r':'\n':more) -> (line, LineBreakCRNL) : lines more
+      (line, c:more)         -> case c of
+        '\n' -> (line, LineBreakNLCR) : lines more
+        '\r' -> (line, LineBreakCRNL) : lines more
+        c    -> error $ "lineBreakerNLCR: 'break' stopped on char "++show c
+      (line, "") -> [(line, NoLineBreak)]
+
+-- Not for export
+makeLineBreaker :: LineBreakSymbol -> Char -> LineBreaker
+makeLineBreaker sym c = LineBreaker
+  { theLineBreakPredicate = (== c)
+  , theLineBreaker        = lines
+  , theDefaultLineBreak   = LineBreakNL
+  } where
+  lines = break (== c) >>> \ case
+    (""  , ""    ) -> []
+    (line, _:more) -> (line, sym) : lines more
+    (line, ""    ) -> [(line, NoLineBreak)]
+
+-- | Only breaks lines on @'\n'@ characters, all other characters are treated as ordinary line
+-- content.
+lineBreakerNL :: LineBreaker
+lineBreakerNL = makeLineBreaker LineBreakNL '\n'
+
+-- | Only breaks lines on @'\r'@ characters, all other characters are treated as ordinary line
+-- content.
+lineBreakerCR :: LineBreaker
+lineBreakerCR = makeLineBreaker LineBreakCR '\r'
+
+-- | Only breaks lines on @'\0'@ (null) characters, all other characters are treated as ordinary
+-- line content.
+lineBreakerNUL :: LineBreaker
+lineBreakerNUL = makeLineBreaker LineBreakNUL '\0'
