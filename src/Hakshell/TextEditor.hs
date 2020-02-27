@@ -105,7 +105,7 @@ module Hakshell.TextEditor
     EditText, runEditTextIO, runEditTextOnCopy,
 
     insertString, lineBreak, lineBreakWith, deleteCharsWrap,
-    pushLine, popLine, currentTextLocation, currentLineNumber, currentColumnNumber,
+    pushLine, popLine, getLineNumber, getColumnNumber,
     getLineIndex, putLineIndex, withCurrentLine,
     bufferLineCount, bufferIsEmpty, currentBuffer,
     lineCursorIsDefined, 
@@ -131,23 +131,20 @@ module Hakshell.TextEditor
 
     TextEditError(..),
     
-    -- ** Moving the Cursor
+    -- ** Positioning the Cursor
     --
-    -- __IMPORTANT__: when moving the cursor around using 'gotoPosition' or similar functions, the
-    -- 'LineEditor' does not leave it's contents on the current line unless you explicitly call
-    -- 'flushLineEditor'. Without "flushing" the characters currently in the 'LineEditor' will not
-    -- be saved to the 'TextBuffer' and will be carried around to the 'LineEditor's current
-    -- position. After moving to the new line, the 'LineEditor' will not load the content of the new
-    -- line until you evaluate 'refillLineEditor'.
-    --
-    -- If you want the "normal" text editor behavior, where the 'LineEditor' leaves the characters
-    -- currenly being edited on the current line, moves to a new line, and then begins editing the
-    -- characters on that new line, you must evaluate a cursor motion value with 'flushRefill'.
+    -- __IMPORTANT__: when moving the cursor around, some functions, like 'gotoLine' or 'moveByLine'
+    -- do not leave it's contents on the current line unless you explicitly call 'flushLineEditor',
+    -- but other functions like 'gotoLocation' do automatically call 'flushLineEditor'. Without
+    -- "flushing" the characters currently in the 'LineEditor' will not be saved to the 'TextBuffer'
+    -- and will be carried around to the 'LineEditor's current location, however if the cursor's
+    -- column location cannot be changed unless 'refilLineEditor' is used to move the line
+    -- location.
     --
     -- There are situations where you may not want to use 'flushRefill' to perform a cursor motion, as
     -- in when accumulating lines into the 'LineEditor' after each cursor motion.
 
-    getPosition, gotoPosition, saveCursorEval, gotoLine, goNearLine, gotoChar, goNearChar,
+    getLocation, gotoLocation, saveCursorEval, gotoLine, goNearLine, gotoChar, goNearChar,
 
     Absolute(..),  LineIndex(..), CharIndex(..), TextLocation(..),
     TextCursorSpan(..), CharStats(..),
@@ -286,10 +283,10 @@ instance IsLength (Relative CharIndex) where
   fromLength (Relative (CharIndex i)) = i
   toLength = Relative . CharIndex
 
--- | When instructing the editor engine to move by or delete a number of cursor positions (where
--- line breaking characters consisting of two characters are considered a single cursor position,
+-- | When instructing the editor engine to move by or delete a number of cursor locations (where
+-- line breaking characters consisting of two characters are considered a single cursor location,
 -- thus the 'moveByCharWrap' or 'deleteCharsWrap' functions), you must specify the number of cursor
--- positions to move or delete using a value of this type.
+-- locations to move or delete using a value of this type.
 newtype TextCursorSpan = TextCursorSpan Int
   deriving (Eq, Ord, Show, Read, Enum, Num, Bounded)
 
@@ -312,7 +309,7 @@ newtype TextCursorSpan = TextCursorSpan Int
 --
 -- (o) Privately 0-based indicies, publicly 1-based indicies
 --
--- When a user positions the cursor, it is done with 1-based indexing values of type 'LineIndex' or
+-- When a user locations the cursor, it is done with 1-based indexing values of type 'LineIndex' or
 -- 'CharIndex', so the first line is line 1, not line zero. This means care must be taken to
 -- translate these addresses to vector indicies by subtracting 1 from every line number parameter
 -- passed by a public API, which is done with functions like 'charToIndex' and
@@ -366,7 +363,7 @@ newtype TextCursorSpan = TextCursorSpan Int
 unwrapTextCursorSpan :: TextCursorSpan -> Int
 unwrapTextCursorSpan (TextCursorSpan o) = o
 
--- | This data structure contains information about the number of character positions traversed
+-- | This data structure contains information about the number of character locations traversed
 -- during a function evaluation. Values of this type are returned by 'insertString',
 -- 'deleteCharsWrap', or 'moveByCharWrap'. It counts both actual UTF characters and "cursor steps".
 -- A "cursor step" is a unit counted in a way that treats multiple-character line breaks like "\r\n"
@@ -658,7 +655,7 @@ viewerLine = lens theViewerLine $ \ a b -> a{ theViewerLine = b }
 --     buf <- 'newTextBuffer' ()
 --     'runEditText' $ do
 --         'insertString' "Hello, world!\\nThis is a text document.\\n"
---         'gotoPosition' 1 0 'Control.Monad.>>' 'insertChar' \'"\'
+--         'gotoLocation' 1 0 'Control.Monad.>>' 'insertChar' \'"\'
 --         'moveByChar' 'Prelude.maxBound' 'Control.Monad.>>' 'insertChar' '"'
 --     'Control.Monad.return' ()
 -- @
@@ -702,8 +699,8 @@ data TextBufferState tags
     , theBufferLineEditor    :: !(LineEditor tags)
       -- ^ A data structure for editing individual characters in a line of text.
     , theBufferTargetCol     :: !(Absolute CharIndex)
-      -- ^ When moving the cursor up and down the 'TextBuffer' (e.g. using 'gotoPosition'), the
-      -- cursor should generally remain at the same character column position.
+      -- ^ When moving the cursor up and down the 'TextBuffer' (e.g. using 'gotoLocation'), the
+      -- cursor should generally remain at the same character column location.
     }
   -- TODO: First do the TODO item on the 'TextBuffer' data type, then rename this to
   -- 'TextBuffer'. Create a 'runEditText' API function and export it.
@@ -756,8 +753,8 @@ bufferVector = textEditGapBuffer . gapBufferVector
 bufferLineEditor :: Lens' (TextBufferState tags) (LineEditor tags)
 bufferLineEditor = lens theBufferLineEditor $ \ a b -> a{ theBufferLineEditor = b }
 
--- | When moving the cursor up and down the 'TextBuffer' (e.g. using 'gotoPosition'), the cursor
--- should generally remain at the same character column position.
+-- | When moving the cursor up and down the 'TextBuffer' (e.g. using 'gotoLocation'), the cursor
+-- should generally remain at the same character column location.
 bufferTargetCol :: Lens' (TextBufferState tags) (Absolute CharIndex)
 bufferTargetCol = lens theBufferTargetCol $ \ a b -> a{ theBufferTargetCol = b }
 
@@ -770,7 +767,7 @@ bufferTargetCol = lens theBufferTargetCol $ \ a b -> a{ theBufferTargetCol = b }
 -- the 'TextBuffer'. The content of a 'LineEditor' can be reverted to the content of the line
 -- currently under the cursor by calling 'refillLineEditor'.
 --
--- Some cursor motion functions, like 'moveCursor' and 'gotoPosition' automatically evaluate
+-- Some cursor motion functions, like 'moveCursor' and 'gotoLocation' automatically evaluate
 -- 'flushLineEditor' before moving the cursor and automatically evaluate 'refillLineEditor' after
 -- moving the cursor. Other cursor motion functions, like 'gotoLine' and 'moveByLine' __DO_NOT__
 -- evaluate 'flushLineEditor' or 'refillLineEditor' at all, allowing you to accumulate 'TextLine's
@@ -786,7 +783,7 @@ data LineEditor tags
       -- ^ The internal 'GapBufferState'.
     , theLineEditorIsClean   :: !Bool
       -- ^ This is set to 'True' if 'theBufferLineEditor' is a perfect copy of the 'TextLine'
-      -- currently being referred to by the 'currentLineNumber'. If the content of
+      -- currently being referred to by the 'getLineNumber'. If the content of
       -- 'theBufferLineEditor' has been modified by 'insertChar' or 'deleteChars', or if cursor has
       -- been moved to a different line, this field is set to 'False'.
     , theCursorBreakSymbol   :: !LineBreakSymbol
@@ -827,7 +824,7 @@ lineEditorTags :: Lens' (LineEditor tags) tags
 lineEditorTags = lens theLineEditorTags $ \ a b -> a{ theLineEditorTags = b }
 
 -- | This is set to 'True' if 'theBufferLineEditor' is a perfect copy of the 'TextLine' currently
--- being referred to by the 'currentLineNumber'. If the content of 'theBufferLineEditor' has been
+-- being referred to by the 'getLineNumber'. If the content of 'theBufferLineEditor' has been
 -- modified by 'insertChar' or 'deleteChars', or if cursor has been moved to a different line, this
 -- field is set to 'False'.
 lineEditorIsClean :: Lens' (LineEditor tags) Bool
@@ -1051,7 +1048,7 @@ sliceLineToEnd rel = let s = view textLineString in splitLine >>= case rel of
   Before -> similarLine (const NoLineBreak) . s . fst
   After  -> similarLine id . s . snd
 
--- | Splits the current 'TextLine' at the current cursor position.
+-- | Splits the current 'TextLine' at the current cursor location.
 splitLine :: Monad m => ViewLine tags m (TextLine tags, TextLine tags)
 splitLine = do
   (before, after) <- viewLineLiftIIBuffer $ withFullSlices $ \ before after ->
@@ -1152,7 +1149,7 @@ newTextBuffer initSize tags = do
   return this
 
 -- | Create a deep-copy of a 'TextBuffer'. Everything is copied perfectly, including the cursor
--- position, and the content and state of the cursor.
+-- location, and the content and state of the cursor.
 copyTextBuffer :: TextBuffer tags -> IO (TextBuffer tags)
 copyTextBuffer (TextBuffer mvar) = withMVar mvar $ \ oldTextBuf ->
   fst <$> runGapBuffer cloneGapBufferState (oldTextBuf ^. textEditGapBuffer) >>= \ case
@@ -1204,7 +1201,7 @@ newLineEditorIO parent initSize tag = do
       , theLineEditorTags    = tag
       }
 
--- | Use this to create a deep-copy of a 'LineEditor'. The cursor position within the 'LineEditor'
+-- | Use this to create a deep-copy of a 'LineEditor'. The cursor location within the 'LineEditor'
 -- is also copied.
 --
 -- See also the 'copyLineEditor' function which calls this function within an 'MonadEditText'
@@ -1349,24 +1346,22 @@ thisTextBuffer :: Monad m => EditText tags m (TextBuffer tags)
 thisTextBuffer = EditText ask
 
 -- | Get the current line number of the cursor.
-currentLineNumber
+getLineNumber
   :: (MonadIO m, PrimMonad m, PrimState m ~ RealWorld)
   => EditText tags m (Absolute LineIndex)
-currentLineNumber = editTextLiftGapBuffer $ cursorIndex >>= indexToAbsolute
+getLineNumber = editTextLiftGapBuffer $ cursorIndex >>= indexToAbsolute
 
 -- | Get the current column number of the cursor.
-currentColumnNumber
+getColumnNumber
   :: (MonadIO m, PrimMonad m, PrimState m ~ RealWorld)
   => EditLine tags m (Absolute CharIndex)
-currentColumnNumber = editLineLiftGapBuffer $ cursorIndex >>= indexToAbsolute
+getColumnNumber = editLineLiftGapBuffer $ cursorIndex >>= indexToAbsolute
 
--- | Get the current cursor position. This function is identical to 'getPosition'.
-currentTextLocation
+-- | Get the current cursor location. This function is identical to 'getLocation'.
+getLocation
   :: (MonadIO m, PrimMonad m, PrimState m ~ RealWorld)
   => EditText tags m TextLocation
-currentTextLocation =
-  TextLocation <$> currentLineNumber <*> editLine currentColumnNumber
-  -- TODO: rename this to 'getLocation'
+getLocation = TextLocation <$> getLineNumber <*> editLine getColumnNumber
 
 -- | Create a copy of the 'bufferLineEditor'.
 copyLineEditorText
@@ -1380,7 +1375,7 @@ validateRelativeChar
   :: (MonadIO m, PrimMonad m, PrimState m ~ RealWorld)
   => Relative CharIndex -> EditLine tags m VecIndex
 validateRelativeChar rel =
-  flip shiftAbsolute rel <$> currentColumnNumber >>= editLineLiftGapBuffer . validateIndex
+  flip shiftAbsolute rel <$> getColumnNumber >>= editLineLiftGapBuffer . validateIndex
 
 -- not for export
 makeLineWithSlice
@@ -1455,7 +1450,7 @@ putLineIndex i line = editTextLiftGapBuffer $
   validateIndex i >>= absoluteIndex >>= flip putElemIndex line
 
 -- | Replace the content in the 'bufferLineEditor' with the content in the given 'TextLine'. Pass
--- an integer value indicating where the cursor position should be set. This function does not
+-- an integer value indicating where the cursor location should be set. This function does not
 -- re-allocate the current line editor buffer unless it is too small to hold all of the characters
 -- in the given 'TextLine', meaning this function only grows the buffer memory allocation, it never
 -- shrinks the memory allocation.
@@ -1473,7 +1468,7 @@ refillLineEditorWith = \ case
   TextLineUndefined -> error
     "internal error: evaluated (refillLineEditorWith TextLineUndefined)"
   line              -> (>>= (throwError ||| return)) $ editLine $ do
-    cur <- currentColumnNumber
+    cur <- getColumnNumber
     flip runViewLineT line $ viewLineLiftIIBuffer $ do
       (_ok, i) <- testIndex cur
       withFullSlices $ \ srcLo srcHi -> lift $ editLineLiftGapBuffer $ do
@@ -1546,7 +1541,7 @@ copyLineEditor = TextLine
 -- function, you can choose when to copy the content of the 'LineEditor' back to the buffer after
 -- moving it. This can be done to "move" the content of a line out of the 'TextBuffer', into the
 -- 'LineEditor', and then move the content back into the 'TextBuffer' at a different location after
--- changing position. This can also be useful after accumulating the content of several lines of
+-- changing location. This can also be useful after accumulating the content of several lines of
 -- text into the 'LineEditor'.
 flushLineEditor
   :: (MonadIO m, PrimMonad m, PrimState m ~ RealWorld)
@@ -1559,7 +1554,7 @@ flushLineEditor = do
     bufferLineEditor . lineEditorIsClean .= True
     return line
 
--- | Evaluate a function on the 'TextLine' currently under the 'currentLineNumber'. This function
+-- | Evaluate a function on the 'TextLine' currently under the 'getLineNumber'. This function
 -- throws an exception if the 'TextBuffer' is empty. __NOTE__ that the 'TextBuffer' is considered
 -- empty if there are characters in the 'LineBuffer' which have not been flushed to the empty
 -- 'TextBuffer' by either 'flushLineEditor' or 'flushRefill'.
@@ -1567,7 +1562,7 @@ withCurrentLine
   :: (MonadIO m, PrimMonad m, PrimState m ~ RealWorld)
   => (Absolute LineIndex -> TextLine tags -> EditLine tags m a) -> EditText tags m a
 withCurrentLine f = do
-  (ln, line) <- (,) <$> currentLineNumber <*> editTextLiftGapBuffer (getElem Before)
+  (ln, line) <- (,) <$> getLineNumber <*> editTextLiftGapBuffer (getElem Before)
   case line of
     TextLineUndefined -> error $
       "internal error: "++show ln++" received from 'getLineIndex' points to undefined line"
@@ -1613,9 +1608,9 @@ modifyColumn f = do
     shiftCursor $ unwrapRelative $ f oldch top
     indexNearCursor Before >>= indexToAbsolute
 
--- | Usually when you move the cursor to a different line using 'gotoPosition', 'gotoLine',
+-- | Usually when you move the cursor to a different line using 'gotoLocation', 'gotoLine',
 -- 'moveByLine', or 'moveCursor', you expect the content of the 'LineEditor' to remain on the
--- current line and you expect the 'LineEditor' will begin editing the line at the new position to
+-- current line and you expect the 'LineEditor' will begin editing the line at the new location to
 -- where it moved -- but unless you evaluate your cursor motion with the 'flushRefill' function, this
 -- is not the default cursor motion behavior. The 'LineEditor' must be explicitly instructed to
 -- flush it's contents to the current line using 'flushLineEditor', and load the content of the new
@@ -1630,11 +1625,11 @@ flushRefill
 flushRefill motion = flushLineEditor >> motion <* refillLineEditor
 
 -- | This function calls 'moveByLine' and then 'moveByChar' to move the cursor by a number of lines
--- and characters relative to the current cursor position.
+-- and characters relative to the current cursor location.
 --
 -- __WARNING__: This evaluates 'flushLineEditor' before moving the cursor, and evaluates
 -- 'refillLineEditor' after moving the cursor. This is necessary because it is impossible to
--- instruct the 'LineEditor' which character position to move to unless it contains an accurate copy
+-- instruct the 'LineEditor' which character location to move to unless it contains an accurate copy
 -- of the line of the buffer that it is currently editing.
 --
 -- If you want to move the cursor without flushing and refilling, use 'gotoLine' or
@@ -1656,7 +1651,7 @@ moveByLine
   => Relative LineIndex -> EditText tags m (Absolute LineIndex)
 moveByLine = editTextLiftGapBuffer . moveCursorBy
 
--- | Move the cursor to a different character position within the 'bufferLineEditor' by an @n ::
+-- | Move the cursor to a different character location within the 'bufferLineEditor' by an @n ::
 -- Int@ number of characters. A negative @n@ indicates moving toward the start of the line, a
 -- positive @n@ indicates moving toward the end of the line.
 --
@@ -1763,7 +1758,7 @@ deleteChars req@(TextCursorSpan curspan0) = do
     }
 
 -- | This function evaluates the 'lineBreaker' function on the given string, and beginning from the
--- current cursor position, begins inserting all the lines of text produced by the 'lineBreaker'
+-- current cursor location, begins inserting all the lines of text produced by the 'lineBreaker'
 -- function.
 insertString
   :: (MonadIO m, PrimMonad m, PrimState m ~ RealWorld)
@@ -1790,7 +1785,7 @@ insertString str = do
   loop mempty $ breaker str
 
 -- | Same as 'lineBreakWith', but uses the 'defaultLineBreak' value to break the line at the current
--- cursor position.
+-- cursor location.
 lineBreak
   :: (MonadIO m, PrimMonad m, PrimState m ~ RealWorld)
   => RelativeToCursor -> EditText tags m ()
@@ -1828,6 +1823,8 @@ lineBreakWith newlbrk rel = join $ editLine $ do
 
 ----------------------------------------------------------------------------------------------------
 
+-- | This value denotes the location of some text, and can also be used to position the cursor when
+-- used with 'gotoLocation'.
 data TextLocation
   = TextLocation
     { theLocationLineIndex :: !(Absolute LineIndex)
@@ -1873,38 +1870,30 @@ lineIndex = lens theLocationLineIndex $ \ a b -> a{ theLocationLineIndex = b }
 charIndex :: Lens' TextLocation (Absolute CharIndex)
 charIndex = lens theLocationCharIndex $ \ a b -> a{ theLocationCharIndex = b }
 
--- | Get the current position of the cursor. This function is identical to 'currentTextLocation'.
-getPosition
-  :: (MonadIO m, PrimMonad m, PrimState m ~ RealWorld)
-  => EditText tags m TextLocation
-getPosition = currentTextLocation
-  -- TODO: remove this. It was added because I couldn't remember the name of
-  -- 'currentTextLocation'. I will rename 'currentTextLocation' to 'getLocation'.
-
 -- | This function calls 'gotoLine' and then 'gotoChar' to move the cursor to an absolute a line
 -- number and characters (column) number.
 --
 -- __WARNING__: This evaluates 'flushLineEditor' before moving the cursor, and evaluates
 -- 'refillLineEditor' after moving the cursor. This is necessary because it is impossible to
--- instruct the 'LineEditor' which character position to move to unless it contains an accurate copy
+-- instruct the 'LineEditor' which character location to move to unless it contains an accurate copy
 -- of the line of the buffer that it is currently editing.
 --
 -- If you want to move the cursor without flushing and refilling, use 'gotoLine' or
 -- 'moveByLine'. Then once you have decided what to do with the content of the current line editor,
 -- can move the cursor column with 'gotoChar' or 'moveByChar', or set the new target column with the
 -- expression @('bufferTargetCol' 'Control.Lens..=' c)@.
-gotoPosition
+gotoLocation
   :: (MonadIO m, PrimMonad m, PrimState m ~ RealWorld)
   => TextLocation -> EditText tags m TextLocation
-gotoPosition (TextLocation{theLocationLineIndex=ln,theLocationCharIndex=ch}) =
+gotoLocation (TextLocation{theLocationLineIndex=ln,theLocationCharIndex=ch}) =
   TextLocation <$> flushRefill (gotoLine ln) <*> gotoChar ch
   -- TODO: rename this to 'gotoLocation'.
 
--- | Like 'gotoPosition' but never throws an exception if the given 'TextLocation' is out of bounds.
-goNearPosition
+-- | Like 'gotoLocation' but never throws an exception if the given 'TextLocation' is out of bounds.
+goNearLocation
   :: (MonadIO m, PrimMonad m, PrimState m ~ RealWorld)
   => TextLocation -> EditText tags m TextLocation
-goNearPosition (TextLocation{theLocationLineIndex=ln,theLocationCharIndex=ch}) =
+goNearLocation (TextLocation{theLocationLineIndex=ln,theLocationCharIndex=ch}) =
   TextLocation <$> flushRefill (goNearLine ln) <*> goNearChar ch
   -- TODO: rename this to 'goNearLocation'.
 
@@ -1915,8 +1904,8 @@ saveCursorEval
   :: (MonadIO m, PrimMonad m, PrimState m ~ RealWorld)
   => EditText tags m a -> EditText tags m a
 saveCursorEval f = do
-  (cur, a) <- (,) <$> currentTextLocation <*> f
-  goNearPosition cur >> return a
+  (cur, a) <- (,) <$> getLocation <*> f
+  goNearLocation cur >> return a
 
 class RelativeToAbsoluteCursor index editor | editor -> index where
   -- | Convert a 'Relative' index (either a 'LineIndex' or 'CharIndex') to an 'Absolute' index.
@@ -2086,7 +2075,7 @@ textViewOnLines from to = textView
    })
 
 -- | Create a new, editable 'TextBuffer' from a read-only 'TextView'. Pass 'Before' to place the
--- text in the buffer before the cursor, meaning the cursor will start positioned at the end of the
+-- text in the buffer before the cursor, meaning the cursor will start locationed at the end of the
 -- editable 'TextBuffer', or pass 'After' to place the text in the buffer after the cursor, meaning
 -- the cursor will start at the beginning of the editable 'TextBuffer'.
 newTextBufferFromView :: MonadIO m => RelativeToCursor -> tags -> TextView tags -> m (TextBuffer tags)
@@ -2155,8 +2144,8 @@ data StreamCursor tags
       -- 'streamResetCache' is evaluated within an 'EditText' function context.
     , theStreamLocation :: !TextLocation
       -- ^ Thinking of a 'StreamCursor' as a cursor pointing to a character within a 'TextBuffer'
-      -- this function returns the 'TextLocation' of the cursor, similar to how
-      -- 'currentTextLocation' returns the position of the text editing cursor.
+      -- this function returns the 'TextLocation' of the cursor, similar to how 'getLocation'
+      -- returns the location of the text editing cursor.
     , theStreamEndpoint :: !TextLocation
       -- ^ This is 'TextLocation' of the final character within the 'TextBuffer' from which this
       -- 'StreamCursor' is reading. If the 'TextBuffer' is modified during parsing, this value must
@@ -2276,7 +2265,7 @@ streamIsEOF s = theStreamLocation s >= theStreamEndpoint s
 
 -- | There are times when the 'StreamCursor' contains a cached 'TextLine' (given by the
 -- 'streamCache' value) that is different from the actual 'TextLine' unders the cursor
--- position of the 'TextLocation' given by 'streamLocation'. This can happen when you evaluate
+-- location of the 'TextLocation' given by 'streamLocation'. This can happen when you evaluate
 -- a 'StreamCursor' in a new 'EditText' context for a different 'TextBuffer', or if
 -- 'flushLineEditor' has been evaluated and modified the line currently being inspected by the
 -- 'StreamCursor'.
