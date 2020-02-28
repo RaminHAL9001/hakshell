@@ -831,7 +831,7 @@ freezeVector = do
 
 data BufferError
   = BufferIsEmpty
-  | UndefinedElement  VecIndex
+  | UndefinedAtIndex  VecIndex
   | BufferLimitError  RelativeToCursor
   | BufferIndexBounds VecIndex
   | BufferIndexRange  VecIndex VecLength
