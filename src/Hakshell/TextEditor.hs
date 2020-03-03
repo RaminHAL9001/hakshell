@@ -160,21 +160,21 @@ module Hakshell.TextEditor
 
     -- ** Text Views
     --
-    -- A 'TextView' is an immutable copy of a portion of a 'TextBuffer'. By creating a 'TextView'
+    -- A 'TextFrame' is an immutable copy of a portion of a 'TextBuffer'. By creating a 'TextFrame'
     -- you take a snapshot of a 'TextBuffer' at a point in time which can then be pasted into
     -- another 'TextBuffer', or used to draw the window of an interactive text editor application.
 
-    TextView, textView, textViewOnLines, textViewAppend, emptyTextView,
-    newTextBufferFromView, textViewCharCount, textViewVector,
-    textViewToList, textViewToStrings,
+    TextFrame, textFrame, textFrameOnLines, textFrameAppend, emptyTextFrame,
+    newTextBufferFromFrame, textFrameCharCount, textFrameVector,
+    textFrameToList, textFrameToStrings,
 
-    -- *** Fold over a 'TextView'.
+    -- *** Fold over a 'TextFrame'.
     --
-    -- It is possible to perform a folding operation on a 'TextView', this is often a good way to
-    -- draw a graphical represntation of text, or to translate the 'TextView' to some other data
+    -- It is possible to perform a folding operation on a 'TextFrame', this is often a good way to
+    -- draw a graphical represntation of text, or to translate the 'TextFrame' to some other data
     -- type.
 
-    FoldTextView, forLinesInView,
+    FoldTextFrame, forLinesInFrame,
 
     -- * Parser Stream
     --
@@ -1110,7 +1110,7 @@ runViewLine f = runIdentity . runViewLineT f
 cursorIsOnLineBreak :: Monad m => ViewLine tags m Bool
 cursorIsOnLineBreak = indexIsOnLineBreak <$> use viewerLine <*> viewLineLiftIIBuffer cursorIndex
 
--- | Move the cursor of the 'TextView' to the given 'Absolute' 'CharIndex'.
+-- | Move the cursor of the 'TextFrame' to the given 'Absolute' 'CharIndex'.
 viewerCursorTo :: Monad m => Absolute CharIndex -> ViewLine tags m ()
 viewerCursorTo = viewLineLiftIIBuffer .
   (validateIndex >=> (iiBufferCursor .=) . distanceFromOrigin)
@@ -1991,72 +1991,72 @@ instance
 
 ----------------------------------------------------------------------------------------------------
 
--- | 'TextView's are a shallow, immutable snapshot of all, or a portion of, a 'TextBuffer'. The
--- internal structure of a 'TextView' is identical to that of the 'TextBuffer' so no additional
+-- | 'TextFrame's are a shallow, immutable snapshot of all, or a portion of, a 'TextBuffer'. The
+-- internal structure of a 'TextFrame' is identical to that of the 'TextBuffer' so no additional
 -- conversion or copying is necessary, making the creation of views extremely fast. Create a
--- 'TextView' using 'textViewOnLines' or 'textViewOnRange'. Once a 'TextView' is created other
+-- 'TextFrame' using 'textFrameOnLines' or 'textFrameOnRange'. Once a 'TextFrame' is created other
 -- threads may immediately resume performing updates on the 'TextBuffer'.
-data TextView tags
-  = TextView
-    { textViewCharCount :: !Int
+data TextFrame tags
+  = TextFrame
+    { textFrameCharCount :: !Int
       -- ^ Evaluates to how many characters exist in this buffer.
-    , textViewVector    :: !(Vec.Vector (TextLine tags))
+    , textFrameVector    :: !(Vec.Vector (TextLine tags))
       -- ^ Evaluates to a vector of 'TextLine's so you can make use of the 'Vec.Vector' APIs to
-      -- define your own operations on a 'TextView'.
+      -- define your own operations on a 'TextFrame'.
     }
 
-instance Semigroup tags => Semigroup (TextView tags) where
-  (<>) = textViewAppend (<>)
+instance Semigroup tags => Semigroup (TextFrame tags) where
+  (<>) = textFrameAppend (<>)
 
-instance Monoid tags => Monoid (TextView tags) where
-  mempty  = TextView{ textViewCharCount = 0, textViewVector = mempty }
-  mappend = textViewAppend mappend
+instance Monoid tags => Monoid (TextFrame tags) where
+  mempty  = TextFrame{ textFrameCharCount = 0, textFrameVector = mempty }
+  mappend = textFrameAppend mappend
 
-newtype FoldTextView r fold tags m a
-  = FoldTextView
-    { unwrapFoldTextView :: ContT r (StateT fold m) a
+newtype FoldTextFrame r fold tags m a
+  = FoldTextFrame
+    { unwrapFoldTextFrame :: ContT r (StateT fold m) a
     }
   deriving (Functor, Applicative, Monad)
 
-instance Monad m => MonadState fold (FoldTextView r fold tags m) where
-  state = FoldTextView . lift . state
+instance Monad m => MonadState fold (FoldTextFrame r fold tags m) where
+  state = FoldTextFrame . lift . state
 
-instance Monad m => MonadCont (FoldTextView r fold tags m) where
-  callCC f = FoldTextView $ callCC $ unwrapFoldTextView . f . (FoldTextView .)
+instance Monad m => MonadCont (FoldTextFrame r fold tags m) where
+  callCC f = FoldTextFrame $ callCC $ unwrapFoldTextFrame . f . (FoldTextFrame .)
 
-instance MonadTrans (FoldTextView r fold tags) where
-  lift = FoldTextView . lift . lift
+instance MonadTrans (FoldTextFrame r fold tags) where
+  lift = FoldTextFrame . lift . lift
 
-type FoldTextViewHalt void fold tags m r = r -> FoldTextView r fold tags m void
+type FoldTextFrameHalt void fold tags m r = r -> FoldTextFrame r fold tags m void
 
--- | Decompose a 'TextView' into a list of 'TextLine's.
-textViewToList :: TextView tags -> [TextLine tags]
-textViewToList = Vec.toList . textViewVector
+-- | Decompose a 'TextFrame' into a list of 'TextLine's.
+textFrameToList :: TextFrame tags -> [TextLine tags]
+textFrameToList = Vec.toList . textFrameVector
 
--- | Decompose a 'TextView' into a list of tagged 'String's. The 'String' is paired with a 'Word16'
+-- | Decompose a 'TextFrame' into a list of tagged 'String's. The 'String' is paired with a 'Word16'
 -- count of the number of line-breaking characters exist at the end of the string, and the @tags@
 -- assoicated with the text.
-textViewToStrings :: TextView tags -> [(String, tags)]
-textViewToStrings = textViewToList >=> \ case
+textFrameToStrings :: TextFrame tags -> [(String, tags)]
+textFrameToStrings = textFrameToList >=> \ case
   TextLineUndefined -> []
   line@(TextLine{theTextLineTags=tags,theTextLineBreakSymbol=lbrksym}) ->
     [(textLineChomp line ++ show lbrksym, tags)]
 
--- | An empty 'TextView', containing zero lines of text.
-emptyTextView :: TextView tags
-emptyTextView = TextView{ textViewCharCount = 0, textViewVector = Vec.empty }
+-- | An empty 'TextFrame', containing zero lines of text.
+emptyTextFrame :: TextFrame tags
+emptyTextFrame = TextFrame{ textFrameCharCount = 0, textFrameVector = Vec.empty }
 
 -- | This function works similar to 'Data.Monoid.mappend' or the @('Data.Semigroup.<>')@ operator,
 -- but allows you to provide your own appending function for the @tags@ value. Tags are appended if
--- the final lines of the left 'TextView' has no line break and therefore must to be prepended to
--- the first line of the right 'TextView'. If the left 'TextView' ends with a line break, the @tags@
+-- the final lines of the left 'TextFrame' has no line break and therefore must to be prepended to
+-- the first line of the right 'TextFrame'. If the left 'TextFrame' ends with a line break, the @tags@
 -- appending function is never evaluated.
-textViewAppend :: (tags -> tags -> tags) -> TextView tags -> TextView tags -> TextView tags
-textViewAppend appendTags
-  TextView{textViewCharCount=countA,textViewVector=vecA}
-  TextView{textViewCharCount=countB,textViewVector=vecB} = TextView
-    { textViewCharCount = countA + countB
-    , textViewVector = let { lenA = Vec.length vecA; lenB = Vec.length vecB; } in
+textFrameAppend :: (tags -> tags -> tags) -> TextFrame tags -> TextFrame tags -> TextFrame tags
+textFrameAppend appendTags
+  TextFrame{textFrameCharCount=countA,textFrameVector=vecA}
+  TextFrame{textFrameCharCount=countB,textFrameVector=vecB} = TextFrame
+    { textFrameCharCount = countA + countB
+    , textFrameVector = let { lenA = Vec.length vecA; lenB = Vec.length vecB; } in
         if lenA == 0 then vecB else
         if lenB == 0 then vecA else Vec.create
           (do let lastA  = vecA Vec.! (lenA - 1)
@@ -2086,22 +2086,22 @@ textViewAppend appendTags
               return newVec
           )
     }
-  where { myname = "textViewAppend"; }
+  where { myname = "textFrameAppend"; }
 
--- | Copy a region of the current 'TextBuffer' into a 'TextView', delimited by the two given
--- 'TextLocation' values. If the two 'TextLocation' values given are identical, an empty 'TextView'
+-- | Copy a region of the current 'TextBuffer' into a 'TextFrame', delimited by the two given
+-- 'TextLocation' values. If the two 'TextLocation' values given are identical, an empty 'TextFrame'
 -- is constructed. The 'TextLocation' value further from the start of the 'TextBuffer' is considered
--- to be the end point of the text to be copied into the resulting 'TextView', and the character
--- under the end point is not included in the resulting 'TextView'.
-textView :: PrimMonad m => TextLocation -> TextLocation -> EditText mvar tags m (TextView tags)
-textView from0 to0 = do
-  let myname = "textView"
+-- to be the end point of the text to be copied into the resulting 'TextFrame', and the character
+-- under the end point is not included in the resulting 'TextFrame'.
+textFrame :: PrimMonad m => TextLocation -> TextLocation -> EditText mvar tags m (TextFrame tags)
+textFrame from0 to0 = do
+  let myname = "textFrame"
   (from, loline) <- validateLocation $ min from0 to0
   (to,   hiline) <- validateLocation $ max from0 to0
   if (from ^. lineIndex) == (to ^. lineIndex) then return $
-    let numchars = diffAbsolute (from ^. charIndex) (to ^. charIndex) in TextView
-      { textViewCharCount = charToCount numchars
-      , textViewVector = Vec.singleton $ sliceLineNoChk (from ^. charIndex) numchars loline
+    let numchars = diffAbsolute (from ^. charIndex) (to ^. charIndex) in TextFrame
+      { textFrameCharCount = charToCount numchars
+      , textFrameVector = Vec.singleton $ sliceLineNoChk (from ^. charIndex) numchars loline
       }
     else do
       to <- if to ^. charIndex > 1 then pure to else
@@ -2116,17 +2116,17 @@ textView from0 to0 = do
         asrtMWrite UnsafeOp myname ("newvec", newvec) (asrtShow "top" top) $
           fst $ splitLineAt (to   ^. charIndex) hiline
         freeze newvec
-      return TextView
-        { textViewCharCount = sum $ intSize <$> Vec.toList newvec
-        , textViewVector    = newvec
+      return TextFrame
+        { textFrameCharCount = sum $ intSize <$> Vec.toList newvec
+        , textFrameVector    = newvec
         }
 
--- | Like 'textView', creates a new text view, but rather than taking two 'TextLocation's to delimit
+-- | Like 'textFrame', creates a new text view, but rather than taking two 'TextLocation's to delimit
 -- the range, takes two @('Absolute' 'LineIndex')@ values to delimit the range.
-textViewOnLines
+textFrameOnLines
   :: PrimMonad m
-  => Absolute LineIndex -> Absolute LineIndex -> EditText mvar tags m (TextView tags)
-textViewOnLines from to = textView
+  => Absolute LineIndex -> Absolute LineIndex -> EditText mvar tags m (TextFrame tags)
+textFrameOnLines from to = textFrame
   (TextLocation
    { theLocationLineIndex = min from to
    , theLocationCharIndex = Absolute $ CharIndex 1
@@ -2136,14 +2136,14 @@ textViewOnLines from to = textView
    , theLocationCharIndex = Absolute $ CharIndex maxBound
    })
 
--- | Create a new, editable 'TextBuffer' from a read-only 'TextView'. Pass 'Before' to place the
+-- | Create a new, editable 'TextBuffer' from a read-only 'TextFrame'. Pass 'Before' to place the
 -- text in the buffer before the cursor, meaning the cursor will start locationed at the end of the
 -- editable 'TextBuffer', or pass 'After' to place the text in the buffer after the cursor, meaning
 -- the cursor will start at the beginning of the editable 'TextBuffer'.
-newTextBufferFromView
+newTextBufferFromFrame
   :: PrimMonad m
-  => RelativeToCursor -> tags -> TextView tags -> m (TextBuffer mvar tags)
-newTextBufferFromView rel tags (TextView{textViewVector=vec}) = liftIO $ do
+  => RelativeToCursor -> tags -> TextFrame tags -> m (TextBuffer mvar tags)
+newTextBufferFromFrame rel tags (TextFrame{textFrameVector=vec}) = liftIO $ do
   mvar <- newEmptyMVar
   let this = TextBuffer mvar
   let oldLen = Vec.length vec
@@ -2160,14 +2160,14 @@ newTextBufferFromView rel tags (TextView{textViewVector=vec}) = liftIO $ do
   putMVar mvar st
   return this
 
--- | Perform a fold over every 'TextLine' in the 'TextView' using a function of type 'FoldTextView'.
-forLinesInView
+-- | Perform a fold over every 'TextLine' in the 'TextFrame' using a function of type 'FoldTextFrame'.
+forLinesInFrame
   :: Monad m
-  => TextView tags -> fold
-  -> (FoldTextViewHalt void fold tags m fold -> TextLine tags -> FoldTextView fold fold tags m ())
+  => TextFrame tags -> fold
+  -> (FoldTextFrameHalt void fold tags m fold -> TextLine tags -> FoldTextFrame fold fold tags m ())
   -> m fold
-forLinesInView (TextView{textViewVector=vec}) fold f = flip execStateT fold $
-  runContT (unwrapFoldTextView $ callCC $ loop $ Vec.toList vec) return where
+forLinesInFrame (TextFrame{textFrameVector=vec}) fold f = flip execStateT fold $
+  runContT (unwrapFoldTextFrame $ callCC $ loop $ Vec.toList vec) return where
     loop lines halt = case lines of
       []         -> get
       line:lines -> f halt line >> loop lines halt
@@ -2358,10 +2358,10 @@ ralign n = case safeAbs n of
   i | i < 1000000 -> " " ++ show i
   i                ->       show i
 
--- | Print debugger information about the structured data that forms the 'TextView' to standard
+-- | Print debugger information about the structured data that forms the 'TextFrame' to standard
 -- output. __WARNING:__ this print's every line of text in the view, so if your text view has
 -- thousands of lines of text, there will be a lot of output.
-debugPrintView :: (Show tags, MonadIO m) => (String -> IO ()) -> TextView tags -> m ()
+debugPrintView :: (Show tags, MonadIO m) => (String -> IO ()) -> TextFrame tags -> m ()
 debugPrintView output view = do
   (_, errCount) <- forLinesInView view (1 :: Int, 0 :: Int) $ \ _halt line -> do
     lineNum <- state $ \ (lineNum, errCount) ->
