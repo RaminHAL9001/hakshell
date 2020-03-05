@@ -10,13 +10,14 @@ module Hakshell.GapBuffer
     Absolute(..), absoluteIndex, indexToAbsolute,
     MonadEditVec(..), MonadGapBuffer(..), getVector,
     indexNearCursor, cursorIndex, distanceFromCursor, cursorAtEnd, relativeIndex, indexToRelative,
-    testIndex, validateIndex, validateLength,
+    testIndex, validateIndex, validateLength, forceCursorIndex,
     countOnCursor, countDefined, countUndefined,
     getVoid, sliceFromCursor, sliceBetween, safeSliceBetween, withVoidSlice, getSlice,
     UnsafeSlice, safeFreeze, safeClone, mutableCopy, safeCopy, sliceSize,
     withFullSlices, withRegion, withNewVector, copyRegion,
     putElemIndex, getElemIndex, putElem, getElem, delElem,
-    pushElem, pushElemVec, popElem, shiftCursor, moveCursorBy, moveCursorTo, moveCursorNear,
+    pushElem, pushElemVec, pushSlice, popElem,
+    shiftCursor, moveCursorBy, moveCursorTo, moveCursorNear,
     minPow2ScaledSize, prepLargerVector, growVector, freezeVector, copyVec,
     ----
     GapBuffer(..), GapBufferState(..), BufferError(..), gapBufferLength,
@@ -36,7 +37,7 @@ import           Control.Monad.State
 --import qualified Data.Vector                 as Vec
 --import qualified Data.Vector.Mutable         as MVec
 --import qualified Data.Vector.Unboxed.Base    as UBox
---import qualified Data.Vector.Unboxed.Mutable as UMVec
+import qualified Data.Vector.Unboxed.Mutable as UMVec
 --import qualified Data.Vector.Unboxed         as UVec
 import qualified Data.Vector.Generic         as GVec
 import qualified Data.Vector.Generic.Mutable as GMVec
@@ -468,6 +469,16 @@ testIndex i = countDefined >>= \ count ->
   else absoluteIndex i >>= \ i -> return $ let top = indexAtRangeEnd 0 count in
     if i > top then (False, top) else if i < 0 then (False, 0) else (True , i)
 
+-- | Force the cursor index to the given position. The position is forced to be in-bounds, and moves
+-- without shifting elements around. This function is only used when initializing a new empty buffer
+-- and positioning the cursor before writing any elements.
+forceCursorIndex
+  :: (Ord i, Bounded i, IsIndex i,
+      Monad m, MonadEditVec vec m, MonadError BufferError m
+     )
+  => i -> m VecLength
+forceCursorIndex = testIndex >=> modCount Before . const . distanceFromOrigin . snd
+
 -- | This function inspects the 'Bool' value of the pair returned by 'testIndex'. If the 'Bool'
 -- value is 'False', an exception is thrown, otherwise the normalized 'VecIndex' is returned.
 validateIndex
@@ -712,6 +723,19 @@ pushElem
 pushElem rel elem = growVector 1 >> modCount rel (+ 1) >>
   indexNearCursor rel >>= flip putElemIndex elem
 
+-- cutting down on copy-pasta
+pushVec
+  :: (PrimMonad m, GMVec.MVector targ elem, MonadGapBuffer (targ (PrimState m) elem) m)
+  => (src -> VecLength)
+  -> (UnsafeSlice (targ (PrimState m) elem) -> src -> m ())
+  -> RelativeToCursor -> src -> m ()
+pushVec length copy rel src = do
+  let len  = length src
+  let diff = (case rel of{ Before -> negate; After -> id; }) $ len
+  growVector len
+  ok <- withVoidSlice diff $ \ targ -> modCount rel (+ len) >> copy targ src
+  unless ok $ error $ "pushElemVec: internal error, \"growVector\" failed to create space"
+
 -- | Push a vector of elements starting at the index 'Before' (currently on) the cursor, or the
 -- index 'After' the cursor.
 pushElemVec
@@ -720,11 +744,16 @@ pushElemVec
       MonadGapBuffer (mvec (PrimState m) elem) m
      )
   => RelativeToCursor -> vec elem -> m ()
-pushElemVec rel src = do
-  let len = VecLength $ (case rel of{ Before -> negate; After -> id; }) $ GVec.length src
-  growVector len
-  ok <- withVoidSlice len $ \ (UnsafeSlice targ) -> modCount rel (+ len) >> GVec.copy targ src
-  unless ok $ error $ "pushElemVec: internal error, \"growVector\" failed to create space"
+pushElemVec = pushVec (VecLength . GVec.length) $ \ (UnsafeSlice targ) -> GVec.copy targ
+
+pushSlice
+  :: (PrimMonad m, GVec.Vector vec elem,
+      mvec (PrimState m) elem ~ GVec.Mutable vec (PrimState m) elem,
+      MonadGapBuffer (mvec (PrimState m) elem) m
+     )
+  => RelativeToCursor -> UnsafeSlice (mvec (PrimState m) elem) -> m ()
+pushSlice = pushVec (sliceSize GMVec.length) $
+  (\ (UnsafeSlice targ) (UnsafeSlice src) -> GMVec.copy targ src)
 
 -- | Pop a single element from the index 'Before' (currently on) the cursor, or from the index 'After'
 -- the cursor, and then shift the cursor to point to the pushed element.
@@ -910,6 +939,13 @@ instance (PrimMonad m, GMVec.MVector vec elem, st ~ PrimState m) =>
       return newvec
     throwLimitErr = throwError . BufferLimitError
     getCursorIsDefined = use gapBufferCursorIsDefined
+
+instance (PrimMonad m, PrimState m ~ s) =>
+  MonadGapBuffer (UMVec.MVector s Char) (GapBuffer (UMVec.MVector s Char) m)
+  where
+    nullElem = pure '\0'
+    newVector (VecLength siz) = lift $ UMVec.replicate siz '\0'
+    setCursorIsDefined = assign gapBufferCursorIsDefined
 
 -- | Evaluate a 'GapBuffer' function providing it a new vector with which to instantiate the
 -- 'GapBufferState'.

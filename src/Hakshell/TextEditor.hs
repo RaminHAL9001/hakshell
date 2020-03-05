@@ -67,8 +67,12 @@ module Hakshell.TextEditor
 
     TextLine, emptyTextLine, textLineBreakSymbol,
     nullTextLine, textLineCursorSpan, textLineGetChar,
-    textLineTop, textLineIsUndefined, sliceLineToEnd, splitLine,
+    textLineTop, textLineIsUndefined,
     textLineTags, textLineChomp, showTextLine,
+
+    -- *** 'TextLine' Inspection Monad
+    ViewLine, liftViewLine, runViewLineT, runViewLine, viewerTopIndex, cursorIsOnLineBreak,
+    viewerCursorTo, sliceLineToEnd, splitLine,
 
     -- ** The 'TextBuffer' data type
     --
@@ -79,9 +83,9 @@ module Hakshell.TextEditor
     -- 'deleteCharsWrap' functions.
 
     TextBuffer, TextIORef, TextMutex, TextSTRef,
-    TextBufferRefType(..),
     newTextBuffer, copyTextBuffer,
-    bufferLineBreaker, bufferDefaultTags,
+    bufferLineBreaker, bufferDefaultTags, bufferTargetCol,
+    thisTextBuffer,
 
     module Hakshell.TextEditor.LineBreaker,
 
@@ -101,7 +105,7 @@ module Hakshell.TextEditor
 
     EditText, runEditText, runEditTextOnCopy,
 
-    insertString, lineBreak, lineBreakWith, deleteCharsWrap,
+    insertString, lineBreak, lineBreakWith,
     pushLine, popLine, getLineNumber, getColumnNumber,
     getLineIndex, putLineIndex, withCurrentLine,
     bufferLineCount, bufferIsEmpty, currentBuffer,
@@ -120,9 +124,9 @@ module Hakshell.TextEditor
 
     -- ** Indicies and Bounds Checking
 
-    CheckedIndex(..), validateLineIndex, lineIndexIsValid,
+    validateLineIndex, lineIndexIsValid,
     validateGetLineIndex, testLocation, validateLocation, locationIsValid,
-    validateCharIndex, testCharIndex, indexIsOnLineBreak,
+    validateCharIndex, indexIsOnLineBreak,
 
     -- *** Error Data Type
 
@@ -146,17 +150,15 @@ module Hakshell.TextEditor
     Absolute(..),  LineIndex(..), CharIndex(..), TextLocation(..),
     TextCursorSpan(..), CharStats(..),
     shiftAbsolute, diffAbsolute, unwrapTextCursorSpan,
-    lineToIndex, charToIndex, indexToLine, indexToChar,
-    distanceBetween, spanDistance, sumTextLocation, diffTextLocation,
+    sumTextLocation, diffTextLocation,
 
     -- *** Moving the cursor relative to the cursor
 
-    moveCursor, moveByLine, moveByChar, moveByCharWrap,
+    moveCursor, moveByLine, moveByChar,
 
     Relative(..), RelativeToCursor(..),
     RelativeToAbsoluteCursor, -- <- does not export members
     relativeToAbsolute, relativeLine, relativeChar, lineIndex, charIndex,
-    lineToCount, charToCount, countToLine, countToChar,
 
     -- ** Text Views
     --
@@ -186,10 +188,6 @@ module Hakshell.TextEditor
     streamGoto, streamLook, streamStep, streamIsEOF, streamIsEOL,
     streamTags, streamCommitTags, streamResetCache, streamResetEndpoint,
     theStreamCache, theStreamLocation, theStreamEndpoint,
-
-    -- * Debugging
-
-    debugPrintBuffer, debugPrintView, debugPrintCursor,
 
     -- * Re-Exports
     -- ** "Hakshell.String"
@@ -221,14 +219,10 @@ import           Control.Monad.State.Class
 
 import           Data.Primitive.MutVar       (MutVar, newMutVar, readMutVar, writeMutVar)
 import           Data.Primitive.MVar         (MVar, newMVar, readMVar, takeMVar, putMVar)
-import           Data.Semigroup
 import qualified Data.Vector                 as Vec
-import qualified Data.Vector.Generic         as GVec
 import qualified Data.Vector.Mutable         as MVec
 import qualified Data.Vector.Unboxed         as UVec
-import qualified Data.Vector.Generic.Mutable as GMVec
 import qualified Data.Vector.Unboxed.Mutable as UMVec
-import           Data.Word
 
 ----------------------------------------------------------------------------------------------------
 
@@ -238,18 +232,6 @@ defaultInitTextBufferSize = 512
 
 defaultInitLineBufferSize :: Int
 defaultInitLineBufferSize = 1024
-
--- Overflow-safe absolute value function. Many programming language compilers have unintuitive
--- behavior when evaluating the expresion @(abs minBound)@ due to integer overflow, GHC also suffers
--- from this problem
-safeAbs :: (Ord n, Num n, Bounded n) => n -> n
-safeAbs n = if n >= 0 then n else negate $ if n == minBound then n + 1 else n
-
--- | Like the @[a .. b]@ notation when @(a <= b)@, but iterates in decreacing order when @(a > b)@.
-iter2way :: (Ord n, Num n) => n -> n -> [n]
-iter2way from to =
-  takeWhile (flip (if from <= to then (<=) else (>=)) to) $
-  iterate ((if from <= to then (+) else subtract) 1) from
 
 ----------------------------------------------------------------------------------------------------
 
@@ -621,22 +603,22 @@ textLineGetCharNoChk txt = ((theTextLineString txt) UVec.!) . fromIndex
 data ViewLineState tags
   = ViewLineState
     { theViewerElemsBeforeCursor :: VecLength
-    , theViewerLine :: TextLine tags
+    , theViewerLine              :: TextLine tags
     }
 
 viewerElemsBeforeCursor :: Lens' (ViewLineState tags) VecLength
 viewerElemsBeforeCursor =
   lens theViewerElemsBeforeCursor $ \ a b -> a{ theViewerElemsBeforeCursor = b }
 
-viewerMirrorCursor :: ViewLineState tags -> Iso' VecLength VecLength
-viewerMirrorCursor view = iso (len -) (len -) where
-  str = view ^. viewerLine . textLineString
-  len = VecLength $ intSize str
+--viewerMirrorCursor :: ViewLineState tags -> Iso' VecLength VecLength
+--viewerMirrorCursor view = iso (len -) (len -) where
+--  str = view ^. viewerLine . textLineString
+--  len = VecLength $ intSize str
 
-viewerElemsAfterCursor :: Lens' (ViewLineState tags) VecLength
-viewerElemsAfterCursor = lens
-  (\ view -> view ^. viewerElemsBeforeCursor . viewerMirrorCursor view)
-  (\ view i -> view & viewerElemsBeforeCursor . viewerMirrorCursor view .~ i)
+--viewerElemsAfterCursor :: Lens' (ViewLineState tags) VecLength
+--viewerElemsAfterCursor = lens
+--  (\ view -> view ^. viewerElemsBeforeCursor . viewerMirrorCursor view)
+--  (\ view i -> view & viewerElemsBeforeCursor . viewerMirrorCursor view .~ i)
 
 viewerLine :: Lens' (ViewLineState tags) (TextLine tags)
 viewerLine = lens theViewerLine $ \ a b -> a{ theViewerLine = b }
@@ -785,21 +767,9 @@ textEditGapBuffer = lens theTextGapBufferState $ \ a b -> a{ theTextGapBufferSta
 bufferLineBreaker :: Lens' (TextBufferState mvar tags) LineBreaker
 bufferLineBreaker = lens theBufferLineBreaker $ \ a b -> a{ theBufferLineBreaker = b }
 
--- Not for export: requires correct accounting of line numbers to avoid segment faults.
-linesAboveCursor :: Lens' (TextBufferState mvar tags) VecLength
-linesAboveCursor = textEditGapBuffer . gapBufferBeforeCursor
-
--- Not for export: requires correct accounting of line numbers to avoid segment faults.
-linesBelowCursor :: Lens' (TextBufferState mvar tags) VecLength
-linesBelowCursor = textEditGapBuffer . gapBufferAfterCursor
-
 -- Not for export: indicates whether the line under the cursor is defined or undefined.
 lineCursorIsDefined :: Lens' (TextBufferState mvar tags) Bool
 lineCursorIsDefined = textEditGapBuffer . gapBufferCursorIsDefined
-
--- Not for export: the vector containing all the lines of text in this buffer.
-bufferVector :: Lens' (TextBufferState mvar tags) (MVec.MVector (VarPrimState mvar) (TextLine tags))
-bufferVector = textEditGapBuffer . gapBufferVector
 
 -- | The current line of text being edited under the cursor.
 bufferLineEditor :: Lens' (TextBufferState mvar tags) (LineEditor mvar tags)
@@ -852,11 +822,6 @@ lineEditGapBuffer
            (GapBufferState (UMVec.MVector (VarPrimState mvar) Char))
 lineEditGapBuffer = lens theLineEditGapBuffer $ \ a b -> a{ theLineEditGapBuffer = b }
 
--- Not for export: this buffer is formatted such that characters before the cursror are near index
--- zero, while characters after the cursor are near the final index.
-lineEditBuffer :: Lens' (LineEditor mvar tags) (UMVec.MVector (VarPrimState mvar) Char)
-lineEditBuffer = lineEditGapBuffer . gapBufferVector
-
 -- Not for export: this gets updated when inserting or deleting characters before the cursor.
 charsBeforeCursor :: Lens' (LineEditor mvar tags) VecLength
 charsBeforeCursor = lineEditGapBuffer . gapBufferBeforeCursor
@@ -905,12 +870,10 @@ instance (PrimMonad m, PrimState m ~ st) =>
 
 -- | This is a type of functions that can modify the textual content stored in a 'TextBufferState'.
 newtype EditText mvar tags m a
-  = EditText
-    { unwrapEditText ::
-        ReaderT (TextBuffer mvar tags)
-          (ExceptT TextEditError
-             (StateT (TextBufferState mvar tags) m)) a
-    }
+  = EditText (
+      ReaderT (TextBuffer mvar tags)
+        (ExceptT TextEditError (StateT (TextBufferState mvar tags) m)) a
+    )
   deriving
     ( Functor, Applicative, Monad,
       MonadError TextEditError
@@ -1004,22 +967,10 @@ validateGetLineIndex = editTextLiftGapBuffer .
 
 ----------------------------------------------------------------------------------------------------
 
-instance (PrimMonad m, PrimState m ~ s) =>
-  MonadGapBuffer (UMVec.MVector s Char) (GapBuffer (UMVec.MVector s Char) m)
-  where
-    nullElem = pure '\0'
-    newVector (VecLength siz) = lift $ UMVec.replicate siz '\0'
-    setCursorIsDefined = assign gapBufferCursorIsDefined
-
 -- | Functions of this type operate on a single 'TextLine', it is useful for updating the
 -- 'bufferLineEditor'.
 newtype EditLine mvar tags m a
-  = EditLine
-    { unwrapEditLine ::
-        ExceptT TextEditError
-          (StateT (LineEditor mvar tags)
-             (EditText mvar tags m)) a
-    }
+  = EditLine (ExceptT TextEditError (StateT (LineEditor mvar tags) (EditText mvar tags m)) a)
   deriving
     ( Functor, Applicative, Monad,
       MonadError TextEditError
@@ -1107,6 +1058,13 @@ runViewLineT (ViewLine f) = \ case
 runViewLine :: ViewLine tags Identity a -> TextLine tags -> Either TextEditError a
 runViewLine f = runIdentity . runViewLineT f
 
+-- | Returns the top-most index of the 'TextLine' being viewed. If the 'TextLine' is empty or
+-- undefined, 'Nothing' is returned.
+viewerTopIndex :: Monad m => ViewLine tags m (Maybe (Absolute CharIndex))
+viewerTopIndex = use viewerLine <&> \ case
+  TextLineUndefined -> Nothing
+  line              -> Just $ toIndex $ intSize line - 1
+
 cursorIsOnLineBreak :: Monad m => ViewLine tags m Bool
 cursorIsOnLineBreak = indexIsOnLineBreak <$> use viewerLine <*> viewLineLiftIIBuffer cursorIndex
 
@@ -1127,16 +1085,15 @@ similarLine onLbrk vec = do
 
 -- | Cut and remove a line at some index, keeping the characters 'Before' or 'After' the index.
 sliceLineToEnd :: Monad m => RelativeToCursor -> ViewLine tags m (TextLine tags)
-sliceLineToEnd rel = let s = view textLineString in splitLine >>= case rel of
-  Before -> similarLine (const NoLineBreak) . s . fst
-  After  -> similarLine id . s . snd
+sliceLineToEnd = (<$> splitLine) . (\ case { Before -> fst; After  -> snd; })
 
 -- | Splits the current 'TextLine' at the current cursor location.
 splitLine :: Monad m => ViewLine tags m (TextLine tags, TextLine tags)
 splitLine = do
   (before, after) <- viewLineLiftIIBuffer $ withFullSlices $ \ before after ->
     return (safeClone before, safeClone after)
-  (,) <$> similarLine (const NoLineBreak) before <*> similarLine id after
+  (,) <$> similarLine (if UVec.null after then id else const NoLineBreak) before
+      <*> similarLine (if UVec.null after then const NoLineBreak else id) after
 
 ----------------------------------------------------------------------------------------------------
 
@@ -1230,7 +1187,21 @@ newTextBuffer
   :: (ModifyReference mvar m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
   => Maybe VecLength -> tags -> m (TextBuffer (mvar (PrimState m)) tags)
 newTextBuffer initSize tags = do
-  mvar <- newTextBufferState initSize tags >>= newReference
+  cur <- UMVec.new defaultInitLineBufferSize >>=
+    lineEditorFromVector tags (pure ())
+  MVec.replicate (maybe defaultInitTextBufferSize fromLength initSize) TextLineUndefined >>=
+    textBufferFromVector tags cur (pure ())
+
+-- not for export
+textBufferFromVector
+  :: (ModifyReference mvar m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
+  => tags
+  -> LineEditor (mvar (PrimState m)) tags
+  -> GapBuffer (MVec.MVector (PrimState m) (TextLine tags)) m ()
+  -> MVec.MVector (PrimState m) (TextLine tags)
+  -> m (TextBuffer (mvar (PrimState m)) tags)
+textBufferFromVector tags cur initVec mvec = do
+  mvar <- textBufferStateFromVector tags cur initVec mvec >>= newReference
   let this = TextBuffer mvar
   modifyReference_ mvar $ return . (bufferLineEditor . parentTextEditor .~ this)
   return this
@@ -1251,13 +1222,17 @@ copyTextBuffer (TextBuffer mvar) = modifyReference mvar $ \ oldst -> do
   modifyReference_ mvar $ return . (bufferLineEditor . parentTextEditor .~ this)
   return (oldst, this)
 
-newTextBufferState
+-- not for export: returns an internal-use-only data type, also discards an exception from
+-- runGapBufferNew.
+textBufferStateFromVector
   :: (ModifyReference mvar m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
-  => Maybe VecLength -> tags -> m (TextBufferState (mvar (PrimState m)) tags)
-newTextBufferState initSize tags = do
-  cur    <- newLineEditor initSize tags
-  newBuf <- MVec.replicate (maybe defaultInitTextBufferSize fromLength initSize) TextLineUndefined
-  gbst   <- snd <$> runGapBufferNew newBuf (pure ())
+  => tags -- ^ Specify the default @tags@ value.
+  -> LineEditor (mvar (PrimState m)) tags
+  -> GapBuffer (MVec.MVector (PrimState m) (TextLine tags)) m ()
+  -> MVec.MVector (PrimState m) (TextLine tags)
+  -> m (TextBufferState (mvar (PrimState m)) tags)
+textBufferStateFromVector tags cur initBuf newBuf = do
+  gbst <- snd <$> runGapBufferNew newBuf initBuf -- discard any exceptions that may have occurred
   return TextBufferState
     { theBufferDefaultLine   = TextLine
         { theTextLineTags        = tags
@@ -1280,9 +1255,18 @@ newTextBufferState initSize tags = do
 newLineEditor
   :: ModifyReference mvar m
   => Maybe VecLength -> tags -> m (LineEditor (mvar (PrimState m)) tags)
-newLineEditor initSize tag = do
-  newBuf <- UMVec.new $ maybe defaultInitLineBufferSize fromLength initSize
-  gbst   <- snd <$> runGapBufferNew newBuf (pure ())
+newLineEditor initSize tag =
+  UMVec.new (maybe defaultInitLineBufferSize fromLength initSize) >>=
+  lineEditorFromVector tag (pure ())
+
+lineEditorFromVector
+  :: ModifyReference mvar m
+  => tags
+  -> GapBuffer (UMVec.MVector (PrimState m) Char) m ()
+  -> UMVec.MVector (PrimState m) Char
+  -> m (LineEditor (mvar (PrimState m)) tags)
+lineEditorFromVector tag initBuf newBuf = do
+  gbst <- snd <$> runGapBufferNew newBuf initBuf
   return LineEditor
     { theParentTextEditor  = error "internal: 'LineEditor{theParentTextEditor}' is undefined"
     , theLineEditGapBuffer = gbst
@@ -1553,7 +1537,7 @@ refillLineEditorWith = \ case
   line              -> (>>= (throwError ||| return)) $ editLine $ do
     cur <- getColumnNumber
     flip runViewLineT line $ viewLineLiftIIBuffer $ do
-      (_ok, i) <- testIndex cur
+      testIndex cur
       withFullSlices $ \ srcLo srcHi -> lift $ editLineLiftGapBuffer $ do
         gapBufferBeforeCursor .= sliceSize UVec.length srcLo
         gapBufferAfterCursor  .= sliceSize UVec.length srcHi
@@ -1648,20 +1632,20 @@ currentBuffer = editTextState $ use $ bufferLineEditor . parentTextEditor
 
 ----------------------------------------------------------------------------------------------------
 
--- not for export
-modifyColumn
-  :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
-  => (Absolute CharIndex -> Absolute CharIndex -> Relative CharIndex)
-  -> EditLine (mvar (PrimState m)) tags m (Absolute CharIndex)
-modifyColumn f = do
-  lbrksym <- editLineState $ use cursorBreakSymbol
-  editLineLiftGapBuffer $ do
-    oldch  <- cursorIndex >>= indexToAbsolute
-    weight <- countDefined
-    top    <- indexToAbsolute $ indexAfterRange 0 $ weight -
-      case lbrksym of { NoLineBreak -> 0; sym -> 1; }
-    shiftCursor $ unwrapRelative $ f oldch top
-    indexNearCursor Before >>= indexToAbsolute
+---- not for export
+--modifyColumn
+--  :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
+--  => (Absolute CharIndex -> Absolute CharIndex -> Relative CharIndex)
+--  -> EditLine (mvar (PrimState m)) tags m (Absolute CharIndex)
+--modifyColumn f = do
+--  lbrksym <- editLineState $ use cursorBreakSymbol
+--  editLineLiftGapBuffer $ do
+--    oldch  <- cursorIndex >>= indexToAbsolute
+--    weight <- countDefined
+--    top    <- indexToAbsolute $ indexAfterRange 0 $ weight -
+--      case lbrksym of { NoLineBreak -> 0; sym -> 1; }
+--    shiftCursor $ unwrapRelative $ f oldch top
+--    indexNearCursor Before >>= indexToAbsolute
 
 -- | Usually when you move the cursor to a different line using 'gotoLocation', 'gotoLine',
 -- 'moveByLine', or 'moveCursor', you expect the content of the 'LineEditor' to remain on the
@@ -1831,7 +1815,6 @@ insertString str = do
   let writeStr = editLine . editLineLiftGapBuffer .
         fmap sum . mapM ((>> (return 1)) . pushElem Before)
   let writeLine (str, lbrk) = do
-        let lbrksiz = if lbrk == NoLineBreak then 0 else 1
         strlen <- writeStr (str ++ "\n")
         line   <- editLine $ do
           editLineState $ cursorBreakSymbol .= lbrk
@@ -1998,7 +1981,7 @@ instance
 -- threads may immediately resume performing updates on the 'TextBuffer'.
 data TextFrame tags
   = TextFrame
-    { textFrameCharCount :: !Int
+    { textFrameCharCount :: !VecLength
       -- ^ Evaluates to how many characters exist in this buffer.
     , textFrameVector    :: !(Vec.Vector (TextLine tags))
       -- ^ Evaluates to a vector of 'TextLine's so you can make use of the 'Vec.Vector' APIs to
@@ -2029,6 +2012,55 @@ instance MonadTrans (FoldTextFrame r fold tags) where
 
 type FoldTextFrameHalt void fold tags m r = r -> FoldTextFrame r fold tags m void
 
+-- not for export: requires an uninitialized 'LineEditor' as a parameter.
+--
+-- This function copies the content of an immutable 'TextFrame' into a
+-- mutable 'TextBuffer'.
+frameToBuffer
+  :: ModifyReference mvar m
+  => Maybe VecLength
+    -- ^ Specify the additional amount of space to allocate for the buffer. This value will be added
+    -- to the number of 'TextLine' elements in the 'TextFrame' to allocate the new bufer.
+  -> TextLocation -- ^ The initial cursor position.
+  -> tags            -- ^ Specify the default tags value.
+  -> TextFrame tags  -- ^ The frame from which to fill the buffer.
+  -> LineEditor (mvar (PrimState m)) tags -- ^ An initial line editor, should be empty.
+  -> m (TextBuffer (mvar (PrimState m)) tags)
+frameToBuffer initSize loc tags TextFrame{ textFrameVector=vec } cur = do
+  let i   = loc ^. lineIndex
+  let len = Vec.length vec
+  if len <= 0 then newTextBuffer initSize tags else do
+    buf <- MVec.new (max len $ maybe defaultInitLineBufferSize fromLength initSize) >>=
+      textBufferFromVector tags cur
+        (do forceCursorIndex i
+            withFullSlices $ \ targLo targHi -> do
+              modCount Before $ const $ sliceSize MVec.length targLo
+              modCount After  $ const $ sliceSize MVec.length targHi
+              lift $ void $ runIIBuffer
+                (do forceCursorIndex i
+                    withFullSlices $ \ srcLo srcHi -> do
+                      safeCopy targLo srcLo
+                      safeCopy targHi srcHi
+                )
+                IIBufferState{ theIIBufferVector = vec, theIIBufferCursor = 0 }
+        )
+    flip runEditText buf $ do
+      editLine $ editLineLiftGapBuffer $
+        absoluteIndex (loc ^. charIndex) >>=
+        modCount Before . const . distanceFromOrigin
+      refillLineEditor
+    return buf
+
+-- | Create a new, editable 'TextBuffer' from a read-only 'TextFrame'. Pass 'Before' to place the
+-- text in the buffer before the cursor, meaning the cursor will start locationed at the end of the
+-- editable 'TextBuffer', or pass 'After' to place the text in the buffer after the cursor, meaning
+-- the cursor will start at the beginning of the editable 'TextBuffer'.
+newTextBufferFromFrame
+  :: ModifyReference mvar m
+  => TextLocation -> tags -> TextFrame tags -> m (TextBuffer (mvar (PrimState m)) tags)
+newTextBufferFromFrame loc tags frame = newLineEditor Nothing tags >>=
+  frameToBuffer Nothing loc tags frame
+
 -- | Decompose a 'TextFrame' into a list of 'TextLine's.
 textFrameToList :: TextFrame tags -> [TextLine tags]
 textFrameToList = Vec.toList . textFrameVector
@@ -2053,79 +2085,83 @@ emptyTextFrame = TextFrame{ textFrameCharCount = 0, textFrameVector = Vec.empty 
 -- appending function is never evaluated.
 textFrameAppend :: (tags -> tags -> tags) -> TextFrame tags -> TextFrame tags -> TextFrame tags
 textFrameAppend appendTags
-  TextFrame{textFrameCharCount=countA,textFrameVector=vecA}
-  TextFrame{textFrameCharCount=countB,textFrameVector=vecB} = TextFrame
+  a@(TextFrame{textFrameCharCount=countA,textFrameVector=vecA})
+  b@(TextFrame{textFrameCharCount=countB,textFrameVector=vecB}) =
+    let lenA = Vec.length vecA in
+    let lenB = Vec.length vecB in
+    if lenA == 0 then a else if lenB == 0 then b else TextFrame
     { textFrameCharCount = countA + countB
-    , textFrameVector = let { lenA = Vec.length vecA; lenB = Vec.length vecB; } in
-        if lenA == 0 then vecB else
-        if lenB == 0 then vecA else Vec.create
-          (do let lastA  = vecA Vec.! (lenA - 1)
-              let firstB = vecB Vec.! 0
-              let lenAB  = lenA + lenB
-              let lineAB = TextLine
-                    { theTextLineString = case lastA of
-                        TextLineUndefined -> case firstB of
-                          TextLineUndefined -> mempty
-                          firstB            -> theTextLineString firstB
-                        lastA             -> case firstB of
-                          TextLineUndefined -> theTextLineString lastA
-                          firstB            -> theTextLineString lastA <> theTextLineString firstB
-                    , theTextLineTags = appendTags (theTextLineTags lastA) (theTextLineTags firstB)
-                    , theTextLineBreakSymbol = theTextLineBreakSymbol firstB
-                    }
-              let listA = Vec.toList $ asrtSlice SafeOp myname
-                    asrtZero (asrtShow "lenA-1" $ lenA - 1) ("vecA", vecA)
-              let listB = Vec.toList $ asrtSlice SafeOp myname
-                    asrtOne  (asrtShow "lenB-1" $ lenB - 1) ("vecB", vecB)
-              let (size, list) = if theTextLineBreakSize lastA > 0
-                    then (lenAB, listA ++ lastA : firstB : listB)
-                    else (lenAB - 1, listA ++ lineAB : listB)
-              newVec <- MVec.new size
-              forM_ (zip [0 ..] list) $ \ (i, elem) ->
-                asrtMWrite UnsafeOp myname ("newVec", newVec) (asrtShow "i" i) elem
-              return newVec
-          )
+    , textFrameVector    = runST
+        (do let hiA     = vecA Vec.! (lenA - 1)
+            let loB     = vecB Vec.! 0
+            let noBreak = hiA ^. textLineBreakSymbol == NoLineBreak
+            vecAB <- MVec.new $ lenA + lenB - if noBreak then 1 else 0
+            runGapBufferNew vecAB $
+              if not noBreak then pushElemVec Before vecA >> pushElemVec Before vecB else do
+                pushElemVec Before $ Vec.slice 0 (lenA - 1) vecA
+                pushElem Before $ TextLine
+                  { theTextLineString = mappend (theTextLineString hiA) (theTextLineString loB)
+                  , theTextLineTags   = appendTags (theTextLineTags hiA) (theTextLineTags loB)
+                  , theTextLineBreakSymbol = theTextLineBreakSymbol loB
+                  }
+                pushElemVec Before $ Vec.slice 1 (lenB - 1) vecB
+            Vec.unsafeFreeze vecAB
+        )
     }
-  where { myname = "textFrameAppend"; }
 
 -- | Copy a region of the current 'TextBuffer' into a 'TextFrame', delimited by the two given
 -- 'TextLocation' values. If the two 'TextLocation' values given are identical, an empty 'TextFrame'
 -- is constructed. The 'TextLocation' value further from the start of the 'TextBuffer' is considered
 -- to be the end point of the text to be copied into the resulting 'TextFrame', and the character
 -- under the end point is not included in the resulting 'TextFrame'.
-textFrame :: PrimMonad m => TextLocation -> TextLocation -> EditText mvar tags m (TextFrame tags)
+textFrame
+  :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
+  => TextLocation -> TextLocation -> EditText (mvar (PrimState m)) tags m (TextFrame tags)
 textFrame from0 to0 = do
-  let myname = "textFrame"
   (from, loline) <- validateLocation $ min from0 to0
   (to,   hiline) <- validateLocation $ max from0 to0
-  if (from ^. lineIndex) == (to ^. lineIndex) then return $
-    let numchars = diffAbsolute (from ^. charIndex) (to ^. charIndex) in TextFrame
-      { textFrameCharCount = charToCount numchars
-      , textFrameVector = Vec.singleton $ sliceLineNoChk (from ^. charIndex) numchars loline
-      }
-    else do
-      to <- if to ^. charIndex > 1 then pure to else
-        fst <$> validateLocation (to & (lineIndex -~ 1) . (charIndex .~ maxBound))
-      -- Compute the range of lines to copy.
-      let top = lineToCount $ diffAbsolute (from ^. lineIndex) (to ^. lineIndex)
-      newvec <- copyRegion (Absolute $ lineToIndex $ from ^. lineIndex) (Relative $ top + 1)
-      let freeze = liftIO . if unsafeMode then Vec.unsafeFreeze else Vec.freeze
-      newvec <- liftIO $ do
-        asrtMWrite UnsafeOp myname ("newvec", newvec) asrtZero $
-          snd $ splitLineAt (from ^. charIndex) loline
-        asrtMWrite UnsafeOp myname ("newvec", newvec) (asrtShow "top" top) $
-          fst $ splitLineAt (to   ^. charIndex) hiline
-        freeze newvec
-      return TextFrame
-        { textFrameCharCount = sum $ intSize <$> Vec.toList newvec
-        , textFrameVector    = newvec
-        }
+  if (from ^. lineIndex) == (to   ^. lineIndex) then
+    (throwError ||| return) $ flip runViewLine loline $ do
+      viewerCursorTo (from ^. charIndex)
+      top <- viewerTopIndex
+      case top of
+        Nothing  -> return TextFrame
+          { textFrameCharCount = 0
+          , textFrameVector    = Vec.empty
+          }
+        Just top -> do
+          (lo, hi) <- splitLine
+          line <- if top == (to ^. charIndex) then pure lo else
+                    viewerLine .= hi >> fst <$> splitLine
+          return TextFrame
+            { textFrameCharCount = VecLength $ intSize line
+            , textFrameVector    = Vec.singleton line
+            }
+   else do
+     let splitter line point take = (throwError ||| return) $
+           flip runViewLine line $ viewerCursorTo (point ^. charIndex) >> take <$> splitLine
+     loline <- splitter loline from snd
+     hiline <- splitter hiline to   fst
+     editTextLiftGapBuffer $ do
+       fromIdx <- absoluteIndex $ (from ^. lineIndex) + 1
+       toIdx   <- absoluteIndex $ (to   ^. lineIndex) - 1
+       mvec    <- lift $ MVec.new $ fromLength $
+                    (to ^. lineIndex) `diffAbsolute` (from ^. lineIndex)
+       let init f = lift $ fmap fst $ runGapBufferNew mvec $
+                    pushElem Before loline >> f >> pushElem Before hiline >> freezeVector
+       vec <- (>>= (throwError ||| return)) $ if fromIdx > toIdx then init $ pure () else
+         withRegion fromIdx toIdx $ \ lo hi -> init $ pushSlice Before lo >> pushSlice Before hi
+       return TextFrame
+         { textFrameCharCount = VecLength $ sum $ intSize <$> Vec.toList vec
+         , textFrameVector    = vec
+         }
 
 -- | Like 'textFrame', creates a new text view, but rather than taking two 'TextLocation's to delimit
 -- the range, takes two @('Absolute' 'LineIndex')@ values to delimit the range.
 textFrameOnLines
-  :: PrimMonad m
-  => Absolute LineIndex -> Absolute LineIndex -> EditText mvar tags m (TextFrame tags)
+  :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
+  => Absolute LineIndex -> Absolute LineIndex
+  -> EditText (mvar (PrimState m)) tags m (TextFrame tags)
 textFrameOnLines from to = textFrame
   (TextLocation
    { theLocationLineIndex = min from to
@@ -2135,30 +2171,6 @@ textFrameOnLines from to = textFrame
    { theLocationLineIndex = max from to
    , theLocationCharIndex = Absolute $ CharIndex maxBound
    })
-
--- | Create a new, editable 'TextBuffer' from a read-only 'TextFrame'. Pass 'Before' to place the
--- text in the buffer before the cursor, meaning the cursor will start locationed at the end of the
--- editable 'TextBuffer', or pass 'After' to place the text in the buffer after the cursor, meaning
--- the cursor will start at the beginning of the editable 'TextBuffer'.
-newTextBufferFromFrame
-  :: PrimMonad m
-  => RelativeToCursor -> tags -> TextFrame tags -> m (TextBuffer mvar tags)
-newTextBufferFromFrame rel tags (TextFrame{textFrameVector=vec}) = liftIO $ do
-  mvar <- newEmptyMVar
-  let this = TextBuffer mvar
-  let oldLen = Vec.length vec
-  st0 <- newTextBufferState this (max 16 $ oldLen * 2) tags
-  let newBuf = theBufferVector st0
-  let newLen = MVec.length newBuf
-  let cursor = if oldLen == 0 then 0 else
-        if theTextLineBreakSize (vec Vec.! (oldLen - 1)) > 0 then oldLen else oldLen - 1
-  let (idx, st) = case rel of
-        Before -> ([0 ..], st & linesAboveCursor .~ cursor)
-        After  -> ([newLen - oldLen ..], st & linesBelowCursor .~ cursor)
-  forM_ (zip idx $ Vec.toList vec) $ \ (i, elem) ->
-    asrtMWrite UnsafeOp "newTextBufferFromView" ("newBuf", newBuf) (asrtShow "i" i) elem
-  putMVar mvar st
-  return this
 
 -- | Perform a fold over every 'TextLine' in the 'TextFrame' using a function of type 'FoldTextFrame'.
 forLinesInFrame
@@ -2240,8 +2252,8 @@ streamTags = streamCache . textLineTags
 -- meaning to the return type of 'validateLocation', which may throw a soft exception (which can be
 -- caught with 'catchError') if the given 'TextLocation' is out of bounds.
 newStreamCursorRange
-  :: PrimMonad m
-  => TextLocation -> TextLocation -> EditText mvar tags m (StreamCursor tags)
+  :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
+  => TextLocation -> TextLocation -> EditText (mvar (PrimState m)) tags m (StreamCursor tags)
 newStreamCursorRange start end = streamResetCache StreamCursor
   { theStreamCache    = TextLineUndefined
   , theStreamLocation = min start end
@@ -2249,7 +2261,9 @@ newStreamCursorRange start end = streamResetCache StreamCursor
   } >>= streamResetEndpoint (max start end)
 
 -- | A convenience function that calls 'newStreamCursorRange' with 'minBound' as the 'TextLocation'.
-newStreamCursor :: PrimMonad m => EditText mvar tags m (StreamCursor tags)
+newStreamCursor
+  :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
+  => EditText (mvar (PrimState m)) tags m (StreamCursor tags)
 newStreamCursor = newStreamCursorRange minBound maxBound
 
 -- | This in an 'EditText' type of function which moves a given 'StreamCursor' to a different
@@ -2264,8 +2278,9 @@ newStreamCursor = newStreamCursorRange minBound maxBound
 -- This function must validate the 'TextLocation' using 'validateLocation', and so may throw a soft
 -- exception (which can be caught with 'catchError') if the given 'TextLocation' is out of bounds.
 streamGoto
-  :: PrimMonad m
-  => StreamCursor tags -> TextLocation -> EditText mvar tags m (StreamCursor tags)
+  :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
+  => StreamCursor tags -> TextLocation
+  -> EditText (mvar (PrimState m)) tags m (StreamCursor tags)
 streamGoto cursor = validateLocation >=> \ (loc, txt) ->
   return cursor{ theStreamCache = txt, theStreamLocation = loc }
 
@@ -2275,7 +2290,9 @@ streamGoto cursor = validateLocation >=> \ (loc, txt) ->
 -- 'theStreamLocation'. This function throws an @'EndOfCharBuffer' 'After'@ exception if cursor has
 -- somehow moved beyond 'theStreamCache', which could only happen if the 'streamResetCache' function
 -- has not been called after transplanting the 'StreamCursor' to another 'TextBuffer'.
-streamLook :: PrimMonad m => StreamCursor tags -> EditText mvar tags m (Char, StreamCursor tags)
+streamLook
+  :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
+  => StreamCursor tags -> EditText (mvar (PrimState m)) tags m (Char, StreamCursor tags)
 streamLook s = case theStreamCache s of
   TextLineUndefined -> streamResetCache s >>= streamLook
   line              -> case textLineGetChar line (theStreamLocation s ^. charIndex) of
@@ -2285,10 +2302,12 @@ streamLook s = case theStreamCache s of
 
 -- | Thinking of the 'StreamCursor' as a cursor pointing to a character within a 'TextBuffer' this
 -- function advances the cursor without reading any characters.
-streamStep :: PrimMonad m => StreamCursor tags -> EditText mvar tags m (StreamCursor tags)
+streamStep
+  :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
+  => StreamCursor tags -> EditText (mvar (PrimState m)) tags m (StreamCursor tags)
 streamStep s = do
-  let i   = charToIndex $ s ^. streamLocation . charIndex
-  let top = intSize     $ s ^. streamCache
+  let i   = fromIndex $ s ^. streamLocation . charIndex
+  let top = intSize   $ s ^. streamCache
   when (i >= top) $ streamCommitTags s
   return $ 
     ( if i < top then streamLocation . charIndex +~ 1 else
@@ -2303,7 +2322,7 @@ streamStep s = do
 streamIsEOL :: StreamCursor tags -> Bool
 streamIsEOL s = case s ^. streamCache of
   TextLineUndefined -> True
-  line              -> charToIndex (s ^. streamLocation . charIndex) >= intSize line
+  line              -> fromIndex (s ^. streamLocation . charIndex) >= intSize line
 {-# INLINE streamIsEOL #-}
 
 -- | Tests whether 'theStreamLocation' is greater-than or equal-to 'theStreamEndpoint'.
@@ -2323,7 +2342,9 @@ streamIsEOF s = theStreamLocation s >= theStreamEndpoint s
 -- value. This function must also check that the 'streamLocation' is still valid, so it may
 -- evaluate to a @('Left' 'After')@ or @('Left' 'Before')@ value as with the 'streamGoto'
 -- function.
-streamResetCache :: PrimMonad m => StreamCursor tags -> EditText mvar tags m (StreamCursor tags)
+streamResetCache
+  :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
+  => StreamCursor tags -> EditText (mvar (PrimState m)) tags m (StreamCursor tags)
 streamResetCache s = do
   (loc, txt) <- validateLocation (theStreamLocation s)
   return (s & streamLocation .~ loc & streamCache .~ txt)
@@ -2332,8 +2353,9 @@ streamResetCache s = do
 -- suring the parsing process. If the 'TextBuffer' does change while the parsing has been paused,
 -- this function must be evaluated to ensure the 'StreamCursor' is aware of the endpoint.
 streamResetEndpoint
-  :: PrimMonad m
-  => TextLocation -> StreamCursor tags -> EditText mvar tags m (StreamCursor tags)
+  :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
+  => TextLocation -> StreamCursor tags
+  -> EditText (mvar (PrimState m)) tags m (StreamCursor tags)
 streamResetEndpoint loc s = do
   (loc, _txt) <- validateLocation loc
   return (s & streamLocation .~ loc)
@@ -2343,80 +2365,7 @@ streamResetEndpoint loc s = do
 -- 'TextBuffer', this function must be called. This function is called automatically by the
 -- 'streamStep' function when the cursor steps past the end of the current line and to the
 -- next line.
-streamCommitTags :: PrimMonad m => StreamCursor tags -> EditText mvar tags m ()
+streamCommitTags
+  :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
+  => StreamCursor tags -> EditText (mvar (PrimState m)) tags m ()
 streamCommitTags s = putLineIndex (s ^. streamLocation . lineIndex) (s ^. streamCache)
-
-----------------------------------------------------------------------------------------------------
-
-ralign :: Int -> String
-ralign n = case safeAbs n of
-  i | i < 10 -> "      " ++ show i
-  i | i < 100 -> "     " ++ show i
-  i | i < 1000 -> "    " ++ show i
-  i | i < 10000 -> "   " ++ show i
-  i | i < 100000 -> "  " ++ show i
-  i | i < 1000000 -> " " ++ show i
-  i                ->       show i
-
--- | Print debugger information about the structured data that forms the 'TextFrame' to standard
--- output. __WARNING:__ this print's every line of text in the view, so if your text view has
--- thousands of lines of text, there will be a lot of output.
-debugPrintView :: (Show tags, MonadIO m) => (String -> IO ()) -> TextFrame tags -> m ()
-debugPrintView output view = do
-  (_, errCount) <- forLinesInView view (1 :: Int, 0 :: Int) $ \ _halt line -> do
-    lineNum <- state $ \ (lineNum, errCount) ->
-      (lineNum, (lineNum + 1, errCount + if textLineIsUndefined line then 1 else 0))
-    liftIO $ output $ ralign lineNum ++ ": " ++ show line
-  liftIO $ output ""
-  when (errCount > 0) $ error $ "iterated over "++show errCount++" undefined lines"
-
--- | Print debugger information about the structured data that forms the 'TextBuffer' to standard
--- output. __WARNING:__ this print's every line of text in the buffer, so if your text buffer has
--- thousands of lines of text, there will be a lot of output.
-debugPrintBuffer
-  :: (MonadIO m, Show tags)
-  => (String -> IO ()) -> EditText mvar tags m ()
-debugPrintBuffer output = do
-  lineVec <- use bufferVector
-  let len = MVec.length lineVec
-  let printLines nullCount i = if i >= len then return () else do
-        line <- liftIO $
-          asrtMRead UnsafeOp "debugPrintBuffer" ("lineVec", lineVec) (asrtShow "i" i)
-        let showLine = output $ ralign i ++ ": " ++ show line
-        if textLineIsUndefined line
-          then do
-            liftIO $ if nullCount < (1 :: Int) then showLine else
-              when (nullCount < 4) $ putStrLn "...."
-            (printLines $! nullCount + 1) $! i + 1
-          else liftIO showLine >> (printLines 0 $! i + 1)
-  printLines 0 0
-  above   <- use linesAboveCursor
-  below   <- use linesBelowCursor
-  liftIO $ do
-    output $ "   linesAboveCursor: " ++ show above
-    output $ "   linesBelowCursor: " ++ show below
-    output $ "    bufferLineCount: " ++ show (above + below)
-
--- | The 'bufferLineEditor', which is a 'LineEditor' is a separate data structure contained within
--- the 'TextBuffer', and it is often not necessary to know this information when debugging, so you
--- can print debugging information about the 'LineEditor' by evaluating this function whenever it is
--- necessary.
-debugPrintCursor
-  :: (MonadIO m, Show tags)
-  => (String -> IO ()) -> EditText mvar tags m ()
-debugPrintCursor output = do
-  cur <- use bufferLineEditor
-  let charVec    = theLineEditBuffer cur
-  let charVecLen = UMVec.length charVec
-  let before     = cur ^. charsBeforeCursor
-  let after      = cur ^. charsAfterCursor
-  liftIO $ do
-    str <- forM [0 .. charVecLen - 1] $
-      asrtMRead UnsafeOp "debugPrintCursor" ("charVec", charVec) . (,) "i"
-    output $ "     bufferLineEditor: " ++ show str
-    output $ "       lineEditorTags: " ++ show (cur ^. lineEditorTags)
-    output $ " __cursorVectorLength: " ++ show charVecLen
-    output $ "    charsBeforeCursor: " ++ show before
-    output $ "     charsAfterCursor: " ++ show after
-    output $ "      cursorInputSize: " ++ show (before + after)
-    output $ "  cursorLineBreakSize: " ++ show (theCursorBreakSize cur)

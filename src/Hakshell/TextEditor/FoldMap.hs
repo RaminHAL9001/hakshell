@@ -1,5 +1,8 @@
 module Hakshell.TextEditor.FoldMap
   (
+    -- * Editor Functions
+    deleteCharsWrap,
+
     -- * Batch Editing
 
     -- ** A Function Type for Both Folding and Mapping
@@ -65,6 +68,11 @@ module Hakshell.TextEditor.FoldMap
     -- function.
 
     MonadEditText(..), MonadEditLine(..),
+
+    -- * Debugging
+
+    debugPrintBuffer, debugPrintView, debugPrintCursor,
+
   ) where
 
 import           Hakshell.TextEditor
@@ -779,3 +787,78 @@ deleteCharsWrap request =
                 } 
           put st
         return []
+
+----------------------------------------------------------------------------------------------------
+
+ralign :: Int -> String
+ralign n = case safeAbs n of
+  i | i < 10 -> "      " ++ show i
+  i | i < 100 -> "     " ++ show i
+  i | i < 1000 -> "    " ++ show i
+  i | i < 10000 -> "   " ++ show i
+  i | i < 100000 -> "  " ++ show i
+  i | i < 1000000 -> " " ++ show i
+  i                ->       show i
+
+-- | Print debugger information about the structured data that forms the 'TextFrame' to standard
+-- output. __WARNING:__ this print's every line of text in the view, so if your text view has
+-- thousands of lines of text, there will be a lot of output.
+debugPrintView :: MonadIO m => (tags -> String) -> (String -> IO ()) -> TextFrame tags -> m ()
+debugPrintView showTags output view = do
+  (_, errCount) <- forLinesInView view (1 :: Int, 0 :: Int) $ \ _halt line -> do
+    lineNum <- state $ \ (lineNum, errCount) ->
+      (lineNum, (lineNum + 1, errCount + if textLineIsUndefined line then 1 else 0))
+    liftIO $ output $ ralign lineNum ++ ": " ++ showTextLine showTags line
+  liftIO $ output ""
+  when (errCount > 0) $ error $ "iterated over "++show errCount++" undefined lines"
+
+-- | Print debugger information about the structured data that forms the 'TextBuffer' to standard
+-- output. __WARNING:__ this print's every line of text in the buffer, so if your text buffer has
+-- thousands of lines of text, there will be a lot of output.
+debugPrintBuffer
+  :: MonadIO m
+  => (tags -> String) -> (String -> IO ()) -> EditText mvar tags m ()
+debugPrintBuffer showTags output = do
+  lineVec <- use bufferVector
+  let len = MVec.length lineVec
+  let printLines nullCount i = if i >= len then return () else do
+        line <- liftIO $
+          asrtMRead UnsafeOp "debugPrintBuffer" ("lineVec", lineVec) (asrtShow "i" i)
+        let showLine = output $ ralign i ++ ": " ++ showTextLine showTags line
+        if textLineIsUndefined line
+          then do
+            liftIO $ if nullCount < (1 :: Int) then showLine else
+              when (nullCount < 4) $ putStrLn "...."
+            (printLines $! nullCount + 1) $! i + 1
+          else liftIO showLine >> (printLines 0 $! i + 1)
+  printLines 0 0
+  above   <- use linesAboveCursor
+  below   <- use linesBelowCursor
+  liftIO $ do
+    output $ "   linesAboveCursor: " ++ show above
+    output $ "   linesBelowCursor: " ++ show below
+    output $ "    bufferLineCount: " ++ show (above + below)
+
+-- | The 'bufferLineEditor', which is a 'LineEditor' is a separate data structure contained within
+-- the 'TextBuffer', and it is often not necessary to know this information when debugging, so you
+-- can print debugging information about the 'LineEditor' by evaluating this function whenever it is
+-- necessary.
+debugPrintCursor
+  :: MonadIO m
+  => (tags -> String) -> (String -> IO ()) -> EditText mvar tags m ()
+debugPrintCursor showTags output = do
+  cur <- use bufferLineEditor
+  let charVec    = theLineEditBuffer cur
+  let charVecLen = UMVec.length charVec
+  let before     = cur ^. charsBeforeCursor
+  let after      = cur ^. charsAfterCursor
+  liftIO $ do
+    str <- forM [0 .. charVecLen - 1] $
+      asrtMRead UnsafeOp "debugPrintCursor" ("charVec", charVec) . (,) "i"
+    output $ "     bufferLineEditor: " ++ show str
+    output $ "       lineEditorTags: " ++ showTags (cur ^. lineEditorTags)
+    output $ " __cursorVectorLength: " ++ show charVecLen
+    output $ "    charsBeforeCursor: " ++ show before
+    output $ "     charsAfterCursor: " ++ show after
+    output $ "      cursorInputSize: " ++ show (before + after)
+    output $ "  cursorLineBreakSize: " ++ show (theCursorBreakSize cur)
