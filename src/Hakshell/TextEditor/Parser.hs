@@ -128,9 +128,9 @@ import           Text.Parser.Token
 -- cannot inspect or modify this data type directly, you can do so indirectly by using 'parserGet',
 -- 'parserUse', or 'parserModify' along with functions like 'thePosition', 'theCurrentLine', or
 -- 'currentTags'.
-data ParserState tags fold
+data ParserState mvar tags fold
   = ParserState
-    { theParBuffer    :: !(TextBuffer tags)
+    { theParBuffer    :: !(TextBuffer mvar tags)
     , theParStream    :: !(StreamCursor tags)
     , theParName      :: !StrictBytes
     , theParUserState :: !fold
