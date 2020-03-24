@@ -13,7 +13,8 @@ module Hakshell.GapBuffer
     testIndex, validateIndex, validateLength, forceCursorIndex,
     countOnCursor, countDefined, countUndefined,
     getVoid, sliceFromCursor, sliceBetween, safeSliceBetween, withVoidSlice, getSlice,
-    UnsafeSlice, safeFreeze, safeClone, mutableCopy, safeCopy, sliceSize,
+    UnsafeSlice, readSlice, writeSlice, safeFreeze, safeClone, mutableCopy, safeCopy,
+    sliceSize, sliceIndiciesReverse, sliceIndiciesForward,
     withFullSlices, withRegion, withNewVector, copyRegion,
     putElemIndex, getElemIndex, putElem, getElem, delElem,
     pushElem, pushElemVec, pushSlice, popElem,
@@ -257,10 +258,29 @@ newtype UnsafeSlice vec = UnsafeSlice { unwrapUnsafeSlice :: vec }
 sliceSize :: (vec -> Int) -> UnsafeSlice vec -> VecLength
 sliceSize length (UnsafeSlice vec) = VecLength $ length vec
 
+sliceIndiciesForward :: GMVec.MVector mvec elem => UnsafeSlice (mvec m elem) -> [VecIndex]
+sliceIndiciesForward vec = [0 .. indexAtRangeEnd 0 (sliceSize GMVec.length vec)]
+
+sliceIndiciesReverse :: GMVec.MVector mvec elem => UnsafeSlice (mvec m elem) -> [VecIndex]
+sliceIndiciesReverse vec = takeWhile (>= 0) $
+  iterate (subtract 1) (indexAtRangeEnd 0 $ sliceSize GMVec.length vec)
+
 safeFreeze
   :: (PrimMonad m, GVec.Vector vec elem)
   => UnsafeSlice (GVec.Mutable vec (PrimState m) elem) -> m (vec elem)
 safeFreeze (UnsafeSlice vec) = GVec.freeze vec
+
+readSlice
+  :: (PrimMonad m, GMVec.MVector vec elem)
+  => UnsafeSlice (vec (PrimState m) elem) -> VecIndex -> m elem
+readSlice (UnsafeSlice vec) i =
+  asrtMRead UnsafeOp "unsafeRead" ("UnsafeSlice", vec) ("VecIndex", i)
+
+writeSlice
+  :: (PrimMonad m, GMVec.MVector vec elem)
+  => UnsafeSlice (vec (PrimState m) elem) -> VecIndex -> elem -> m ()
+writeSlice (UnsafeSlice vec) i elem =
+  asrtMWrite UnsafeOp "unsafeWrite" ("UnsafeSlice", vec) ("VecIndex", i) elem
 
 --mutableClone
 --  :: (PrimMonad m, GMVec.MVector vec elem)
@@ -572,6 +592,9 @@ getHiSlice = countCursor After >>= sliceFromCursor
 -- the slice. If the region spans the gap in the buffer, the first continuation is called. If the
 -- region is fully contained to within either sub region on either side of the gap, then the second
 -- continuation function is called.
+--
+-- Note that it is assumed the given 'VecIndex' values are already bounds checked absolute indicies
+-- into the index. If these values are wrong, you may receive slices with undefined elements.
 withRegion
   :: MonadEditVec vec m
   => VecIndex -> VecIndex
@@ -579,9 +602,9 @@ withRegion
   -> m a
 withRegion from0 to0 f =
   cursorIndex >>= \ cur ->
-  absoluteIndex (min from0 to0) >>= \ from ->
-  absoluteIndex (max from0 to0) >>= \ to ->
-  let contained =  safeSliceBetween from to in
+  let from      = min from0 to0 in
+  let to        = max from0 to0 in
+  let contained = safeSliceBetween from to in
   if      from <= cur && to <= cur then contained $ safeSliceBetween 0 0 . f
   else if from >  cur && to >  cur then contained $ safeSliceBetween 0 0 . flip f
   else do
