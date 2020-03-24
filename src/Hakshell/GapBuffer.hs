@@ -258,12 +258,12 @@ newtype UnsafeSlice vec = UnsafeSlice { unwrapUnsafeSlice :: vec }
 sliceSize :: (vec -> Int) -> UnsafeSlice vec -> VecLength
 sliceSize length (UnsafeSlice vec) = VecLength $ length vec
 
-sliceIndiciesForward :: GMVec.MVector mvec elem => UnsafeSlice (mvec m elem) -> [VecIndex]
-sliceIndiciesForward vec = [0 .. indexAtRangeEnd 0 (sliceSize GMVec.length vec)]
+sliceIndiciesForward :: (UnsafeSlice vec -> VecLength) -> UnsafeSlice vec -> [VecIndex]
+sliceIndiciesForward sliceSize vec = [0 .. indexAtRangeEnd 0 (sliceSize vec)]
 
-sliceIndiciesReverse :: GMVec.MVector mvec elem => UnsafeSlice (mvec m elem) -> [VecIndex]
-sliceIndiciesReverse vec = takeWhile (>= 0) $
-  iterate (subtract 1) (indexAtRangeEnd 0 $ sliceSize GMVec.length vec)
+sliceIndiciesReverse :: (UnsafeSlice vec -> VecLength) -> UnsafeSlice vec -> [VecIndex]
+sliceIndiciesReverse sliceSize vec = takeWhile (>= 0) $
+  iterate (subtract 1) (indexAtRangeEnd 0 $ sliceSize vec)
 
 safeFreeze
   :: (PrimMonad m, GVec.Vector vec elem)
