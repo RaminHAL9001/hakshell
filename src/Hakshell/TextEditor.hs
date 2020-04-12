@@ -50,9 +50,9 @@
 -- done, to use Emacs in place of Bash as the login shell process, and anyone logging in to the
 -- system would have no difficulty using any and all of the services provided to them by the server.
 --
--- The "Hakshell.TextEditor" module is therefore designed to provide a solid, consistent foundation
--- for automated text processing APIs, upon which programmers can build text editors and text
--- processors, and hence a text editor API is an integral part of the "Hakshell" library.
+--- The "Hakshell.TextEditor" module is therefore designed to provide a solid, consistent foundation
+--- for automated text processing APIs, upon which programmers can build text editors and text
+--- processors, and hence a text editor API is an integral part of the "Hakshell" library.
 module Hakshell.TextEditor
   ( -- * Text Buffers
 
@@ -84,8 +84,8 @@ module Hakshell.TextEditor
     textLineTags, textLineChomp, showTextLine,
 
     -- *** 'TextLine' Inspection Monad
-    ViewLine, liftViewLine, runViewLineT, runViewLine, viewerTopIndex, cursorIsOnLineBreak,
-    viewerCursorTo, sliceLineToEnd, splitLine,
+    ViewLine, liftViewLine, runViewLineT, runViewLine, viewerTopChar, cursorIsOnLineBreak,
+    viewerCursorToChar, sliceLineToEnd, splitLine,
 
     -- ** The 'TextBuffer' data type
     --
@@ -186,6 +186,9 @@ module Hakshell.TextEditor
     TextFrame, textFrame, textFrameOnLines, textFrameAppend, emptyTextFrame,
     newTextBufferFromFrame, textFrameCharCount, textFrameVector,
     textFrameToList, textFrameToStrings,
+
+    -- *** 'TextFrame' Inspection Monad
+    ViewText, runViewTextT, runViewText, viewLine, viewerCursorToLine, viewerGetLine,
 
     -- * Batch Editing
 
@@ -638,13 +641,13 @@ textLineGetCharNoChk txt = ((theTextLineString txt) UVec.!) . fromIndex
 -- | This data type keeps track of a cursor state within the 'ViewLine' monad.
 data ViewLineState tags
   = ViewLineState
-    { theViewerElemsBeforeCursor :: VecLength
+    { theViewerCharsBeforeCursor :: VecLength
     , theViewerLine              :: TextLine tags
     }
 
 viewerElemsBeforeCursor :: Lens' (ViewLineState tags) VecLength
 viewerElemsBeforeCursor =
-  lens theViewerElemsBeforeCursor $ \ a b -> a{ theViewerElemsBeforeCursor = b }
+  lens theViewerCharsBeforeCursor $ \ a b -> a{ theViewerCharsBeforeCursor = b }
 
 --viewerMirrorCursor :: ViewLineState tags -> Iso' VecLength VecLength
 --viewerMirrorCursor view = iso (len -) (len -) where
@@ -900,6 +903,7 @@ instance (PrimMonad m, PrimState m ~ st) =>
     (MVec.MVector st (TextLine tags))
     (GapBuffer (MVec.MVector st (TextLine tags)) m)
   where
+    type WriteVecElem (MVec.MVector st (TextLine tags)) = TextLine tags
     nullElem = pure TextLineUndefined
     newVector (VecLength siz) = nullElem >>= lift . MVec.replicate siz
     setCursorIsDefined = assign gapBufferCursorIsDefined
@@ -1109,8 +1113,8 @@ instance
       (foldLinesLift . lift)
       editTextLiftGapBuffer
       runFoldLinesStep
-      readSlice
-      (\ _ _ () -> return ())
+      (readSlice MVec.read)
+      (\ _ _ -> return)
       (sliceSize MVec.length)
 
 -- not for export
@@ -1266,7 +1270,7 @@ mapLinesBetween from to = gFoldMapBetween
   lift
   editTextLiftGapBuffer
   (\ f () -> flip (,) () <$> runMapLinesStep f)
-  readSlice
+  (readSlice MVec.read)
   writeSlice
   (sliceSize MVec.length)
   from
@@ -1333,6 +1337,8 @@ newtype FoldMapLines mvar tags fold r m a
     }
   deriving (Functor, Applicative, Monad)
 
+type instance EditorTagsType (FoldMapLines mvar tags fold r m) = tags
+
 instance Monad m => MonadState fold (FoldMapLines mvar tags fold r m) where
   state = FoldMapLines . lift . state
 
@@ -1385,7 +1391,7 @@ foldMapLinesBetween = gFoldMapBetween
   lift
   editTextLiftGapBuffer
   (\ f -> runFoldMapLinesStep f $ const $ return ())
-  readSlice
+  (readSlice MVec.read)
   writeSlice
   (sliceSize MVec.length)
 
@@ -1451,12 +1457,12 @@ viewLineLiftIIBuffer f = ViewLine $ ExceptT $ do
   cur <- use viewerElemsBeforeCursor
   (ret, st) <- lift $ flip runIIBuffer
     IIBufferState{ theIIBufferVector = vec, theIIBufferCursor = cur }
-    (catchError (Right <$> f) $ fmap Left . bufferToLineEditError)
+    (catchError (Right <$> f) $ fmap Left . bufferToTextEditError)
   viewerLine . textLineString .= st ^. iiBufferVector
   viewerElemsBeforeCursor     .= st ^. iiBufferCursor
   case ret of
-    Right ret -> return ret
-    Left{}    -> error $ "internal error: 'bufferTextToEditorError' evaluated to 'throwError'"
+    Right a -> return a
+    Left{}  -> error $ "internal error: 'bufferTextToEditorError' evaluated to 'throwError'"
 
 liftViewLine :: MonadError TextEditError m => ViewLine tags Identity a -> TextLine tags -> m a
 liftViewLine f = (throwError ||| pure) . runViewLine f
@@ -1466,7 +1472,7 @@ runViewLineT :: Monad m => ViewLine tags m a -> TextLine tags -> m (Either TextE
 runViewLineT (ViewLine f) = \ case
   TextLineUndefined -> error "internal error: evaluated 'runViewLine' on an undefined line"
   line -> evalStateT (runExceptT f) $
-    ViewLineState{ theViewerElemsBeforeCursor = 0, theViewerLine = line }
+    ViewLineState{ theViewerCharsBeforeCursor = 0, theViewerLine = line }
 
 -- | Like 'runViewLineT' but runs in a pure 'Identity' monad
 runViewLine :: ViewLine tags Identity a -> TextLine tags -> Either TextEditError a
@@ -1474,8 +1480,8 @@ runViewLine f = runIdentity . runViewLineT f
 
 -- | Returns the top-most index of the 'TextLine' being viewed. If the 'TextLine' is empty or
 -- undefined, 'Nothing' is returned.
-viewerTopIndex :: Monad m => ViewLine tags m (Maybe (Absolute CharIndex))
-viewerTopIndex = use viewerLine <&> \ case
+viewerTopChar :: Monad m => ViewLine tags m (Maybe (Absolute CharIndex))
+viewerTopChar = use viewerLine <&> \ case
   TextLineUndefined -> Nothing
   line              -> Just $ toIndex $ intSize line - 1
 
@@ -1483,8 +1489,8 @@ cursorIsOnLineBreak :: Monad m => ViewLine tags m Bool
 cursorIsOnLineBreak = indexIsOnLineBreak <$> use viewerLine <*> viewLineLiftIIBuffer cursorIndex
 
 -- | Move the cursor of the 'TextFrame' to the given 'Absolute' 'CharIndex'.
-viewerCursorTo :: Monad m => Absolute CharIndex -> ViewLine tags m ()
-viewerCursorTo = viewLineLiftIIBuffer .
+viewerCursorToChar :: Monad m => Absolute CharIndex -> ViewLine tags m ()
+viewerCursorToChar = viewLineLiftIIBuffer .
   (validateIndex >=> (iiBufferCursor .=) . distanceFromOrigin)
 
 -- Not for export
@@ -2409,9 +2415,9 @@ instance
 -- threads may immediately resume performing updates on the 'TextBuffer'.
 data TextFrame tags
   = TextFrame
-    { textFrameCharCount :: !VecLength
+    { theTextFrameCharCount :: !VecLength
       -- ^ Evaluates to how many characters exist in this buffer.
-    , textFrameVector    :: !(Vec.Vector (TextLine tags))
+    , theTextFrameVector    :: !(Vec.Vector (TextLine tags))
       -- ^ Evaluates to a vector of 'TextLine's so you can make use of the 'Vec.Vector' APIs to
       -- define your own operations on a 'TextFrame'.
     }
@@ -2420,8 +2426,16 @@ instance Semigroup tags => Semigroup (TextFrame tags) where
   (<>) = textFrameAppend (<>)
 
 instance Monoid tags => Monoid (TextFrame tags) where
-  mempty  = TextFrame{ textFrameCharCount = 0, textFrameVector = mempty }
+  mempty  = TextFrame{ theTextFrameCharCount = 0, theTextFrameVector = mempty }
   mappend = textFrameAppend mappend
+
+-- not for export
+textFrameCharCount :: Lens' (TextFrame tags) VecLength
+textFrameCharCount = lens theTextFrameCharCount $ \ a b -> a{ theTextFrameCharCount = b }
+
+-- not for export
+textFrameVector :: Lens' (TextFrame tags) (Vec.Vector (TextLine tags))
+textFrameVector = lens theTextFrameVector $ \ a b -> a{ theTextFrameVector = b }
 
 -- not for export: requires an uninitialized 'LineEditor' as a parameter.
 --
@@ -2437,7 +2451,7 @@ frameToBuffer
   -> TextFrame tags  -- ^ The frame from which to fill the buffer.
   -> LineEditor (mvar (PrimState m)) tags -- ^ An initial line editor, should be empty.
   -> m (TextBuffer (mvar (PrimState m)) tags)
-frameToBuffer initSize loc tags TextFrame{ textFrameVector=vec } cur = do
+frameToBuffer initSize loc tags TextFrame{ theTextFrameVector=vec } cur = do
   let i   = loc ^. lineIndex
   let len = Vec.length vec
   if len <= 0 then newTextBuffer initSize tags else do
@@ -2474,7 +2488,7 @@ newTextBufferFromFrame loc tags frame = newLineEditor Nothing tags >>=
 
 -- | Decompose a 'TextFrame' into a list of 'TextLine's.
 textFrameToList :: TextFrame tags -> [TextLine tags]
-textFrameToList = Vec.toList . textFrameVector
+textFrameToList = Vec.toList . theTextFrameVector
 
 -- | Decompose a 'TextFrame' into a list of tagged 'String's. The 'String' is paired with a 'Word16'
 -- count of the number of line-breaking characters exist at the end of the string, and the @tags@
@@ -2487,7 +2501,7 @@ textFrameToStrings = textFrameToList >=> \ case
 
 -- | An empty 'TextFrame', containing zero lines of text.
 emptyTextFrame :: TextFrame tags
-emptyTextFrame = TextFrame{ textFrameCharCount = 0, textFrameVector = Vec.empty }
+emptyTextFrame = TextFrame{ theTextFrameCharCount = 0, theTextFrameVector = Vec.empty }
 
 -- | This function works similar to 'Data.Monoid.mappend' or the @('Data.Semigroup.<>')@ operator,
 -- but allows you to provide your own appending function for the @tags@ value. Tags are appended if
@@ -2496,13 +2510,13 @@ emptyTextFrame = TextFrame{ textFrameCharCount = 0, textFrameVector = Vec.empty 
 -- appending function is never evaluated.
 textFrameAppend :: (tags -> tags -> tags) -> TextFrame tags -> TextFrame tags -> TextFrame tags
 textFrameAppend appendTags
-  a@(TextFrame{textFrameCharCount=countA,textFrameVector=vecA})
-  b@(TextFrame{textFrameCharCount=countB,textFrameVector=vecB}) =
+  a@(TextFrame{theTextFrameCharCount=countA,theTextFrameVector=vecA})
+  b@(TextFrame{theTextFrameCharCount=countB,theTextFrameVector=vecB}) =
     let lenA = Vec.length vecA in
     let lenB = Vec.length vecB in
     if lenA == 0 then a else if lenB == 0 then b else TextFrame
-    { textFrameCharCount = countA + countB
-    , textFrameVector    = runST
+    { theTextFrameCharCount = countA + countB
+    , theTextFrameVector    = runST
         (do let hiA     = vecA Vec.! (lenA - 1)
             let loB     = vecB Vec.! 0
             let noBreak = hiA ^. textLineBreakSymbol == NoLineBreak
@@ -2533,24 +2547,24 @@ textFrame from0 to0 = do
   (to,   hiline) <- validateLocation $ max from0 to0
   if (from ^. lineIndex) == (to   ^. lineIndex) then
     (throwError ||| return) $ flip runViewLine loline $ do
-      viewerCursorTo (from ^. charIndex)
-      top <- viewerTopIndex
+      viewerCursorToChar (from ^. charIndex)
+      top <- viewerTopChar
       case top of
         Nothing  -> return TextFrame
-          { textFrameCharCount = 0
-          , textFrameVector    = Vec.empty
+          { theTextFrameCharCount = 0
+          , theTextFrameVector    = Vec.empty
           }
         Just top -> do
           (lo, hi) <- splitLine
           line <- if top == (to ^. charIndex) then pure lo else
                     viewerLine .= hi >> fst <$> splitLine
           return TextFrame
-            { textFrameCharCount = VecLength $ intSize line
-            , textFrameVector    = Vec.singleton line
+            { theTextFrameCharCount = VecLength $ intSize line
+            , theTextFrameVector    = Vec.singleton line
             }
    else do
      let splitter line point take = (throwError ||| return) $
-           flip runViewLine line $ viewerCursorTo (point ^. charIndex) >> take <$> splitLine
+           flip runViewLine line $ viewerCursorToChar (point ^. charIndex) >> take <$> splitLine
      loline <- splitter loline from snd
      hiline <- splitter hiline to   fst
      editTextLiftGapBuffer $ do
@@ -2563,8 +2577,8 @@ textFrame from0 to0 = do
        vec <- (>>= (throwError ||| return)) $ if fromIdx > toIdx then init $ pure () else
          withRegion fromIdx toIdx $ \ lo hi -> init $ pushSlice Before lo >> pushSlice Before hi
        return TextFrame
-         { textFrameCharCount = VecLength $ sum $ intSize <$> Vec.toList vec
-         , textFrameVector    = vec
+         { theTextFrameCharCount = VecLength $ sum $ intSize <$> Vec.toList vec
+         , theTextFrameVector    = vec
          }
 
 -- | Like 'textFrame', creates a new text view, but rather than taking two 'TextLocation's to delimit
@@ -2582,6 +2596,89 @@ textFrameOnLines from to = textFrame
    { theLocationLineIndex = max from to
    , theLocationCharIndex = Absolute $ CharIndex maxBound
    })
+
+----------------------------------------------------------------------------------------------------
+
+-- | This is a type for functions that are used to inspect the elements of a 'TextFrame'.
+newtype ViewText tags m a
+  = ViewText (ExceptT TextEditError (StateT (ViewTextState tags) m) a)
+  deriving (Functor, Applicative, Monad, MonadError TextEditError)
+
+type instance EditorTagsType (ViewText tags m) = tags
+
+instance MonadTrans (ViewText tags) where
+  lift = ViewText . lift . lift
+
+data ViewTextState tags
+  = ViewTextState
+    { theViewerLinesBeforeCursor :: VecLength
+    , theViewerFrame             :: TextFrame tags
+    }
+
+instance PrimMonad m => TextFoldable (ViewText tags m) where
+  foldLinesBetween = gFoldMapBetween
+    (foldLinesLift . lift)
+    viewTextLiftIIBuffer
+    runFoldLinesStep
+    (readSlice $ \ vec -> return . (vec Vec.!))
+    (\ _ _ -> return)
+    (sliceSize Vec.length)
+
+viewerLinesBeforeCursor :: Lens' (ViewTextState tags) VecLength
+viewerLinesBeforeCursor =
+  lens theViewerLinesBeforeCursor $ \ a b -> a{ theViewerLinesBeforeCursor = b }
+
+viewerFrame :: Lens' (ViewTextState tags) (TextFrame tags)
+viewerFrame = lens theViewerFrame $ \ a b -> a{ theViewerFrame = b }
+
+-- not for export
+--
+-- Only used by instance of foldLinesBetween
+viewTextLiftIIBuffer
+  :: Monad m
+  => IIBuffer (Vec.Vector (TextLine tags)) m a
+  -> ViewText tags m a
+viewTextLiftIIBuffer f = ViewText $ ExceptT $ do
+  vec <- use (viewerFrame . textFrameVector)
+  cur <- use viewerLinesBeforeCursor
+  (ret, st) <- lift $ flip runIIBuffer
+    IIBufferState{ theIIBufferVector = vec, theIIBufferCursor = cur }
+    (catchError (Right <$> f) $ fmap Left . bufferToLineEditError)
+  viewerFrame . textFrameVector .= st ^. iiBufferVector
+  viewerLinesBeforeCursor       .= st ^. iiBufferCursor
+  case ret of
+    Right ret -> return ret
+    Left{}    -> error $ "internal error: 'bufferTextToEditorError' evaluated to 'throwError'"
+
+-- | Run a function of type 'ViewText' on a 'TextFrame', allowing you to inspect the elements of the
+-- frame line by line.
+runViewTextT :: Monad m => ViewText tags m a -> TextFrame tags -> m (Either TextEditError a)
+runViewTextT (ViewText f) frame = evalStateT (runExceptT f) ViewTextState
+  { theViewerLinesBeforeCursor = 0
+  , theViewerFrame             = frame
+  }
+
+-- | Like 'RunViewTextT' but evaluates to a pure function. Of course the 'ViewText' function given
+-- must be pure, this the monadic type is 'Identity'.
+runViewText :: ViewText tags Identity a -> TextFrame tags -> Either TextEditError a
+runViewText (ViewText f) frame = evalState (runExceptT f) ViewTextState
+  { theViewerLinesBeforeCursor = 0
+  , theViewerFrame             = frame
+  }
+
+-- | Get the current line under the cursor within a 'ViewText' function context.
+viewerGetLine :: Monad m => ViewText tags m (TextLine tags)
+viewerGetLine = viewTextLiftIIBuffer $ getElem Before
+
+-- | Move the line cursor within a 'ViewText' function context.
+viewerCursorToLine :: Monad m => Absolute LineIndex -> ViewText tags m ()
+viewerCursorToLine = viewTextLiftIIBuffer . void .
+  (validateIndex >=> distanceFromCursor >=> modCount Before . (+))
+
+-- | Take the line under the cursor within a 'ViewText' function context, and use this line to
+-- evaluate a 'ViewLine' function.
+viewLine :: Monad m => ViewLine tags m a -> ViewText tags m a
+viewLine f = viewerGetLine >>= lift . runViewLineT f >>= (throwError ||| return)
 
 ----------------------------------------------------------------------------------------------------
 
