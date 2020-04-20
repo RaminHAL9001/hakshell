@@ -55,17 +55,92 @@
 --- processors, and hence a text editor API is an integral part of the "Hakshell" library.
 module Hakshell.TextEditor
   ( -- * Text Buffers
+    --
+    -- There are two general types of buffers:
+    --
+    --     * 'TextBuffer' which is mutable
+    --     * and 'TextFrame' which is immutable.
+    --
+    -- Though different, both buffer types have many things in common:
+    --
+    --     * store information in vector data structures from the @vector@ library,
+    --     * vectors contain 'TextLine' values
+    --     * provide cursors for inspecting text
+    --
+    -- Of course, in the case of the immutable 'TextBuffer' type, the cursors can change text
+    -- content relative to the cursor position, while 'TextFrame's cannot have the text content be
+    -- changed.
+    --
+    -- Even immutable buffers, which cannot have the text content changed, have stateful cursors
+    -- that can have their positions changed. Since cursors are stateful, functions for manipulating
+    -- the cursor are monadic in nature.
+    --
+    --     * Functions of type 'ViewText' are cursors that operate on immutable 'TextFrame's,
+    --     * functions of type 'EditText' are cursors that operate on mutable 'TextBuffer's.
+    --
+    -- There are also functions for folding, mapping, and both folding and mapping over buffers.
+    --
+    --     * 'FoldLines' performs read-only folds,
+    --     * 'MapLines' maps over lines in-place without changing the number of lines in the buffer,
+    --     * 'FoldMapLines' can map over lines in-place without changing the number of lines in the
+    --       buffer, but can also
 
-    -- ** Cursors
+    -- ** The Cursor
     --
-    -- The concept of a "cursor" is important to understand in order to use the functions in this
-    -- module. The 'EditText' function type and the 'ViewText' function type both have cursors which
-    -- can be moved around a 'TextBuffer' or 'TextFrame' (respectively), and many functions can
-    -- copy or fold over text relative to that cursor position.
+    -- The cursor is an index into a buffer, and index values begin at 1, not at 0, as is typical
+    -- with most text editors. Most cursor functions take a 'RelativeToCursor' value which is either
+    -- 'Before' or 'After'. 'Before' may have instead been called "on" or "under" because it
+    -- actually indicates the element at the current cursor index, while 'After' indicates the first
+    -- element after the cursror.
+
+    Absolute(..),  LineIndex(..), CharIndex(..), TextLocation(..),
+    TextCursorSpan(..), CharStats(..),
+    Relative(..), RelativeToCursor(..),
+    RelativeToAbsoluteCursor, -- <- does not export members
+    relativeToAbsolute, relativeLine, relativeChar, lineIndex, charIndex,
+
+    -- *** The 'LineEditor' data type.
     --
-    -- All functions which have access to cursors in their context provide the ability to query the
-    -- location of the cursor. But the ability to edit text under the cursor is unique to the
-    -- 'EditText' function.
+    -- There is a 'LineEditor' data type which allows editing of individual characters in a
+    -- line. The 'TextBuffer' data type always has one 'LineEditor' built-in to it. This
+    -- 'LineEditor' can be filled with the content of 'TextLine's from the buffer using
+    -- 'refillLineEditor', and the content of the 'LineEditor' can be flushed back to the buffer as
+    -- a 'TextLine' using 'flushLineEditor'.
+
+    LineEditor,
+    flushRefill, refillLineEditor, refillLineEditorWith, flushLineEditor,
+    lineEditorCharCount, lineEditorUnitCount, getLineCharCount, getUnitCount,
+    copyLineEditorText, clearLineEditor, resetLineEditor,
+
+    -- *** Moving by lines or by characters
+    --
+    -- These are the fundamental cursor motion functions. You must move by line and then move by
+    -- character separately. There are more convenient cursor motion functinos below which allow
+    -- motion to a line and character using a single 'TextLocation' value.
+
+    moveCursor, moveByLine, moveByChar,
+
+    -- *** Getting and setting the cursor position
+    --
+    -- When moving the cursor around, some functions, like 'gotoLine' or 'moveByLine' it's contents
+    -- on the current line unless you explicitly call 'flushLineEditor'. However functions like
+    -- 'gotoLocation' do automatically call 'flushLineEditor' because the cursor 'CharIndex'
+    -- position cannot be updated until it is known how many characters exist on the current line,
+    -- and the number of characters that exist on the line cannot be known until the line is
+    -- flushed.
+    --
+    -- Without "flushing" the characters currently in the 'LineEditor' will not be saved to the
+    -- 'TextBuffer' and will be carried around to the 'LineEditor's current location, however if the
+    -- cursor's column location cannot be changed unless 'refilLineEditor' is used to move the line
+    -- location.
+    --
+    -- There are situations where you may not want to use 'flushRefill' to perform a cursor motion, as
+    -- in when accumulating lines into the 'LineEditor' after each cursor motion.
+
+    getLocation, gotoLocation, saveCursorEval, gotoLine, goNearLine, gotoChar, goNearChar,
+    shiftAbsolute, diffAbsolute, unwrapTextCursorSpan, sumTextLocation, diffTextLocation,
+
+    -- *** Other functions for getting cursor information
 
     CursorIndexedText(..), CursorIndexedLine(..),
 
@@ -83,7 +158,11 @@ module Hakshell.TextEditor
     textLineTop, textLineIsUndefined,
     textLineTags, textLineChomp, showTextLine,
 
-    -- *** 'TextLine' Inspection Monad
+    -- *** Cursoring over characters in a 'TextLine'
+    --
+    -- The 'ViewLine' function type allows for manipulating a cursor along a 'TextLine' to inspect
+    -- individual characters.
+
     ViewLine, liftViewLine, runViewLineT, runViewLine, viewerTopChar, cursorIsOnLineBreak,
     viewerCursorToChar, sliceLineToEnd, splitLine,
 
@@ -101,18 +180,6 @@ module Hakshell.TextEditor
     thisTextBuffer,
 
     module Hakshell.TextEditor.LineBreaker,
-
-    -- ** The 'LineEditor' data type.
-    --
-    -- Every 'TextBuffer' has it's own 'LineEditor' which can be updated by evaluating a function of
-    -- type 'EditLine' using the 'editLine' function.
-
-    LineEditor,
-    flushRefill, refillLineEditor, refillLineEditorWith, flushLineEditor,
-
-    -- *** Working with the content of a 'LineEditor'
-    lineEditorCharCount, lineEditorUnitCount, getLineCharCount, getUnitCount,
-    copyLineEditorText, clearLineEditor, resetLineEditor,
 
     -- ** The 'EditText' function type
     --
@@ -149,34 +216,6 @@ module Hakshell.TextEditor
 
     TextEditError(..),
     
-    -- ** Positioning the Cursor
-    --
-    -- __IMPORTANT__: when moving the cursor around, some functions, like 'gotoLine' or 'moveByLine'
-    -- do not leave it's contents on the current line unless you explicitly call 'flushLineEditor',
-    -- but other functions like 'gotoLocation' do automatically call 'flushLineEditor'. Without
-    -- "flushing" the characters currently in the 'LineEditor' will not be saved to the 'TextBuffer'
-    -- and will be carried around to the 'LineEditor's current location, however if the cursor's
-    -- column location cannot be changed unless 'refilLineEditor' is used to move the line
-    -- location.
-    --
-    -- There are situations where you may not want to use 'flushRefill' to perform a cursor motion, as
-    -- in when accumulating lines into the 'LineEditor' after each cursor motion.
-
-    getLocation, gotoLocation, saveCursorEval, gotoLine, goNearLine, gotoChar, goNearChar,
-
-    Absolute(..),  LineIndex(..), CharIndex(..), TextLocation(..),
-    TextCursorSpan(..), CharStats(..),
-    shiftAbsolute, diffAbsolute, unwrapTextCursorSpan,
-    sumTextLocation, diffTextLocation,
-
-    -- *** Moving the cursor relative to the cursor
-
-    moveCursor, moveByLine, moveByChar,
-
-    Relative(..), RelativeToCursor(..),
-    RelativeToAbsoluteCursor, -- <- does not export members
-    relativeToAbsolute, relativeLine, relativeChar, lineIndex, charIndex,
-
     -- ** Text Frames
     --
     -- A 'TextFrame' is an immutable copy of a portion of a 'TextBuffer'. By creating a 'TextFrame'
