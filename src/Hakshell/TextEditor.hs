@@ -493,7 +493,7 @@ data TextEditError
   deriving (Eq, Ord, Show)
 
 bufferToEditorError
-  :: (Bounded i, IsIndex i, IsLength len, MonadEditVec vec m)
+  :: (Bounded i, IsIndex i, IsLength len, MonadVectorCursor vec m)
   => (RelativeToCursor -> TextEditError) -- ^ EndOfBuffer
   -> (i -> TextEditError) -- ^ IndexOutOfRnage
   -> (i -> len -> TextEditError) -- ^ CountOutOfRnage
@@ -506,15 +506,15 @@ bufferToEditorError endOfBuffer indexOutOfRange countOutOfRange = \ case
   BufferIndexRange  i len ->
     flip countOutOfRange (toLength $ fromLength len) <$> indexToAbsolute i
 
-bufferToTextEditError :: MonadEditVec vec m => BufferError -> m TextEditError
+bufferToTextEditError :: MonadVectorCursor vec m => BufferError -> m TextEditError
 bufferToTextEditError = bufferToEditorError EndOfLineBuffer LineIndexOutOfRange LineCountOutOfRange
 
-bufferToLineEditError :: MonadEditVec vec m => BufferError -> m TextEditError
+bufferToLineEditError :: MonadVectorCursor vec m => BufferError -> m TextEditError
 bufferToLineEditError = bufferToEditorError EndOfCharBuffer CharIndexOutOfRange CharCountOutOfRange
 
 liftMutableGapBuffer
   :: (Monad m, Monad lifted, Monad prim,
-      MonadEditVec vec (GapBuffer vec prim)
+      MonadVectorCursor vec (GapBuffer vec prim)
      )
   => Lens' st (GapBufferState vec)
   -> (BufferError -> GapBuffer vec prim TextEditError)
@@ -564,6 +564,8 @@ data TextLine tags
     , theTextLineTags        :: !tags
     }
   deriving Functor
+
+instance HasNullValue (TextLine tags) where { nullValue = TextLineUndefined; }
 
 instance IntSized (TextLine tags) where
   intSize = \ case
@@ -937,16 +939,6 @@ charCursorIsDefined = lineEditGapBuffer . gapBufferCursorIsDefined
 
 ----------------------------------------------------------------------------------------------------
 
-instance (PrimMonad m, PrimState m ~ st) =>
-  MonadGapBuffer
-    (MVec.MVector st (TextLine tags))
-    (GapBuffer (MVec.MVector st (TextLine tags)) m)
-  where
-    type WriteVecElem (MVec.MVector st (TextLine tags)) = TextLine tags
-    nullElem = pure TextLineUndefined
-    newVector (VecLength siz) = nullElem >>= lift . MVec.replicate siz
-    setCursorIsDefined = assign gapBufferCursorIsDefined
-
 -- | This is a type of functions that can modify the textual content stored in a 'TextBufferState'.
 newtype EditText mvar tags m a
   = EditText (
@@ -1076,9 +1068,8 @@ editLineState = EditLine . lift
 -- evaluation completes (which may have updated the 'GapBuffer'), replaces the updated
 -- 'textEditGapBuffer'.
 editLineLiftGapBuffer
-  :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
-  => GapBuffer (UMVec.MVector (PrimState m) Char) m a
-  -> EditLine (mvar (PrimState m)) tags m a
+  :: (PrimMonad m, PrimState m ~ st, VarPrimState (mvar st) ~ st)
+  => GapBuffer (UMVec.MVector st Char) m a -> EditLine (mvar st) tags m a
 editLineLiftGapBuffer =
   liftMutableGapBuffer lineEditGapBuffer bufferToLineEditError lift EditLine
 
@@ -1178,7 +1169,7 @@ runFoldLinesStep (FoldLines f) = runStateT (runExceptT $ runContT f return) >=> 
 -- This function is used to define the algorithm used by several functions. Here is a list of return
 -- types followed by the functions that return them.
 gFoldMapBetween ::
-  ( MonadEditVec (vec (TextLine tags)) (gapperM m),
+  ( MonadVectorCursor (vec (TextLine tags)) (gapperM m),
     PrimMonad m, MonadError BufferError (gapperM m),
     MonadCont loopM, Monad editor
   )
@@ -1525,7 +1516,8 @@ viewerTopChar = use viewerLine <&> \ case
   line              -> Just $ toIndex $ intSize line - 1
 
 cursorIsOnLineBreak :: Monad m => ViewLine tags m Bool
-cursorIsOnLineBreak = indexIsOnLineBreak <$> use viewerLine <*> viewLineLiftIIBuffer cursorIndex
+cursorIsOnLineBreak =
+  indexIsOnLineBreak <$> use viewerLine <*> viewLineLiftIIBuffer (writingIndex Before)
 
 -- | Move the cursor of the 'TextFrame' to the given 'Absolute' 'CharIndex'.
 viewerCursorToChar :: Monad m => Absolute CharIndex -> ViewLine tags m ()
@@ -1884,13 +1876,13 @@ thisTextBuffer = EditText ask
 editTextGetLineNumber
   :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
   => EditText (mvar (PrimState m)) tags m (Absolute LineIndex)
-editTextGetLineNumber = editTextLiftGapBuffer $ cursorIndex >>= indexToAbsolute
+editTextGetLineNumber = editTextLiftGapBuffer $ writingIndex Before >>= indexToAbsolute
 
 -- | Get the current column number of the cursor.
 getColumnNumber
   :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
   => EditLine (mvar (PrimState m)) tags m (Absolute CharIndex)
-getColumnNumber = editLineLiftGapBuffer $ cursorIndex >>= indexToAbsolute
+getColumnNumber = editLineLiftGapBuffer $ writingIndex Before >>= indexToAbsolute
 
 -- | Get the current cursor location. This function is identical to 'getLocation'.
 getLocation
