@@ -170,7 +170,7 @@ module Hakshell.TextEditor
     -- around using the 'gotoChar', 'moveByChar', functions. Text is deleted with the
     -- 'deleteCharsWrap' functions.
 
-    TextBuffer, TextIORef, TextMutex, TextSTRef,
+    TextBuffer,
     newTextBuffer, copyTextBuffer,
     bufferLineBreaker, bufferDefaultTags, bufferTargetCol,
     thisTextBuffer,
@@ -278,7 +278,6 @@ import           Hakshell.String
 import           Hakshell.TextEditor.LineBreaker
 
 import           Control.Arrow
-import           Control.Exception
 import           Control.Lens
 import           Control.Monad.Cont
 import           Control.Monad.Cont.Class
@@ -290,8 +289,7 @@ import           Control.Monad.ST
 import           Control.Monad.State
 import           Control.Monad.State.Class
 
-import           Data.Primitive.MutVar       (MutVar, newMutVar, readMutVar, writeMutVar)
-import           Data.Primitive.MVar         (MVar, newMVar, readMVar, takeMVar, putMVar)
+import qualified Data.Primitive.MutVar       as Var
 import qualified Data.Vector                 as Vec
 --import qualified Data.Vector.Generic         as GVec
 import qualified Data.Vector.Mutable         as MVec
@@ -733,53 +731,7 @@ viewerLine = lens theViewerLine $ \ a b -> a{ theViewerLine = b }
 -- Just remember that you can't use an @(editor tag a@) type as though @editor@ were two different
 -- function types, for example when using an 'EditText' and an 'FoldMapLines' function in the same
 -- @do@ block, this will fail to pass the type-checker.
-newtype TextBuffer mvar tags = TextBuffer (mvar (TextBufferState mvar tags))
-
--- | An non-mutex (non-thread-safe) reference that can be mutated in the IO monad.
-type TextIORef = MutVar (PrimState IO)
-
--- | An mutex (thread-safe) reference that can be mutated in the IO monad.
-type TextMutex = MVar (PrimState IO)
-
--- | An non-mutex (non-thread-safe) reference that can be mutated in the ST monad, although the ST
--- monad is almost always a single-threaded computation, so it doesn't matter if it is not
--- thread-safe.
-type TextSTRef s = MutVar (PrimState (ST s))
-
-type family VarPrimState (var :: * -> *)
-type instance VarPrimState (MutVar primst) = primst
-type instance VarPrimState (MVar primst) = primst
-
-class
-  (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m
-  ) =>
-  ModifyReference (mvar :: * -> * -> *) m where
-    newReference :: a -> m (mvar (PrimState m) a)
-    modifyReference :: mvar (PrimState m) a -> (a -> m (a, b)) -> m b
-    readReference :: mvar (PrimState m) a -> m a
-    swapReference :: mvar (PrimState m) a -> a -> m a
-
-instance
-  (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m
-  ) =>
-  ModifyReference MutVar m where
-    newReference  = newMutVar
-    modifyReference ref f = readMutVar ref >>= f >>= \ (a, b) -> writeMutVar ref a >> return b
-    readReference ref = readMutVar ref
-    swapReference ref a = readMutVar ref <* writeMutVar ref a
-
-instance ModifyReference MVar IO where
-  newReference = newMVar
-  modifyReference ref f = bracketOnError (takeMVar ref) (putMVar ref)
-    (f >=> \ (a, b) -> putMVar ref a >> return b)
-  readReference ref = readMVar ref
-  swapReference ref b =
-    bracketOnError (takeMVar ref) (putMVar ref) (\ a -> putMVar ref b >> return a)
-
-modifyReference_
-  :: ModifyReference mvar m
-  => mvar (PrimState m) a -> (a -> m a) -> m ()
-modifyReference_ mvar = modifyReference mvar . fmap (fmap (flip (,) ()))
+newtype TextBuffer m tags = TextBuffer (Var.MutVar (PrimState m) (TextBufferState m tags))
 
 ----------------------------------------------------------------------------------------------------
 
@@ -794,7 +746,10 @@ modifyReference_ mvar = modifyReference mvar . fmap (fmap (flip (,) ()))
 -- data type, which means you can use the 'Control.Lens.use', 'Control.Lens.assign', functions and
 -- the similar @('Control.Lens..=')@, @('Control.Lens.%=') operators in the "Control.Lens" module to
 -- update these values from within a @do@ block of code when programming a text editing combinator.
-data TextBufferState mvar tags
+--
+-- The type @m@ must be the monad in which this data type has it's internal state updated, and it
+-- must be a member of the typeclass 'PrimMonad'.
+data TextBufferState m tags
   = TextBufferState
     { theBufferDefaultLine   :: !(TextLine tags)
       -- ^ The tag value to use when new 'TextLine's are automatically constructed after a line
@@ -802,9 +757,9 @@ data TextBufferState mvar tags
     , theBufferLineBreaker   :: LineBreaker
       -- ^ The function used to break strings into lines. This function is called every time a
       -- string is transferred from 'theBufferLineEditor' to to 'theLinesAbove' or 'theLinesBelow'.
-    , theTextGapBufferState  :: !(GapBufferState (MVec.MVector (VarPrimState mvar) (TextLine tags)))
+    , theTextGapBufferState  :: !(GapBufferState (MVec.MVector (PrimState m) (TextLine tags)))
       -- ^ Contains the gap buffer itself, which is defined in the "Hakshell.GapBuffer" module.
-    , theBufferLineEditor    :: !(LineEditor mvar tags)
+    , theBufferLineEditor    :: !(LineEditor m tags)
       -- ^ A data structure for editing individual characters in a line of text.
     , theBufferTargetCol     :: !(Absolute CharIndex)
       -- ^ When moving the cursor up and down the 'TextBuffer' (e.g. using 'gotoLocation'), the
@@ -814,20 +769,20 @@ data TextBufferState mvar tags
   -- 'TextBuffer'. Create a 'runEditText' API function and export it.
 
 -- Not for export: this is only used to set empty lines in the buffer.
-bufferDefaultLine :: Lens' (TextBufferState mvar tags) (TextLine tags)
+bufferDefaultLine :: Lens' (TextBufferState st tags) (TextLine tags)
 bufferDefaultLine = lens theBufferDefaultLine $ \ a b -> a{ theBufferDefaultLine = b }
 
 -- | Entering a line-breaking character (e.g. @'\n'@) into a 'TextBufferState' using 'insertChar' or
 -- 'insertString' results in several 'TextLine's being generated automatically. Whenever a
 -- 'TextLine' is constructed, there needs to be a default tag value that is assigned to it. This
 -- lens allows you to observe or set the default tag value.
-bufferDefaultTags :: Lens' (TextBufferState mvar tags) tags
+bufferDefaultTags :: Lens' (TextBufferState st tags) tags
 bufferDefaultTags = bufferDefaultLine . textLineTags
 
 -- Not for export: access to the 'GapBufferState' within the 'TextBufferState' data structure.
 textEditGapBuffer
-  :: Lens' (TextBufferState mvar tags)
-           (GapBufferState (MVec.MVector (VarPrimState mvar) (TextLine tags)))
+  :: Lens' (TextBufferState m tags)
+           (GapBufferState (MVec.MVector (PrimState m) (TextLine tags)))
 textEditGapBuffer = lens theTextGapBufferState $ \ a b -> a{ theTextGapBufferState = b }
 
 -- | The function used to break strings into lines. This function is called every time a string is
@@ -840,20 +795,20 @@ textEditGapBuffer = lens theTextGapBufferState $ \ a b -> a{ theTextGapBufferSta
 -- @
 -- 'Prelude.concat' ('lineBreakerNLCR' str) == str
 -- @
-bufferLineBreaker :: Lens' (TextBufferState mvar tags) LineBreaker
+bufferLineBreaker :: Lens' (TextBufferState m tags) LineBreaker
 bufferLineBreaker = lens theBufferLineBreaker $ \ a b -> a{ theBufferLineBreaker = b }
 
 -- Not for export: indicates whether the line under the cursor is defined or undefined.
-lineCursorIsDefined :: Lens' (TextBufferState mvar tags) Bool
+lineCursorIsDefined :: Lens' (TextBufferState m tags) Bool
 lineCursorIsDefined = textEditGapBuffer . gapBufferCursorIsDefined
 
 -- | The current line of text being edited under the cursor.
-bufferLineEditor :: Lens' (TextBufferState mvar tags) (LineEditor mvar tags)
+bufferLineEditor :: Lens' (TextBufferState m tags) (LineEditor m tags)
 bufferLineEditor = lens theBufferLineEditor $ \ a b -> a{ theBufferLineEditor = b }
 
 -- | When moving the cursor up and down the 'TextBuffer' (e.g. using 'gotoLocation'), the cursor
 -- should generally remain at the same character column location.
-bufferTargetCol :: Lens' (TextBufferState mvar tags) (Absolute CharIndex)
+bufferTargetCol :: Lens' (TextBufferState m tags) (Absolute CharIndex)
 bufferTargetCol = lens theBufferTargetCol $ \ a b -> a{ theBufferTargetCol = b }
 
 ----------------------------------------------------------------------------------------------------
@@ -870,14 +825,17 @@ bufferTargetCol = lens theBufferTargetCol $ \ a b -> a{ theBufferTargetCol = b }
 -- moving the cursor. Other cursor motion functions, like 'gotoLine' and 'moveByLine' __DO_NOT__
 -- evaluate 'flushLineEditor' or 'refillLineEditor' at all, allowing you to accumulate 'TextLine's
 -- into the 'LineEditor' as you move it the cursor different lines in the 'TextBuffer'.
-data LineEditor mvar tags
+--
+-- The type @m@ must be the monad in which this data type has it's internal state updated, and it
+-- must be a member of the typeclass 'PrimMonad'.
+data PrimMonad m => LineEditor m tags
   = LineEditor
-    { theParentTextEditor     :: TextBuffer mvar tags
+    { theParentTextEditor     :: TextBuffer m tags
       -- ^ A line editor can be removed from it's parent 'TextEditor'. A 'LineEditor' is defined
       -- such that it can only directly edit text in it's parent 'TextEditor'. A 'LineEditor' can
       -- indirectly edit text in any other parent, but only if a complete copy of the content of the
       -- line editor is made and passed it to some other 'TextEditor'.
-    , theLineEditGapBuffer   :: !(GapBufferState (UMVec.MVector (VarPrimState mvar) Char))
+    , theLineEditGapBuffer   :: !(GapBufferState (UMVec.MVector (PrimState m) Char))
       -- ^ The internal 'GapBufferState'.
     , theLineEditorIsClean   :: !Bool
       -- ^ This is set to 'True' if 'theBufferLineEditor' is a perfect copy of the 'TextLine'
@@ -888,22 +846,23 @@ data LineEditor mvar tags
     , theLineEditorTags      :: tags
     }
 
-instance IntSized (LineEditor mvar tags) where { intSize = lineEditorCharCount; }
+instance PrimMonad m => IntSized (LineEditor m tags) where { intSize = lineEditorCharCount; }
 
-parentTextEditor :: Lens' (LineEditor mvar tags) (TextBuffer mvar tags)
+parentTextEditor :: PrimMonad m => Lens' (LineEditor m tags) (TextBuffer m tags)
 parentTextEditor = lens theParentTextEditor $ \ a b -> a{ theParentTextEditor = b }
 
 lineEditGapBuffer
-  :: Lens' (LineEditor mvar tags)
-           (GapBufferState (UMVec.MVector (VarPrimState mvar) Char))
+  :: (PrimMonad m, st ~ PrimState m)
+  => Lens' (LineEditor m tags)
+           (GapBufferState (UMVec.MVector st Char))
 lineEditGapBuffer = lens theLineEditGapBuffer $ \ a b -> a{ theLineEditGapBuffer = b }
 
 -- Not for export: this gets updated when inserting or deleting characters before the cursor.
-charsBeforeCursor :: Lens' (LineEditor mvar tags) VecLength
+charsBeforeCursor :: PrimMonad m => Lens' (LineEditor m tags) VecLength
 charsBeforeCursor = lineEditGapBuffer . gapBufferBeforeCursor
 
 -- Not for export: this gets updated when inserting or deleting characters after the cursor.
-charsAfterCursor :: Lens' (LineEditor mvar tags) VecLength
+charsAfterCursor :: PrimMonad m => Lens' (LineEditor m tags) VecLength
 charsAfterCursor = lineEditGapBuffer . gapBufferAfterCursor
 
 -- Not for export: controls line break information within the cursor. If this value is zero, it
@@ -911,35 +870,35 @@ charsAfterCursor = lineEditGapBuffer . gapBufferAfterCursor
 -- is non-zero, it indicates that the line breaking characters do exist after the cursor at some
 -- point, and if additional line breaks are inserted the characters after the cursor need to be
 -- split off into a new 'TextLine'.
-cursorBreakSymbol :: Lens' (LineEditor mvar tags) LineBreakSymbol
+cursorBreakSymbol :: PrimMonad m => Lens' (LineEditor m tags) LineBreakSymbol
 cursorBreakSymbol = lens theCursorBreakSymbol $ \ a b -> a{ theCursorBreakSymbol = b }
 
 -- | A 'Control.Lens.Lens' to get or set tags for the line currently under the cursor. To use or
 -- modify the tags value of the line under the cursor, evaluate one of the functions 'use',
 -- 'modifying', @('Control.Lens..=')@, or @('Control.Lens.%=')@ within an 'EditText' function, or
 -- any function which instantiates 'MonadEditText'.
-lineEditorTags :: Lens' (LineEditor mvar tags) tags
+lineEditorTags :: PrimMonad m => Lens' (LineEditor m tags) tags
 lineEditorTags = lens theLineEditorTags $ \ a b -> a{ theLineEditorTags = b }
 
 -- | This is set to 'True' if 'theBufferLineEditor' is a perfect copy of the 'TextLine' currently
 -- being referred to by the 'getLineNumber'. If the content of 'theBufferLineEditor' has been
 -- modified by 'insertChar' or 'deleteChars', or if cursor has been moved to a different line, this
 -- field is set to 'False'.
-lineEditorIsClean :: Lens' (LineEditor mvar tags) Bool
+lineEditorIsClean :: PrimMonad m => Lens' (LineEditor m tags) Bool
 lineEditorIsClean = lens theLineEditorIsClean $ \ a b -> a{ theLineEditorIsClean = b }
 
 -- This is set to 'True' if the element under the cursor is defined, 'False' if the element under
 -- the cursor is undefined.
-charCursorIsDefined :: Lens' (LineEditor mvar tags) Bool
+charCursorIsDefined :: PrimMonad m => Lens' (LineEditor m tags) Bool
 charCursorIsDefined = lineEditGapBuffer . gapBufferCursorIsDefined
 
 ----------------------------------------------------------------------------------------------------
 
 -- | This is a type of functions that can modify the textual content stored in a 'TextBufferState'.
-newtype EditText mvar tags m a
+newtype EditText tags m a
   = EditText (
-      ReaderT (TextBuffer mvar tags)
-        (ExceptT TextEditError (StateT (TextBufferState mvar tags) m)) a
+      ReaderT (TextBuffer m tags)
+        (ExceptT TextEditError (StateT (TextBufferState m tags) m)) a
     )
   deriving
     ( Functor, Applicative, Monad,
@@ -953,20 +912,20 @@ newtype EditText mvar tags m a
 --  throwError = EditText . throwError
 --  catchError (EditText try) catch = EditText $ catchError try $ unwrapEditText . catch
 
-instance MonadTrans (EditText mvar tags) where
+instance MonadTrans (EditText tags) where
   lift = EditText . lift . lift . lift
 
-instance (Monad m, Semigroup a) => Semigroup (EditText mvar tags m a) where
+instance (Monad m, Semigroup a) => Semigroup (EditText tags m a) where
   a <> b = (<>) <$> a <*> b
 
-instance (Monad m, Monoid a) => Monoid (EditText mvar tags m a) where
+instance (Monad m, Monoid a) => Monoid (EditText tags m a) where
   mempty = return mempty
   mappend a b = mappend <$> a <*> b
 
 editTextState
   :: PrimMonad m
-  => StateT (TextBufferState mvar tags) m a
-  -> EditText mvar tags m a
+  => StateT (TextBufferState m tags) m a
+  -> EditText tags m a
 editTextState = EditText . lift . lift
 
 -- | Evaluate an 'EditText' function on the given 'TextBufferState'. The given 'EditText' function
@@ -976,12 +935,15 @@ editTextState = EditText . lift . lift
 -- type's @m@ parameter is set to the @IO@ type, meaning you cannot use this function if the
 -- 'EditText's @m@ parameter is something other than @IO@, like for example a 'ReaderT' type.
 runEditText
-  :: ModifyReference mvar m
-  => EditText (mvar (PrimState m)) tags m a
-  -> TextBuffer (mvar (PrimState m)) tags
+  :: (PrimMonad m, st ~ PrimState m)
+  => EditText tags m a
+  -> TextBuffer m tags
   -> m (Either TextEditError a)
-runEditText (EditText f) this@(TextBuffer mvar) = modifyReference mvar $
-  fmap (\ (a,b) -> (b,a)) . runStateT (runExceptT $ runReaderT f this)
+runEditText (EditText f) this@(TextBuffer mvar) = do
+  (result, buffer) <- Var.readMutVar mvar >>=
+    runStateT (runExceptT $ runReaderT f this)
+  Var.writeMutVar mvar buffer
+  return result
 
 -- | Evaluate an 'EditText' function on the given 'TextBufferState', but unlike 'runEditTextIO', a
 -- copy of the entire text buffer is first created, and all updates are performed on the copy
@@ -989,46 +951,44 @@ runEditText (EditText f) this@(TextBuffer mvar) = modifyReference mvar $
 -- 'EditText' functions where the @m@ parameter is not just @IO@ but any member of the 'Monad'
 -- typeclass, however the trade-off is that a copy of the text buffer must be made.
 runEditTextOnCopy
-  :: ModifyReference mvar m
-  => EditText (mvar (PrimState m)) tags m a
-  -> TextBuffer (mvar (PrimState m)) tags
-  -> m (Either TextEditError a, TextBuffer (mvar (PrimState m)) tags)
+  :: PrimMonad m
+  => EditText tags m a
+  -> TextBuffer m tags
+  -> m (Either TextEditError a, TextBuffer m tags)
 runEditTextOnCopy (EditText f) = copyTextBuffer >=> \ copy@(TextBuffer mvar) -> do
-  (result, st) <- readReference mvar >>= runStateT (runExceptT $ runReaderT f copy)
-  void $ swapReference mvar st
+  (result, st) <- Var.readMutVar mvar >>= runStateT (runExceptT $ runReaderT f copy)
+  Var.writeMutVar mvar st
   return (result, copy)
 
 -- Extracts 'textEditGapBuffer', uses it to evaluate 'runGapBuffer', then after the 'runGapBuffer'
 -- evaluation completes (which may have updated the 'GapBuffer'), replaces the updated
 -- 'textEditGapBuffer'.
 editTextLiftGapBuffer
-  :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
-  => GapBuffer (MVec.MVector (PrimState m) (TextLine tags)) m a
-  -> EditText (mvar (PrimState m)) tags m a
+  :: (PrimMonad m, st ~ PrimState m)
+  => GapBuffer (MVec.MVector st (TextLine tags)) m a
+  -> EditText tags m a
 editTextLiftGapBuffer =
   liftMutableGapBuffer textEditGapBuffer bufferToTextEditError id (EditText . lift)
 
 -- | Like 'textLineIndex', but throws a 'LineIndexOutOfRange' exception if the given 'LineIndex' is
 -- out of bounds.
 validateLineIndex
-  :: ModifyReference mvar m
+  :: PrimMonad m
   => Absolute LineIndex
-  -> EditText (mvar (PrimState m)) tags m (Absolute LineIndex)
+  -> EditText tags m (Absolute LineIndex)
 validateLineIndex = editTextLiftGapBuffer . (validateIndex >=> indexToAbsolute)
 
 -- | Like 'validateLineIndex', but rather than throwing an exception, simply returns 'False' if an
 -- exception would have been thrown, and returns 'True' otherwise.
-lineIndexIsValid
-  :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
-  => Absolute LineIndex -> EditText (mvar (PrimState m)) tags m Bool
+lineIndexIsValid :: PrimMonad m => Absolute LineIndex -> EditText tags m Bool
 lineIndexIsValid = editTextLiftGapBuffer . fmap fst . testIndex
 
 -- | Evaluates 'validateLineIndex' on a given 'LineIndex', and if no exceptions are thrown, also
 -- dereferences the index, returning the 'TextLine' stored at the given normalized logical index.
 validateGetLineIndex
-  :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
+  :: PrimMonad m
   => Absolute LineIndex
-  -> EditText (mvar (PrimState m)) tags m (Absolute LineIndex, TextLine tags)
+  -> EditText tags m (Absolute LineIndex, TextLine tags)
 validateGetLineIndex = editTextLiftGapBuffer .
   (validateIndex >=> \ i -> (,) <$> indexToAbsolute i <*> getElemIndex i)
 
@@ -1036,36 +996,39 @@ validateGetLineIndex = editTextLiftGapBuffer .
 
 -- | Functions of this type operate on a single 'TextLine', it is useful for updating the
 -- 'bufferLineEditor'.
-newtype EditLine mvar tags m a
-  = EditLine (ExceptT TextEditError (StateT (LineEditor mvar tags) (EditText mvar tags m)) a)
+newtype EditLine tags m a
+  = EditLine
+    ( ExceptT TextEditError
+        (StateT (LineEditor m tags) (EditText tags m)) a
+    )
   deriving
     ( Functor, Applicative, Monad,
       MonadError TextEditError
     )
   -- TODO: try lifting @m@ instead of @(EditText tags m)@
 
---instance Monad m => MonadState (LineEditor mvar tags) (EditLine mvar tags m) where
+--instance Monad m => MonadState (LineEditor mvar st tags) (EditLine mvar tags m) where
 --  state = EditLine . lift . state
 --
 --instance Monad m =>  MonadError TextEditError (EditLine mvar tags m) where
 --  throwError = EditLine . throwError
 --  catchError (EditLine try) catch = EditLine $ catchError try $ unwrapEditLine . catch
 
-instance MonadTrans (EditLine mvar tags) where
+instance MonadTrans (EditLine tags) where
   lift = EditLine . lift . lift . lift
 
 editLineState
   :: PrimMonad m
-  => StateT (LineEditor mvar tags) (EditText mvar tags m) a
-  -> EditLine mvar tags m a
+  => StateT (LineEditor m tags) (EditText tags m) a
+  -> EditLine tags m a
 editLineState = EditLine . lift
 
 -- Extracts 'textEditGapBuffer', uses it to evaluate 'runGapBuffer', then after the 'runGapBuffer'
 -- evaluation completes (which may have updated the 'GapBuffer'), replaces the updated
 -- 'textEditGapBuffer'.
 editLineLiftGapBuffer
-  :: (PrimMonad m, PrimState m ~ st, VarPrimState (mvar st) ~ st)
-  => GapBuffer (UMVec.MVector st Char) m a -> EditLine (mvar st) tags m a
+  :: (PrimMonad m, st ~ PrimState m)
+  => GapBuffer (UMVec.MVector st Char) m a -> EditLine tags m a
 editLineLiftGapBuffer =
   liftMutableGapBuffer lineEditGapBuffer bufferToLineEditError lift EditLine
 
@@ -1074,7 +1037,7 @@ editLineLiftGapBuffer =
 -- function, so any function that evaluates to an @editor@ where the @editor@ is a member of the
 -- 'MonadEditLine' typeclass will automatically invoke this function based on the function type of
 -- the context in which it is used.
-editLine :: PrimMonad m => EditLine mvar tags m a -> EditText mvar tags m a
+editLine :: PrimMonad m => EditLine tags m a -> EditText tags m a
 editLine (EditLine f) = editTextState (use bufferLineEditor) >>=
   runStateT (runExceptT f) >>= \ case
     (Left err, _   ) -> throwError err
@@ -1132,9 +1095,8 @@ class Monad editor => TextFoldable editor where
     -> editor fold
 
 instance
-  (PrimMonad m, primst ~ PrimState m, VarPrimState (mvar (PrimState m)) ~ primst,
-   EditorTagsType (EditText (mvar primst) tags m) ~ tags
-  ) => TextFoldable (EditText (mvar primst) tags m) where
+  (PrimMonad m, st ~ PrimState m, tags ~ EditorTagsType (EditText tags m)
+  ) => TextFoldable (EditText tags m) where
     foldLinesBetween = gFoldMapBetween
       (foldLinesLift . lift)
       editTextLiftGapBuffer
@@ -1255,42 +1217,42 @@ foldAllLines = foldLinesBetween minBound maxBound
 -- 'mapLinesInRange', 'mapLines', or 'mapAllLines'. Functions of this type are not able to modify
 -- the @tags@ type, but they can make other modifications to each of the 'TextLine's in the
 -- 'TextBuffer'.
-newtype MapLines mvar tags r (m :: * -> *) a
-  = MapLines{ unwrapMapLines :: ContT r (EditText mvar tags m) a}
+newtype MapLines tags r (m :: * -> *) a
+  = MapLines{ unwrapMapLines :: ContT r (EditText tags m) a}
   deriving (Functor, Applicative, Monad)
 
-instance Monad m => MonadError TextEditError(MapLines mvar tags r m) where
+instance Monad m => MonadError TextEditError(MapLines tags r m) where
   throwError = MapLines . lift . throwError
   catchError (MapLines try) catch = MapLines $ ContT $ \ next ->
     catchError (runContT try next) $ \ err ->
     runContT (unwrapMapLines $ catch err) next
 
-instance Monad m => MonadCont (MapLines mvar tags r m) where
+instance Monad m => MonadCont (MapLines tags r m) where
   callCC f = MapLines $ callCC $ unwrapMapLines . f . fmap MapLines
  
-instance (Monad m, Monoid a) => Monoid (MapLines mvar tags r m a) where
+instance (Monad m, Monoid a) => Monoid (MapLines tags r m a) where
   mappend a b = mappend <$> a <*> b
   mempty = return mempty
  
-instance (Monad m, Semigroup a) => Semigroup (MapLines mvar tags r m a) where
+instance (Monad m, Semigroup a) => Semigroup (MapLines tags r m a) where
   (<>) a b = (<>) <$> a <*> b
 
-instance MonadTrans (MapLines mvar tags r) where
+instance MonadTrans (MapLines tags r) where
   lift = MapLines . lift . lift
 
-runMapLinesStep :: Monad m => MapLines mvar tags a m a -> EditText mvar tags m a
+runMapLinesStep :: Monad m => MapLines tags a m a -> EditText tags m a
 runMapLinesStep (MapLines f) = runContT f return
 
 mapLinesBetween
-  :: ModifyReference mvar m
+  :: PrimMonad m
   => Absolute LineIndex
   -> Absolute LineIndex
-  -> (MapLines (mvar (PrimState m)) tags () m void
+  -> (MapLines tags () m void
       -> Absolute LineIndex
       -> TextLine tags
-      -> MapLines (mvar (PrimState m)) tags () m (TextLine tags)
+      -> MapLines tags () m (TextLine tags)
      )
-  -> EditText (mvar (PrimState m)) tags m ()
+  -> EditText tags m ()
 mapLinesBetween from to = gFoldMapBetween
   lift
   editTextLiftGapBuffer
@@ -1303,37 +1265,37 @@ mapLinesBetween from to = gFoldMapBetween
   ()
 
 mapLinesInRange
-  :: ModifyReference mvar m
+  :: PrimMonad m
   => Absolute LineIndex
   -> Relative LineIndex
-  -> (MapLines (mvar (PrimState m)) tags () m void
+  -> (MapLines tags () m void
       -> Absolute LineIndex
       -> TextLine tags
-      -> MapLines (mvar (PrimState m)) tags () m (TextLine tags)
+      -> MapLines tags () m (TextLine tags)
      )
-  -> EditText (mvar (PrimState m)) tags m ()
+  -> EditText tags m ()
 mapLinesInRange from rel f = if rel == 0 then return () else
   mapLinesBetween from (shiftAbsolute from rel) f
 
 mapLines
-  :: ModifyReference mvar m
+  :: PrimMonad m
   => Relative LineIndex
-  -> (MapLines (mvar (PrimState m)) tags () m void
+  -> (MapLines tags () m void
       -> Absolute LineIndex
       -> TextLine tags
-      -> MapLines (mvar (PrimState m)) tags () m (TextLine tags)
+      -> MapLines tags () m (TextLine tags)
      )
-  -> EditText (mvar (PrimState m)) tags m ()
+  -> EditText tags m ()
 mapLines rel f = getLineNumber >>= \ from -> mapLinesInRange from rel f
 
 mapAllLines
-  :: ModifyReference mvar m
-  => (MapLines (mvar (PrimState m)) tags () m void
+  :: PrimMonad m
+  => (MapLines tags () m void
       -> Absolute LineIndex
       -> TextLine tags
-      -> MapLines (mvar (PrimState m)) tags () m (TextLine tags)
+      -> MapLines tags () m (TextLine tags)
      )
-  -> EditText (mvar (PrimState m)) tags m ()
+  -> EditText tags m ()
 mapAllLines = mapLinesBetween minBound maxBound
 
 ----------------------------------------------------------------------------------------------------
@@ -1356,36 +1318,36 @@ mapAllLines = mapLinesBetween minBound maxBound
 -- the first line of the block of text, and once below the bottom line of the block of text, then
 -- pushing the edges of the folds of paper together to obscure the text between the folds. The
 -- 'FoldMapLines' has nothing to do with such a feature.
-newtype FoldMapLines mvar tags fold r m a
+newtype FoldMapLines tags fold r m a
   = FoldMapLines
-    { unwrapFoldMapLines :: ContT r (ExceptT TextEditError (StateT fold (EditText mvar tags m))) a
+    { unwrapFoldMapLines :: ContT r (ExceptT TextEditError (StateT fold (EditText tags m))) a
     }
   deriving (Functor, Applicative, Monad)
 
-type instance EditorTagsType (FoldMapLines mvar tags fold r m) = tags
+type instance EditorTagsType (FoldMapLines tags fold r m) = tags
 
-instance Monad m => MonadState fold (FoldMapLines mvar tags fold r m) where
+instance Monad m => MonadState fold (FoldMapLines tags fold r m) where
   state = FoldMapLines . lift . state
 
-instance Monad m => MonadError TextEditError (FoldMapLines mvar tags fold r m) where
+instance Monad m => MonadError TextEditError (FoldMapLines tags fold r m) where
   throwError = FoldMapLines . lift . throwError
   catchError (FoldMapLines try) catch = FoldMapLines $ ContT $ \ next ->
     catchError (runContT try next) $ flip runContT next . unwrapFoldMapLines . catch
 
-instance Monad m => MonadCont (FoldMapLines mvar tags fold r m) where
+instance Monad m => MonadCont (FoldMapLines tags fold r m) where
   callCC f = FoldMapLines $ callCC $ unwrapFoldMapLines . f . (FoldMapLines .)
 
-instance MonadTrans (FoldMapLines mvar tags fold r) where
+instance MonadTrans (FoldMapLines tags fold r) where
   lift = foldMapLiftEditText . lift
 
-instance (Monad m, Semigroup a) => Semigroup (FoldMapLines mvar tags fold r m a) where
+instance (Monad m, Semigroup a) => Semigroup (FoldMapLines tags fold r m a) where
   a <> b = (<>) <$> a <*> b
 
-instance (Monad m, Monoid a) => Monoid (FoldMapLines mvar tags fold r m a) where
+instance (Monad m, Monoid a) => Monoid (FoldMapLines tags fold r m a) where
   mappend a b = mappend <$> a <*> b
   mempty = return mempty
 
-foldMapLiftEditText :: Monad m => EditText mvar tags m a -> FoldMapLines mvar tags fold r m a
+foldMapLiftEditText :: Monad m => EditText tags m a -> FoldMapLines tags fold r m a
 foldMapLiftEditText = FoldMapLines . lift . lift . lift
 
 -- | Convert a 'FoldMapLines' into an 'EditText' function. This function is analogous to the
@@ -1393,25 +1355,25 @@ foldMapLiftEditText = FoldMapLines . lift . lift . lift
 -- simply unwraps the 'EditText' monad that exists within the 'FoldMapLines' monad.
 runFoldMapLinesStep
   :: Monad m
-  => FoldMapLines mvar tags fold r m a
-  -> (a -> EditText mvar tags m r)
-  -> fold -> EditText mvar tags m (r, fold)
+  => FoldMapLines tags fold r m a
+  -> (a -> EditText tags m r)
+  -> fold -> EditText tags m (r, fold)
 runFoldMapLinesStep (FoldMapLines f) end =
   runStateT (runExceptT $ runContT f $ lift . lift . end) >=> \ case
     (Left err, _   ) -> throwError err
     (Right  a, fold) -> return (a, fold)
 
 foldMapLinesBetween
-  :: ModifyReference mvar m
+  :: PrimMonad m
   => Absolute LineIndex
   -> Absolute LineIndex
   -> fold
-  -> (FoldMapLines (mvar (PrimState m)) tags fold () m void
+  -> (FoldMapLines tags fold () m void
       -> Absolute LineIndex
       -> TextLine tags
-      -> FoldMapLines (mvar (PrimState m)) tags fold () m (TextLine tags)
+      -> FoldMapLines tags fold () m (TextLine tags)
      )
-  -> EditText (mvar (PrimState m)) tags m fold
+  -> EditText tags m fold
 foldMapLinesBetween = gFoldMapBetween
   lift
   editTextLiftGapBuffer
@@ -1421,40 +1383,40 @@ foldMapLinesBetween = gFoldMapBetween
   (sliceSize MVec.length)
 
 foldMapLinesInRange
-  :: ModifyReference mvar m
+  :: PrimMonad m
   => Absolute LineIndex
   -> Relative LineIndex
   -> fold
-  -> (FoldMapLines (mvar (PrimState m)) tags fold () m void
+  -> (FoldMapLines tags fold () m void
       -> Absolute LineIndex
       -> TextLine tags
-      -> FoldMapLines (mvar (PrimState m)) tags fold () m (TextLine tags)
+      -> FoldMapLines tags fold () m (TextLine tags)
      )
-  -> EditText (mvar (PrimState m)) tags m fold
+  -> EditText tags m fold
 foldMapLinesInRange from rel fold f = if rel == 0 then return fold else
   foldMapLinesBetween from (shiftAbsolute from rel) fold f
 
 foldMapLines
-  :: ModifyReference mvar m
+  :: PrimMonad m
   => Relative LineIndex
   -> fold
-  -> (FoldMapLines (mvar (PrimState m)) tags fold () m void
+  -> (FoldMapLines tags fold () m void
       -> Absolute LineIndex
       -> TextLine tags
-      -> FoldMapLines (mvar (PrimState m)) tags fold () m (TextLine tags)
+      -> FoldMapLines tags fold () m (TextLine tags)
      )
-  -> EditText (mvar (PrimState m)) tags m fold
+  -> EditText tags m fold
 foldMapLines rel fold f = getLineNumber >>= \ from -> foldMapLinesInRange from rel fold f
 
 foldMapAllLines
-  :: ModifyReference mvar m
+  :: PrimMonad m
   => fold
-  -> (FoldMapLines (mvar (PrimState m)) tags fold () m void
+  -> (FoldMapLines tags fold () m void
       -> Absolute LineIndex
       -> TextLine tags
-      -> FoldMapLines (mvar (PrimState m)) tags fold () m (TextLine tags)
+      -> FoldMapLines tags fold () m (TextLine tags)
      )
-  -> EditText (mvar (PrimState m)) tags m fold
+  -> EditText tags m fold
 foldMapAllLines = foldMapLinesBetween minBound maxBound
 
 ----------------------------------------------------------------------------------------------------
@@ -1569,9 +1531,9 @@ splitLine = do
 --                       non-extreme valid 'TextLocation' that could be validated.
 -- @
 testLocation
-  :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
+  :: (PrimMonad m, st ~ PrimState m)
   => TextLocation
-  -> EditText (mvar (PrimState m)) tags m (Either TextLocation (TextLine tags, (Bool, TextLocation)))
+  -> EditText tags m (Either TextLocation (TextLine tags, (Bool, TextLocation)))
 testLocation loc = editTextLiftGapBuffer $ do
   (ok, linum) <- testIndex $ loc ^. lineIndex
   idx <- indexToAbsolute linum
@@ -1590,8 +1552,8 @@ testLocation loc = editTextLiftGapBuffer $ do
 
 -- | Like 'testLocation', but evaluates to an exception if the 'TextLocation' is invalid.
 validateLocation
-  :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
-  => TextLocation -> EditText (mvar (PrimState m)) tags m (TextLocation, TextLine tags)
+  :: (PrimMonad m, st ~ PrimState m)
+  => TextLocation -> EditText tags m (TextLocation, TextLine tags)
 validateLocation loc0 = testLocation loc0 >>= \ case
   Left{}  -> throwError $ LineIndexOutOfRange $ loc0 ^. lineIndex
   Right (textln, (ok, loc)) -> if ok then return (loc, textln) else
@@ -1600,9 +1562,8 @@ validateLocation loc0 = testLocation loc0 >>= \ case
 -- | Like 'validateLocation' but rather than throwing an exception, returns 'Nothing'. If the
 -- location is valid, the 'TextLine' at the valid 'TextLocation' is returned as a 'Just' value.
 locationIsValid
-  :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
-  => TextLocation
-  -> EditText (mvar (PrimState m)) tags m (Maybe (TextLine tags))
+  :: (PrimMonad m, st ~ PrimState m)
+  => TextLocation -> EditText tags m (Maybe (TextLine tags))
 locationIsValid = (`catchError` (const $ return Nothing)) . fmap (Just . snd) . validateLocation
 
 -- | This predicate function checks if an @('Absolute' 'CharIndex')@ points to the line breaking
@@ -1625,8 +1586,8 @@ indexIsOnLineBreak line = ((unwrapTextCursorSpan $ textLineCursorSpan line) ==) 
 -- avoid re-allocations. If you expect to moslty just read through this buffer set a slightly lower
 -- size to avoid wasting space.
 newTextBuffer
-  :: (ModifyReference mvar m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
-  => Maybe VecLength -> tags -> m (TextBuffer (mvar (PrimState m)) tags)
+  :: (PrimMonad m, st ~ PrimState m)
+  => Maybe VecLength -> tags -> m (TextBuffer m tags)
 newTextBuffer initSize tags = do
   cur <- UMVec.new defaultInitLineBufferSize >>=
     lineEditorFromVector tags (pure ())
@@ -1635,43 +1596,44 @@ newTextBuffer initSize tags = do
 
 -- not for export
 textBufferFromVector
-  :: (ModifyReference mvar m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
+  :: (PrimMonad m, st ~ PrimState m)
   => tags
-  -> LineEditor (mvar (PrimState m)) tags
-  -> GapBuffer (MVec.MVector (PrimState m) (TextLine tags)) m ()
-  -> MVec.MVector (PrimState m) (TextLine tags)
-  -> m (TextBuffer (mvar (PrimState m)) tags)
+  -> LineEditor m tags
+  -> GapBuffer (MVec.MVector st (TextLine tags)) m ()
+  -> MVec.MVector st (TextLine tags)
+  -> m (TextBuffer m tags)
 textBufferFromVector tags cur initVec mvec = do
-  mvar <- textBufferStateFromVector tags cur initVec mvec >>= newReference
+  mvar <- textBufferStateFromVector tags cur initVec mvec >>= Var.newMutVar
   let this = TextBuffer mvar
-  modifyReference_ mvar $ return . (bufferLineEditor . parentTextEditor .~ this)
+  Var.modifyMutVar mvar $ bufferLineEditor . parentTextEditor .~ this
   return this
 
 -- | Create a deep-copy of a 'TextBuffer'. Everything is copied perfectly, including the cursor
 -- location, and the content and state of the cursor.
 copyTextBuffer
-  :: (ModifyReference mvar m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
-  => TextBuffer (mvar (PrimState m)) tags -> m (TextBuffer (mvar (PrimState m)) tags)
-copyTextBuffer (TextBuffer mvar) = modifyReference mvar $ \ oldst -> do
+  :: (PrimMonad m, st ~ PrimState m)
+  => TextBuffer m tags -> m (TextBuffer m tags)
+copyTextBuffer (TextBuffer mvar) = do
+  oldst      <- Var.readMutVar mvar
   gbst       <- snd <$> runGapBuffer (cloneGapBufferState >>= put) (oldst ^. textEditGapBuffer)
   newLineBuf <- copyLineEditor (oldst ^. bufferLineEditor)
-  mvar       <- newReference oldst
+  mvar       <- Var.newMutVar oldst
     { theBufferLineEditor   = newLineBuf
     , theTextGapBufferState = gbst
     }
   let this = TextBuffer mvar
-  modifyReference_ mvar $ return . (bufferLineEditor . parentTextEditor .~ this)
-  return (oldst, this)
+  Var.modifyMutVar mvar $ bufferLineEditor . parentTextEditor .~ this
+  return this
 
 -- not for export: returns an internal-use-only data type, also discards an exception from
 -- runGapBufferNew.
 textBufferStateFromVector
-  :: (ModifyReference mvar m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
+  :: (PrimMonad m, st ~ PrimState m)
   => tags -- ^ Specify the default @tags@ value.
-  -> LineEditor (mvar (PrimState m)) tags
-  -> GapBuffer (MVec.MVector (PrimState m) (TextLine tags)) m ()
-  -> MVec.MVector (PrimState m) (TextLine tags)
-  -> m (TextBufferState (mvar (PrimState m)) tags)
+  -> LineEditor m tags
+  -> GapBuffer (MVec.MVector st (TextLine tags)) m ()
+  -> MVec.MVector st (TextLine tags)
+  -> m (TextBufferState m tags)
 textBufferStateFromVector tags cur initBuf newBuf = do
   gbst <- snd <$> runGapBufferNew newBuf initBuf -- discard any exceptions that may have occurred
   return TextBufferState
@@ -1694,18 +1656,18 @@ textBufferStateFromVector tags cur initBuf newBuf = do
 --
 -- See also the 'newLineEditor' function which calls this function within a 'MonadEditLine' context.
 newLineEditor
-  :: ModifyReference mvar m
-  => Maybe VecLength -> tags -> m (LineEditor (mvar (PrimState m)) tags)
+  :: (PrimMonad m, st ~ PrimState m)
+  => Maybe VecLength -> tags -> m (LineEditor m tags)
 newLineEditor initSize tag =
   UMVec.new (maybe defaultInitLineBufferSize fromLength initSize) >>=
   lineEditorFromVector tag (pure ())
 
 lineEditorFromVector
-  :: ModifyReference mvar m
+  :: (PrimMonad m, st ~ PrimState m)
   => tags
-  -> GapBuffer (UMVec.MVector (PrimState m) Char) m ()
-  -> UMVec.MVector (PrimState m) Char
-  -> m (LineEditor (mvar (PrimState m)) tags)
+  -> GapBuffer (UMVec.MVector st Char) m ()
+  -> UMVec.MVector st Char
+  -> m (LineEditor m tags)
 lineEditorFromVector tag initBuf newBuf = do
   gbst <- snd <$> runGapBufferNew newBuf initBuf
   return LineEditor
@@ -1719,8 +1681,8 @@ lineEditorFromVector tag initBuf newBuf = do
 -- Use this to create a deep-copy of a 'LineEditor'. The cursor location within the 'LineEditor'
 -- is also copied.
 copyLineEditor
-  :: (ModifyReference mvar m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
-  => LineEditor (mvar (PrimState m)) tags -> m (LineEditor (mvar (PrimState m)) tags)
+  :: (PrimMonad m, st ~ PrimState m)
+  => LineEditor m tags -> m (LineEditor m tags)
 copyLineEditor cur = do
   gbst <- snd <$> runGapBuffer (cloneGapBufferState >>= put) (cur ^. lineEditGapBuffer)
   return cur{ theLineEditGapBuffer = gbst }
@@ -1729,7 +1691,7 @@ copyLineEditor cur = do
 -- buffer. This function returns an 'Int' value because it is generally not to be used with other
 -- functions in this module. The 'lineEditorLength' function returns a @'Relative' 'CharIndex'@ that
 -- can be used with other functions.
-lineEditorCharCount :: LineEditor mvar tags -> Int
+lineEditorCharCount :: PrimMonad m => LineEditor m tags -> Int
 lineEditorCharCount line = fromLength count + adjust where
   buf    = line ^. lineEditGapBuffer
   count  = buf ^. gapBufferBeforeCursor + buf ^. gapBufferAfterCursor
@@ -1738,15 +1700,15 @@ lineEditorCharCount line = fromLength count + adjust where
     sym         -> lineBreakSize sym - 1
 
 -- | This funcion returns the same value as 'textLineCursorSpan' but for a 'LineEditor'.
-lineEditorUnitCount :: LineEditor mvar tags -> Relative CharIndex
+lineEditorUnitCount :: PrimMonad m => LineEditor m tags -> Relative CharIndex
 lineEditorUnitCount = relative . gapBufferLength . theLineEditGapBuffer
 
 -- | Gets the 'lineEditorCharCount' value for the current 'LineEditor'.
-getLineCharCount :: PrimMonad m => EditText mvar tags m Int
+getLineCharCount :: PrimMonad m => EditText tags m Int
 getLineCharCount = lineEditorCharCount <$> editTextState (use bufferLineEditor)
 
 -- | Gets the 'lineEditorUnitCount' value for the current 'LineEditor'.
-getUnitCount :: PrimMonad m => EditText mvar tags m (Relative CharIndex)
+getUnitCount :: PrimMonad m => EditText tags m (Relative CharIndex)
 getUnitCount = lineEditorUnitCount <$> editTextState (use bufferLineEditor)
 
 -- TODO: uncomment this, rewrite it
@@ -1757,7 +1719,7 @@ getUnitCount = lineEditorUnitCount <$> editTextState (use bufferLineEditor)
 ---- in the @IO@ monad, the 'EditText' monad, the 'EditLine' monad, and in other contexts as well.
 --newLineEditorAt
 --  :: PrimMonad m
---  => TextBuffer mvar tags -> TextLocation -> m (Either TextEditError (LineEditor mvar tags))
+--  => TextBuffer mvar tags -> TextLocation -> m (Either TextEditError (LineEditor mvar st tags))
 --newLineEditorAt parent loc = liftIO $ flip runEditTextIO parent $ do
 --  -- This function is safe to export because we assume a 'TextLine' never contains more than one
 --  -- line terminator, and always only at the end of the buffer. The 'TextLine' constructor is not
@@ -1793,8 +1755,8 @@ getUnitCount = lineEditorUnitCount <$> editTextState (use bufferLineEditor)
 -- | Push a 'TextLine' before or after the cursor. This function does not effect the content of the
 -- 'bufferLineEditor'.
 pushLine
-  :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
-  => RelativeToCursor -> TextLine tags -> EditText (mvar (PrimState m)) tags m ()
+  :: (PrimMonad m, st ~ PrimState m)
+  => RelativeToCursor -> TextLine tags -> EditText tags m ()
 pushLine rel = editTextLiftGapBuffer . pushElem rel
 
 -- | Pop a 'TextLine' from before or after the cursor. This function does not effect the content of
@@ -1802,9 +1764,7 @@ pushLine rel = editTextLiftGapBuffer . pushElem rel
 -- at the beginning of the buffer, or if you 'popLine' from 'After' the cursor when the
 -- 'bufferLineEditor' is at the end of the buffer, this function evaluates to an 'EndOfLineBuffer'
 -- exception.
-popLine
-  :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
-  => RelativeToCursor -> EditText (mvar (PrimState m)) tags m (TextLine tags)
+popLine :: (PrimMonad m, st ~ PrimState m) => RelativeToCursor -> EditText tags m (TextLine tags)
 popLine = editTextLiftGapBuffer . popElem
 
 ----------------------------------------------------------------------------------------------------
@@ -1814,29 +1774,25 @@ popLine = editTextLiftGapBuffer . popElem
 -- within a 'runEditText' function.
 --
 -- Obtain a reference to the 'TextBuffer' that this was given to this function's monadic evaluator.
-thisTextBuffer :: Monad m => EditText mvar tags m (TextBuffer mvar tags)
+thisTextBuffer :: Monad m => EditText tags m (TextBuffer m tags)
 thisTextBuffer = EditText ask
 
 -- | Create a copy of the 'bufferLineEditor'.
-copyLineEditorText
-  :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
-  => EditLine (mvar (PrimState m)) tags m (TextLine tags)
+copyLineEditorText :: (PrimMonad m, st ~ PrimState m) => EditLine tags m (TextLine tags)
 copyLineEditorText = TextLine
   <$> editLineLiftGapBuffer freezeVector
   <*> editLineState (use cursorBreakSymbol)
   <*> editLineState (use lineEditorTags)
 
 -- TODO: make this more abstract, make it callable from within any 'CursorIndexedLine' monad.
-validateRelativeChar
-  :: ModifyReference mvar m
-  => Relative CharIndex -> EditLine (mvar (PrimState m)) tags m VecIndex
+validateRelativeChar :: PrimMonad m => Relative CharIndex -> EditLine tags m VecIndex
 validateRelativeChar rel =
   flip shiftAbsolute rel <$> getColumnNumber >>= editLineLiftGapBuffer . validateIndex
 
 -- not for export
 makeLineWithSlice
   :: PrimMonad m
-  => (LineBreakSymbol -> LineBreakSymbol) -> CharVector -> EditLine mvar tags m (TextLine tags)
+  => (LineBreakSymbol -> LineBreakSymbol) -> CharVector -> EditLine tags m (TextLine tags)
 makeLineWithSlice onLbrk slice = do
   lbrk  <- editLineState $ use cursorBreakSymbol
   tags  <- editLineState $ use lineEditorTags
@@ -1847,9 +1803,7 @@ makeLineWithSlice onLbrk slice = do
     }
 
 -- | Create a 'TextLine' by copying the characters relative to the cursor.
-copyChars
-  :: ModifyReference mvar m
-  => Relative CharIndex -> EditLine (mvar (PrimState m)) tags m (TextLine tags)
+copyChars :: PrimMonad m => Relative CharIndex -> EditLine tags m (TextLine tags)
 copyChars rel = do
   break <- validateRelativeChar rel >>= pointContainsLineBreak
   editLineLiftGapBuffer (sliceFromCursor (unwrapRelative rel) >>= safeFreeze) >>=
@@ -1858,8 +1812,8 @@ copyChars rel = do
 -- | Calls 'copyChars' with a @'Relative' 'CharIndex'@ value equal to the number of characters
 -- 'Before' or 'After' the cursor on the current line.
 copyCharsToEnd
-  :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
-  => RelativeToCursor -> EditLine (mvar (PrimState m)) tags m (TextLine tags)
+  :: (PrimMonad m, st ~ PrimState m)
+  => RelativeToCursor -> EditLine tags m (TextLine tags)
 copyCharsToEnd rel = editLineLiftGapBuffer (getSlice rel >>= safeFreeze) >>= case rel of
   Before -> makeLineWithSlice (const NoLineBreak)
   After  -> makeLineWithSlice id
@@ -1867,16 +1821,16 @@ copyCharsToEnd rel = editLineLiftGapBuffer (getSlice rel >>= safeFreeze) >>= cas
 -- | Like 'textLineIndex', but throws a 'LineIndexOutOfRange' exception if the given 'LineIndex' is
 -- out of bounds.
 validateCharIndex
-  :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
-  => Absolute CharIndex -> EditLine (mvar (PrimState m)) tags m (Absolute CharIndex)
+  :: (PrimMonad m, st ~ PrimState m)
+  => Absolute CharIndex -> EditLine tags m (Absolute CharIndex)
 validateCharIndex = editLineLiftGapBuffer . (validateIndex >=> indexToAbsolute)
 
 -- | Create a 'TextLine' by copying the the characters in the given range from the line under the
 -- cursor.
 copyCharsRange
-  :: ModifyReference mvar m
+  :: PrimMonad m
   => Absolute CharIndex -> Absolute CharIndex
-  -> EditLine (mvar (PrimState m)) tags m (TextLine tags)
+  -> EditLine tags m (TextLine tags)
 copyCharsRange from to = do
   (from, to) <- editLineLiftGapBuffer $ (,) <$> validateIndex from <*> validateIndex to
   break <- pointContainsLineBreak to
@@ -1888,16 +1842,16 @@ copyCharsRange from to = do
 -- line under the cursor. The characters on the two given indicies are included in the resulting
 -- 'TextLine'.
 copyCharsBetween
-  :: ModifyReference mvar m
+  :: PrimMonad m
   => Absolute CharIndex -> Absolute CharIndex
-  -> EditLine (mvar (PrimState m)) tags m (TextLine tags)
+  -> EditLine tags m (TextLine tags)
 copyCharsBetween from to = copyCharsRange (min from to) (max from to)
 
 -- | Write a 'TextLine' (as produced by 'copyLineEditorText' or getLineAt') to an @('Absolute'
 -- 'LineIndex')@ address.
 putLineIndex
-  :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
-  => Absolute LineIndex -> TextLine tags -> EditText (mvar (PrimState m)) tags m ()
+  :: (PrimMonad m, st ~ PrimState m)
+  => Absolute LineIndex -> TextLine tags -> EditText tags m ()
 putLineIndex i line = editTextLiftGapBuffer $
   validateIndex i >>= absoluteIndex >>= flip putElemIndex line
 
@@ -1906,16 +1860,12 @@ putLineIndex i line = editTextLiftGapBuffer $
 -- re-allocate the current line editor buffer unless it is too small to hold all of the characters
 -- in the given 'TextLine', meaning this function only grows the buffer memory allocation, it never
 -- shrinks the memory allocation.
-refillLineEditor
-  :: ModifyReference mvar m
-  => EditText (mvar (PrimState m)) tags m ()
+refillLineEditor :: PrimMonad m => EditText tags m ()
 refillLineEditor = editTextLiftGapBuffer (getElem Before) >>= refillLineEditorWith
 
 -- | Like 'refillLineEditor', but replaces the content in the 'bufferLineEditor' with the content in
 -- a given 'TextLine', rather the content of the current line.
-refillLineEditorWith
-  :: ModifyReference mvar m
-  => TextLine tags -> EditText (mvar (PrimState m)) tags m ()
+refillLineEditorWith :: PrimMonad m => TextLine tags -> EditText tags m ()
 refillLineEditorWith = \ case
   TextLineUndefined -> error
     "internal error: evaluated (refillLineEditorWith TextLineUndefined)"
@@ -1932,9 +1882,7 @@ refillLineEditorWith = \ case
 -- | Delete the content of the 'bufferLineEditor' except for the line breaking characters (if any)
 -- at the end of the line. This function does not change the memory allocation for the 'LineEditor',
 -- it simply sets the character count to zero. Tags on this line are not effected.
-clearLineEditor
-  :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
-  => EditLine (mvar (PrimState m)) tags m ()
+clearLineEditor :: (PrimMonad m, st ~ PrimState m) => EditLine tags m ()
 clearLineEditor = do
   sym <- editLineState $ use cursorBreakSymbol
   editLineLiftGapBuffer $ do
@@ -1942,7 +1890,7 @@ clearLineEditor = do
     modCount After  $ const $ case sym of { NoLineBreak -> 0; _ -> 1; }
     return ()
 
-liftEditText :: Monad m => EditText mvar tags m a -> EditLine mvar tags m a
+liftEditText :: Monad m => EditText tags m a -> EditLine tags m a
 liftEditText = EditLine . lift . lift
 
 -- | Like 'clearLineEditor', this function deletes the content of the 'bufferLineEditor', and tags
@@ -1950,9 +1898,7 @@ liftEditText = EditLine . lift . lift
 -- 'bufferLineEditor' with a new empty line, resetting the line editor buffer to the default
 -- allocation size and allowing the garbage collector to delete the previous allocation. This means
 -- the line editor buffer memory allocation may be shrunk to it's minimal/default size.
-resetLineEditor
-  :: ModifyReference mvar m
-  => EditText (mvar (PrimState m)) tags m ()
+resetLineEditor :: PrimMonad m => EditText tags m ()
 resetLineEditor = editTextState (use $ bufferLineEditor . lineEditorTags) >>=
   lift . newLineEditor Nothing >>= editTextState . assign bufferLineEditor
 
@@ -1968,9 +1914,7 @@ resetLineEditor = editTextState (use $ bufferLineEditor . lineEditorTags) >>=
 -- 'LineEditor', and then move the content back into the 'TextBuffer' at a different location after
 -- changing location. This can also be useful after accumulating the content of several lines of
 -- text into the 'LineEditor'.
-flushLineEditor
-  :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
-  => EditText (mvar (PrimState m)) tags m (TextLine tags)
+flushLineEditor :: (PrimMonad m, st ~ PrimState m) => EditText tags m (TextLine tags)
 flushLineEditor = do
   clean <- editTextState $ use $ bufferLineEditor . lineEditorIsClean
   if clean then editTextLiftGapBuffer $ getElem Before else do
@@ -1984,9 +1928,9 @@ flushLineEditor = do
 -- empty if there are characters in the 'LineBuffer' which have not been flushed to the empty
 -- 'TextBuffer' by either 'flushLineEditor' or 'flushRefill'.
 withCurrentLine
-  :: ModifyReference mvar m
-  => (Absolute LineIndex -> TextLine tags -> EditLine (mvar (PrimState m)) tags m a)
-  -> EditText (mvar (PrimState m)) tags m a
+  :: PrimMonad m
+  => (Absolute LineIndex -> TextLine tags -> EditLine tags m a)
+  -> EditText tags m a
 withCurrentLine f = do
   (ln, line) <- (,) <$> getLineNumber <*> editTextLiftGapBuffer (getElem Before)
   case line of
@@ -1995,15 +1939,11 @@ withCurrentLine f = do
     line              -> editLine $ f ln line
 
 -- | Return the number of lines of text in this buffer.
-bufferLineCount
-  :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
-  => EditText (mvar (PrimState m)) tags m VecLength
+bufferLineCount :: (PrimMonad m, st ~ PrimState m) => EditText tags m VecLength
 bufferLineCount = editTextLiftGapBuffer countDefined
 
 -- | Returns a boolean indicating whether there is no content in the current buffer.
-bufferIsEmpty
-  :: ModifyReference mvar m
-  => EditText (mvar (PrimState m)) tags m Bool
+bufferIsEmpty :: PrimMonad m => EditText tags m Bool
 bufferIsEmpty = bufferLineCount >>= \ ln ->
   if ln > 1 then return False
   else if ln <= 0 then return True
@@ -2011,17 +1951,17 @@ bufferIsEmpty = bufferLineCount >>= \ ln ->
 
 -- | Return a pointer to the buffer currently being edited by the @editor@ function.
 currentBuffer
-  :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
-  => EditText (mvar (PrimState m)) tags m (TextBuffer (mvar (PrimState m)) tags)
+  :: (PrimMonad m, st ~ PrimState m)
+  => EditText tags m (TextBuffer m tags)
 currentBuffer = editTextState $ use $ bufferLineEditor . parentTextEditor
 
 ----------------------------------------------------------------------------------------------------
 
 ---- not for export
 --modifyColumn
---  :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
+--  :: (PrimMonad m, st ~ PrimState m)
 --  => (Absolute CharIndex -> Absolute CharIndex -> Relative CharIndex)
---  -> EditLine (mvar (PrimState m)) tags m (Absolute CharIndex)
+--  -> EditLine tags m (Absolute CharIndex)
 --modifyColumn f = do
 --  lbrksym <- editLineState $ use cursorBreakSymbol
 --  editLineLiftGapBuffer $ do
@@ -2043,10 +1983,7 @@ currentBuffer = editTextState $ use $ bufferLineEditor . parentTextEditor
 -- That is precisely what this function call does: it evaluates an @editor@ function (one that
 -- usually evaluates a cursor motion), but before it does, it evaluate 'flushLineEditor', and after
 -- evaluating 'flushRefill' it evaluates 'refillLineEditor'.
-flushRefill
-  :: ModifyReference mvar m
-  => EditText (mvar (PrimState m)) tags m a
-  -> EditText (mvar (PrimState m)) tags m a
+flushRefill :: PrimMonad m => EditText tags m a -> EditText tags m a
 flushRefill motion = flushLineEditor >> motion <* refillLineEditor
 
 ----------------------------------------------------------------------------------------------------
@@ -2055,9 +1992,9 @@ flushRefill motion = flushLineEditor >> motion <* refillLineEditor
 -- meaning the given character is a line breaking character, this function does nothing. To insert
 -- line breaks, using 'insertString'. Returns the number of characters added to the buffer.
 insertChar
-  :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
+  :: (PrimMonad m, st ~ PrimState m)
   => RelativeToCursor -> Char
-  -> EditText (mvar (PrimState m)) tags m TextCursorSpan
+  -> EditText tags m TextCursorSpan
 insertChar rel c = TextCursorSpan <$> do
   isBreak <- editTextState $ use $ bufferLineBreaker . lineBreakPredicate
   if isBreak c then return 0 else do
@@ -2073,8 +2010,8 @@ insertChar rel c = TextCursorSpan <$> do
 -- the line. This function returns the number of characters actually deleted as a negative number
 -- (or zero), indicating a change in the number of characters in the buffer.
 deleteChars
-  :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
-  => TextCursorSpan -> EditLine (mvar (PrimState m)) tags m CharStats
+  :: (PrimMonad m, st ~ PrimState m)
+  => TextCursorSpan -> EditLine tags m CharStats
 deleteChars req@(TextCursorSpan curspan0) = do
   let curspan = VecLength curspan0
   let done count = return (count, editLineState $ when (count /= 0) $ lineEditorIsClean .= False)
@@ -2101,8 +2038,8 @@ deleteChars req@(TextCursorSpan curspan0) = do
 -- current cursor location, begins inserting all the lines of text produced by the 'lineBreaker'
 -- function.
 insertString
-  :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
-  => String -> EditText (mvar (PrimState m)) tags m CharStats
+  :: (PrimMonad m, st ~ PrimState m)
+  => String -> EditText tags m CharStats
 insertString str = do
   breaker <- editTextState $ use $ bufferLineBreaker . lineBreaker
   let writeStr = editLine . editLineLiftGapBuffer .
@@ -2126,8 +2063,8 @@ insertString str = do
 -- | Same as 'lineBreakWith', but uses the 'defaultLineBreak' value to break the line at the current
 -- cursor location.
 lineBreak
-  :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
-  => RelativeToCursor -> EditText (mvar (PrimState m)) tags m ()
+  :: (PrimMonad m, st ~ PrimState m)
+  => RelativeToCursor -> EditText tags m ()
 lineBreak rel =
   editTextState (use $ bufferLineBreaker . defaultLineBreak) >>= flip lineBreakWith rel
 
@@ -2135,9 +2072,9 @@ lineBreak rel =
 -- 'LineBreakSymbol', creating a new 'TextLine' and pushing it to the 'TextBuffer' either 'Before'
 -- or 'After' the cursor.
 lineBreakWith
-  :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
+  :: (PrimMonad m, st ~ PrimState m)
   => LineBreakSymbol -> RelativeToCursor
-  -> EditText (mvar (PrimState m)) tags m ()
+  -> EditText tags m ()
 lineBreakWith newlbrk rel = join $ editLine $ do
   tags    <- editLineState $ use lineEditorTags
   oldlbrk <- editLineState $ use cursorBreakSymbol
@@ -2216,16 +2153,14 @@ class RelativeToAbsoluteCursor index editor | editor -> index where
   relativeToAbsolute :: Relative index -> editor (Absolute index)
 
 instance
-  (PrimMonad m, primst ~ PrimState m, VarPrimState (mvar primst) ~ primst
-  ) =>
-  RelativeToAbsoluteCursor LineIndex (EditText (mvar primst) tags m)
+  (PrimMonad m, st ~ PrimState m
+  ) => RelativeToAbsoluteCursor LineIndex (EditText tags m)
   where
     relativeToAbsolute = editTextLiftGapBuffer . (relativeIndex >=> indexToAbsolute)
 
 instance
-  (PrimMonad m, primst ~ PrimState m, VarPrimState (mvar primst) ~ primst
-  ) =>
-  RelativeToAbsoluteCursor CharIndex (EditLine (mvar primst) tags m)
+  (PrimMonad m, st ~ PrimState m
+  ) => RelativeToAbsoluteCursor CharIndex (EditLine tags m)
   where
     relativeToAbsolute = editLineLiftGapBuffer . (relativeIndex >=> indexToAbsolute)
 
@@ -2265,15 +2200,15 @@ textFrameVector = lens theTextFrameVector $ \ a b -> a{ theTextFrameVector = b }
 -- This function copies the content of an immutable 'TextFrame' into a
 -- mutable 'TextBuffer'.
 frameToBuffer
-  :: ModifyReference mvar m
+  :: (PrimMonad m, st ~ PrimState m)
   => Maybe VecLength
     -- ^ Specify the additional amount of space to allocate for the buffer. This value will be added
     -- to the number of 'TextLine' elements in the 'TextFrame' to allocate the new bufer.
   -> TextLocation -- ^ The initial cursor position.
   -> tags            -- ^ Specify the default tags value.
   -> TextFrame tags  -- ^ The frame from which to fill the buffer.
-  -> LineEditor (mvar (PrimState m)) tags -- ^ An initial line editor, should be empty.
-  -> m (TextBuffer (mvar (PrimState m)) tags)
+  -> LineEditor m tags -- ^ An initial line editor, should be empty.
+  -> m (TextBuffer m tags)
 frameToBuffer initSize loc tags TextFrame{ theTextFrameVector=vec } cur = do
   let i   = loc ^. lineIndex
   let len = Vec.length vec
@@ -2304,8 +2239,8 @@ frameToBuffer initSize loc tags TextFrame{ theTextFrameVector=vec } cur = do
 -- editable 'TextBuffer', or pass 'After' to place the text in the buffer after the cursor, meaning
 -- the cursor will start at the beginning of the editable 'TextBuffer'.
 newTextBufferFromFrame
-  :: ModifyReference mvar m
-  => TextLocation -> tags -> TextFrame tags -> m (TextBuffer (mvar (PrimState m)) tags)
+  :: (PrimMonad m, st ~ PrimState m)
+  => TextLocation -> tags -> TextFrame tags -> m (TextBuffer m tags)
 newTextBufferFromFrame loc tags frame = newLineEditor Nothing tags >>=
   frameToBuffer Nothing loc tags frame
 
@@ -2363,8 +2298,8 @@ textFrameAppend appendTags
 -- to be the end point of the text to be copied into the resulting 'TextFrame', and the character
 -- under the end point is not included in the resulting 'TextFrame'.
 textFrame
-  :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
-  => TextLocation -> TextLocation -> EditText (mvar (PrimState m)) tags m (TextFrame tags)
+  :: (PrimMonad m, st ~ PrimState m)
+  => TextLocation -> TextLocation -> EditText tags m (TextFrame tags)
 textFrame from0 to0 = do
   (from, loline) <- validateLocation $ min from0 to0
   (to,   hiline) <- validateLocation $ max from0 to0
@@ -2407,9 +2342,9 @@ textFrame from0 to0 = do
 -- | Like 'textFrame', creates a new text view, but rather than taking two 'TextLocation's to delimit
 -- the range, takes two @('Absolute' 'LineIndex')@ values to delimit the range.
 textFrameOnLines
-  :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
+  :: (PrimMonad m, st ~ PrimState m)
   => Absolute LineIndex -> Absolute LineIndex
-  -> EditText (mvar (PrimState m)) tags m (TextFrame tags)
+  -> EditText tags m (TextFrame tags)
 textFrameOnLines from to = textFrame
   (TextLocation
    { theLocationLineIndex = min from to
@@ -2497,7 +2432,7 @@ viewLine f = getLineNumber >>= getLineAt >>= lift . runViewLineT f >>= (throwErr
 ----------------------------------------------------------------------------------------------------
 
 type family EditorTagsType (editor :: * -> *)
-type instance EditorTagsType (EditText mvar tags m) = tags
+type instance EditorTagsType (EditText tags m) = tags
 
 class Monad editor => CursorIndexedText editor where
   -- | Get the line number of the cursror (number of lines from the start of the buffer).
@@ -2539,16 +2474,13 @@ class Monad editor => CursorIndexedText editor where
   -- 'gotoLine' has moved the cursor.
   goNearLine :: Absolute LineIndex -> editor (Absolute LineIndex)
 
-instance
-  (ModifyReference mvar m, primst ~ PrimState m, VarPrimState (mvar (PrimState m)) ~ primst
-  ) => CursorIndexedText (EditText (mvar primst) tags m)
-  where
-    getLineNumber = editTextLiftGapBuffer $ writingIndex Before >>= indexToAbsolute
-    getLineAt     = editTextLiftGapBuffer . (validateIndex >=> absoluteIndex >=> getElemIndex)
-    getLine       = editTextLiftGapBuffer . getElem
-    moveByLine    = editTextLiftGapBuffer . moveCursorBy
-    gotoLine      = editTextLiftGapBuffer . moveCursorTo
-    goNearLine    = editTextLiftGapBuffer . moveCursorNear
+instance PrimMonad m => CursorIndexedText (EditText tags m) where
+  getLineNumber = editTextLiftGapBuffer $ writingIndex Before >>= indexToAbsolute
+  getLineAt     = editTextLiftGapBuffer . (validateIndex >=> absoluteIndex >=> getElemIndex)
+  getLine       = editTextLiftGapBuffer . getElem
+  moveByLine    = editTextLiftGapBuffer . moveCursorBy
+  gotoLine      = editTextLiftGapBuffer . moveCursorTo
+  goNearLine    = editTextLiftGapBuffer . moveCursorNear
 
 instance Monad m => CursorIndexedText (ViewText tags m) where
   getLineNumber = viewTextLiftIIBuffer $ writingIndex Before >>= indexToAbsolute
@@ -2598,27 +2530,21 @@ class Monad editor => CursorIndexedLine editor where
   -- This function __DOES NOT__ evaluate 'flushLineEditor' or 'refillLineEditor'.
   goNearChar :: Absolute CharIndex -> editor (Absolute CharIndex)
 
-instance
-  (ModifyReference mvar m, primst ~ PrimState m, VarPrimState (mvar primst) ~ primst
-  ) => CursorIndexedLine (EditLine (mvar primst) tags m)
-  where
-    getColumnNumber    = editLineLiftGapBuffer $ writingIndex Before >>= indexToAbsolute
-    getLineBreakSymbol = editLineState (use cursorBreakSymbol)
-    getLineAllocation  = editLineLiftGapBuffer getAllocSize
-    moveByChar         = editLineLiftGapBuffer . moveCursorBy
-    gotoChar           = editLineLiftGapBuffer . moveCursorTo
-    goNearChar         = editLineLiftGapBuffer . moveCursorNear
+instance PrimMonad m => CursorIndexedLine (EditLine tags m) where
+  getColumnNumber    = editLineLiftGapBuffer $ writingIndex Before >>= indexToAbsolute
+  getLineBreakSymbol = editLineState (use cursorBreakSymbol)
+  getLineAllocation  = editLineLiftGapBuffer getAllocSize
+  moveByChar         = editLineLiftGapBuffer . moveCursorBy
+  gotoChar           = editLineLiftGapBuffer . moveCursorTo
+  goNearChar         = editLineLiftGapBuffer . moveCursorNear
 
-instance
-  (ModifyReference mvar m, primst ~ PrimState m, VarPrimState (mvar primst) ~ primst
-  ) => CursorIndexedLine (EditText (mvar primst) tags m)
-  where
-    getColumnNumber    = editLine getColumnNumber
-    getLineBreakSymbol = editLine getLineBreakSymbol
-    getLineAllocation  = editLine getLineAllocation
-    moveByChar         = editLine . moveByChar
-    gotoChar           = editLine . gotoChar
-    goNearChar         = editLine . goNearChar
+instance PrimMonad m => CursorIndexedLine (EditText tags m) where
+  getColumnNumber    = editLine getColumnNumber
+  getLineBreakSymbol = editLine getLineBreakSymbol
+  getLineAllocation  = editLine getLineAllocation
+  moveByChar         = editLine . moveByChar
+  gotoChar           = editLine . gotoChar
+  goNearChar         = editLine . goNearChar
 
 instance Monad m => CursorIndexedLine (ViewLine tags m) where
   getColumnNumber    = viewLineLiftIIBuffer $ writingIndex Before >>= indexToAbsolute
@@ -2688,14 +2614,12 @@ class (CursorIndexedLine editor, CursorIndexedText editor) => CursorIndexedBuffe
   -- bounds.
   goNearLocation :: TextLocation -> editor TextLocation
 
-instance 
-  (ModifyReference mvar m, primst ~ PrimState m, VarPrimState (mvar primst) ~ primst
-  ) => CursorIndexedBuffer (EditText (mvar primst) tags m) where
-    moveCursor row col = TextLocation <$> flushRefill (moveByLine row) <*> moveByChar col
-    gotoLocation (TextLocation{theLocationLineIndex=ln,theLocationCharIndex=ch}) =
-      TextLocation <$> flushRefill (gotoLine ln) <*> gotoChar ch
-    goNearLocation (TextLocation{theLocationLineIndex=ln,theLocationCharIndex=ch}) =
-      TextLocation <$> flushRefill (goNearLine ln) <*> goNearChar ch
+instance PrimMonad m => CursorIndexedBuffer (EditText tags m) where
+  moveCursor row col = TextLocation <$> flushRefill (moveByLine row) <*> moveByChar col
+  gotoLocation (TextLocation{theLocationLineIndex=ln,theLocationCharIndex=ch}) =
+    TextLocation <$> flushRefill (gotoLine ln) <*> gotoChar ch
+  goNearLocation (TextLocation{theLocationLineIndex=ln,theLocationCharIndex=ch}) =
+    TextLocation <$> flushRefill (goNearLine ln) <*> goNearChar ch
 
 instance Monad m => CursorIndexedBuffer (ViewText tags m) where
   moveCursor row col = TextLocation <$> moveByLine row <*> moveByChar col
@@ -2784,8 +2708,8 @@ streamTags = streamCache . textLineTags
 -- meaning to the return type of 'validateLocation', which may throw a soft exception (which can be
 -- caught with 'catchError') if the given 'TextLocation' is out of bounds.
 newStreamCursorRange
-  :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
-  => TextLocation -> TextLocation -> EditText (mvar (PrimState m)) tags m (StreamCursor tags)
+  :: (PrimMonad m, st ~ PrimState m)
+  => TextLocation -> TextLocation -> EditText tags m (StreamCursor tags)
 newStreamCursorRange start end = streamResetCache StreamCursor
   { theStreamCache    = TextLineUndefined
   , theStreamLocation = min start end
@@ -2794,8 +2718,8 @@ newStreamCursorRange start end = streamResetCache StreamCursor
 
 -- | A convenience function that calls 'newStreamCursorRange' with 'minBound' as the 'TextLocation'.
 newStreamCursor
-  :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
-  => EditText (mvar (PrimState m)) tags m (StreamCursor tags)
+  :: (PrimMonad m, st ~ PrimState m)
+  => EditText tags m (StreamCursor tags)
 newStreamCursor = newStreamCursorRange minBound maxBound
 
 -- | This in an 'EditText' type of function which moves a given 'StreamCursor' to a different
@@ -2810,9 +2734,9 @@ newStreamCursor = newStreamCursorRange minBound maxBound
 -- This function must validate the 'TextLocation' using 'validateLocation', and so may throw a soft
 -- exception (which can be caught with 'catchError') if the given 'TextLocation' is out of bounds.
 streamGoto
-  :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
+  :: (PrimMonad m, st ~ PrimState m)
   => StreamCursor tags -> TextLocation
-  -> EditText (mvar (PrimState m)) tags m (StreamCursor tags)
+  -> EditText tags m (StreamCursor tags)
 streamGoto cursor = validateLocation >=> \ (loc, txt) ->
   return cursor{ theStreamCache = txt, theStreamLocation = loc }
 
@@ -2823,8 +2747,8 @@ streamGoto cursor = validateLocation >=> \ (loc, txt) ->
 -- somehow moved beyond 'theStreamCache', which could only happen if the 'streamResetCache' function
 -- has not been called after transplanting the 'StreamCursor' to another 'TextBuffer'.
 streamLook
-  :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
-  => StreamCursor tags -> EditText (mvar (PrimState m)) tags m (Char, StreamCursor tags)
+  :: (PrimMonad m, st ~ PrimState m)
+  => StreamCursor tags -> EditText tags m (Char, StreamCursor tags)
 streamLook s = case theStreamCache s of
   TextLineUndefined -> streamResetCache s >>= streamLook
   line              -> case textLineGetChar line (theStreamLocation s ^. charIndex) of
@@ -2835,8 +2759,8 @@ streamLook s = case theStreamCache s of
 -- | Thinking of the 'StreamCursor' as a cursor pointing to a character within a 'TextBuffer' this
 -- function advances the cursor without reading any characters.
 streamStep
-  :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
-  => StreamCursor tags -> EditText (mvar (PrimState m)) tags m (StreamCursor tags)
+  :: (PrimMonad m, st ~ PrimState m)
+  => StreamCursor tags -> EditText tags m (StreamCursor tags)
 streamStep s = do
   let i   = fromIndex $ s ^. streamLocation . charIndex
   let top = intSize   $ s ^. streamCache
@@ -2875,8 +2799,8 @@ streamIsEOF s = theStreamLocation s >= theStreamEndpoint s
 -- evaluate to a @('Left' 'After')@ or @('Left' 'Before')@ value as with the 'streamGoto'
 -- function.
 streamResetCache
-  :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
-  => StreamCursor tags -> EditText (mvar (PrimState m)) tags m (StreamCursor tags)
+  :: (PrimMonad m, st ~ PrimState m)
+  => StreamCursor tags -> EditText tags m (StreamCursor tags)
 streamResetCache s = do
   (loc, txt) <- validateLocation (theStreamLocation s)
   return (s & streamLocation .~ loc & streamCache .~ txt)
@@ -2885,9 +2809,9 @@ streamResetCache s = do
 -- suring the parsing process. If the 'TextBuffer' does change while the parsing has been paused,
 -- this function must be evaluated to ensure the 'StreamCursor' is aware of the endpoint.
 streamResetEndpoint
-  :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
+  :: (PrimMonad m, st ~ PrimState m)
   => TextLocation -> StreamCursor tags
-  -> EditText (mvar (PrimState m)) tags m (StreamCursor tags)
+  -> EditText tags m (StreamCursor tags)
 streamResetEndpoint loc s = do
   (loc, _txt) <- validateLocation loc
   return (s & streamLocation .~ loc)
@@ -2898,6 +2822,6 @@ streamResetEndpoint loc s = do
 -- 'streamStep' function when the cursor steps past the end of the current line and to the
 -- next line.
 streamCommitTags
-  :: (PrimMonad m, VarPrimState (mvar (PrimState m)) ~ PrimState m)
-  => StreamCursor tags -> EditText (mvar (PrimState m)) tags m ()
+  :: (PrimMonad m, st ~ PrimState m)
+  => StreamCursor tags -> EditText tags m ()
 streamCommitTags s = putLineIndex (s ^. streamLocation . lineIndex) (s ^. streamCache)
