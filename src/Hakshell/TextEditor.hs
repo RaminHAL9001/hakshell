@@ -227,7 +227,7 @@ module Hakshell.TextEditor
 
     -- * Batch Editing
 
-    -- ** Only folding over lines of text
+    -- ** Folding over lines of text
     --
     -- These functions perform a batch read-only opertion over the 'TextBuffer' without moving the
     -- position of the cursor. Be careful to evaluate 'flushLineEditor' before evaluating folds over
@@ -236,13 +236,12 @@ module Hakshell.TextEditor
 
     FoldLines, foldLines, foldAllLines, foldLinesBetween, foldLinesInRange, runFoldLinesStep,
 
-    -- ** Only mapping over lines  of text
+    -- ** Mapping over lines of text
     --
-    -- Folding and mapping can both be done in a single pass. It is also possible to halt a
-    -- folding/mapping function by evaluating a halting continuation function provided by
-    -- 'forLinesInRange', 'forLines', and 'forLinesInBuffer'. Functions of the type described here
-    -- are used to perform statelses updates on a buffer, for example a context-free search and
-    -- replace function.
+    -- Functions of the type described here are used to perform statelses updates on a buffer, for
+    -- example a context-free search and replace function. It is possible to halt a mapping function
+    -- by evaluating a halting continuation function provided by 'forLinesInRange', 'forLines', and
+    -- 'forLinesInBuffer'.
 
     MapLines, mapLines, mapAllLines, mapLinesBetween, mapLinesInRange, runMapLinesStep,
 
@@ -432,14 +431,14 @@ unwrapTextCursorSpan (TextCursorSpan o) = o
 -- 'cursorStepCount' and a count of 6 for the 'deltaCharCount'.
 data CharStats
   = CharStats
-    { cursorStepCount :: !TextCursorSpan
+    { cursorStepCount :: !(Relative CharIndex)
       -- ^ When an 'TextBuffer' stateful operation produces a value of this type, it is an
       -- indication of the minimum number of cursor movements that would have had to been made by an
       -- end user pressing keyboard keys (e.g. pressing the right-arrow to perform a traversal) in
       -- order to replicate the stateful operation. The biggest difference between this number and
       -- the 'deltaCharCount' is that line breaks are always considered a single cursor step,
       -- regardless of how many characters comprise the line break.
-    , deltaCharCount  :: !(Relative CharIndex)
+    , deltaCharCount  :: !TextCursorSpan
       -- ^ This is the number of UTF characters inserted\/deleted, a positive value indicates
       -- insertion, a negative value indicates deletion. Use this value if you need an accurate
       -- accounting of the amount of data has been changed.
@@ -2011,8 +2010,8 @@ insertChar rel c = TextCursorSpan <$> do
 -- (or zero), indicating a change in the number of characters in the buffer.
 deleteChars
   :: (PrimMonad m, st ~ PrimState m)
-  => TextCursorSpan -> EditLine tags m CharStats
-deleteChars req@(TextCursorSpan curspan0) = do
+  => Relative CharIndex -> EditLine tags m CharStats
+deleteChars req@(Relative (CharIndex curspan0)) = do
   let curspan = VecLength curspan0
   let done count = return (count, editLineState $ when (count /= 0) $ lineEditorIsClean .= False)
   sym <- editLineState $ use cursorBreakSymbol
