@@ -13,11 +13,16 @@ module Hakshell.String
     StringSlice, sliceOffset, sliceLength, sliceString, splitByPatternFrom,
     -- * Patterns
     ExactString(..), exact, 
+    -- * Formatting integers
+    BaseNumber, PaddingChar, NumCellWidth,
+    digitSymbols, numberOfDigits, digitString,
+    asBase2, asBase8, asBase10, asBase16L, asBase16U, asBase64,
+    -- ** Custom tables for 'digitString'
+    NumSymbolTable(..), 
+    base2Syms, base8Syms, base10Syms, base16SymsL, base16SymsU, base64Syms,
   ) where
 
 import           Hakshell.Struct
-
-import           Control.Monad
 
 import           Data.String
 import qualified Data.ByteString.Char8          as Strict
@@ -82,10 +87,14 @@ instance SizePackable StrictBytes where
   packSize size = Lazy.toStrict . packSize size
 
 instance SizePackable CharVector where
-  packSize size elems = UVec.create
-    (do vec <- UMVec.replicate size '\0'
-        forM_ (zip [0 ..] elems) $ uncurry $ UMVec.write vec
-        return vec
+  packSize size chars = UVec.create
+    (do vec <- UMVec.new size
+        let len      = length chars
+        let padding  = replicate (max 0 $ size - len) '\0'
+        let fill vec = fmap (const vec) $
+              mapM_ (uncurry $ UMVec.write vec) $ zip [0 ..] (chars ++ padding)
+        fill vec
+        if len <= size then return vec else UMVec.new len >>= fill
     )
 
 ----------------------------------------------------------------------------------------------------
@@ -251,6 +260,165 @@ instance StringPattern ExactString where
             NoMatch            -> PatternMatch mempty
             _                  -> PatternNoMatch
   findSubstringFrom = findExactSubstringFrom
+
+----------------------------------------------------------------------------------------------------
+
+-- The base of a number, e.g. 10 to get digits 0-9, 2 to get binary digits.
+type BaseNumber = Int
+
+-- | When aligning numbers to the right of a column in a matrix of characters (like a text console),
+-- it is neccessary to specify the width of the column so that an appropriate number of padding
+-- characters can be inserted before the number. If a number is larger than this value, it is
+-- printed as it is (without truncating) which can throw off the column alignment.
+type NumCellWidth = Int
+
+-- | A character used to fill space, usually just a space character.
+type PaddingChar = Char
+
+data NumSymbolTable
+  = NumSymbolTable
+    { numBase         :: !BaseNumber
+    , numPaddingChar  :: !PaddingChar
+    , numSymbolLookup :: Int -> Char
+    }
+
+-- | The function @digitSymbols n base@ divides the number @n@ by the @base@ repeatedly, creating a
+-- list of digits which you can then convert to characters. To convert the number to a strinng,
+-- apply the output of this function to 'digitString'.
+digitSymbols
+  :: (Integral n, Ord n)
+  => n -- ^ the number to deconstruct
+  -> BaseNumber -- ^ the base of the number representation
+  -> [Int] -- ^ the list of symbols used to represent the number of type @n@
+digitSymbols n ibase = loop [] n where
+  base = fromIntegral ibase
+  loop stk n0 =
+    if n0 < base then fromIntegral n0 : stk else
+    let (n, r) = divMod n0 base in loop (fromIntegral r : stk) n
+{-# INLINE digitSymbols #-}
+
+-- | The function @numberOfDigits n base@ computes the minimum number of digits necessary to
+-- represent a number in that base. This is useful for computing alignments of numbers, because you
+-- can obtain the string length a number will be before it is printed.
+--
+-- This function simply takes the length of the list returned by 'digitSymbols'.
+numberOfDigits :: (Integral n, Ord n) => n -> BaseNumber -> Int
+numberOfDigits = (.) length . digitSymbols
+{-# INLINE numberOfDigits #-}
+
+-- | Calls 'digitSymbols', then maps these symbols to the 'Char's in the given vector. Pads the
+-- string with space characters so the number aligns to the right of a cell in a column of
+-- numbers. The base of the number is taken from the length of the 'CharVector' symbol table.
+digitString
+  :: (Integral n, Ord n, Packable str)
+  => NumSymbolTable
+  -- ^ Map 'digitSymbols' to the characters in this array, can be created with 'packSize'
+  -> NumCellWidth -- ^ the cell width when algning a number to the right.
+  -> n            -- ^ the number to deconstruct
+  -> str
+digitString table width n = pack (padding ++ symbols) where
+  symbols = numSymbolLookup table <$> digitSymbols n (numBase table)
+  padding = replicate (max 0 $ width - length symbols) (numPaddingChar table)
+{-# NOINLINE digitString #-}
+
+asBase2 :: (Integral n, Ord n, Packable str) => NumCellWidth -> n -> str
+asBase2 = digitString base2Syms
+{-# NOINLINE asBase2 #-}
+
+asBase8 :: (Integral n, Ord n, Packable str) => NumCellWidth -> n -> str
+asBase8 = digitString base8Syms
+{-# NOINLINE asBase8 #-}
+
+asBase10 :: (Integral n, Ord n, Packable str) => NumCellWidth -> n -> str
+asBase10 = digitString base10Syms
+{-# NOINLINE asBase10 #-}
+
+asBase16L :: (Integral n, Ord n, Packable str) => NumCellWidth -> n -> str
+asBase16L = digitString base16SymsL
+{-# NOINLINE asBase16L #-}
+
+asBase16U :: (Integral n, Ord n, Packable str) => NumCellWidth -> n -> str
+asBase16U = digitString base16SymsU
+{-# NOINLINE asBase16U #-}
+
+asBase64 :: (Integral n, Ord n, Packable str) => NumCellWidth -> n -> str
+asBase64 = digitString base64Syms
+{-# NOINLINE asBase64 #-}
+
+publicNumSymTable :: NumSymbolTable -> NumSymbolTable
+publicNumSymTable table =
+  table{ numSymbolLookup = numSymbolLookup table . (`mod` (numBase table)) }
+
+base2Syms :: NumSymbolTable
+base2Syms = NumSymbolTable
+  { numBase = 2
+  , numPaddingChar  = ' '
+  , numSymbolLookup = \ i -> if i == 0 then '0' else '1'
+  }
+{-# INLINE base2Syms #-}
+
+base8Syms :: NumSymbolTable
+base8Syms = publicNumSymTable _base8Syms
+{-# INLINE base8Syms #-}
+
+_base8Syms :: NumSymbolTable
+_base8Syms = base2Syms{ numBase = 8, numSymbolLookup = (table UVec.!) } where
+  table = mkSymCharTable 10 ['0' .. '7']
+{-# NOINLINE _base8Syms #-}
+
+base10Syms :: NumSymbolTable
+base10Syms = publicNumSymTable _base10Syms
+{-# INLINE base10Syms #-}
+
+_base10Syms :: NumSymbolTable
+_base10Syms = base2Syms{ numBase = 10, numSymbolLookup = (table UVec.!)} where
+  table = mkSymCharTable 10 ['0' .. '9']
+{-# NOINLINE _base10Syms #-}
+
+-- | Upper-case base-16 symbols
+base16SymsU :: NumSymbolTable
+base16SymsU = publicNumSymTable _base16SymsU
+{-# INLINE base16SymsU #-}
+
+_base16SymsU :: NumSymbolTable
+_base16SymsU = base2Syms{ numBase = 16, numSymbolLookup = (table UVec.!)} where
+  table = mkSymCharTable 16 $ ['0' .. '9'] ++ ['A' .. 'F']
+{-# NOINLINE _base16SymsU #-}
+
+-- | Lower-case base-16 symbols
+base16SymsL :: NumSymbolTable
+base16SymsL = publicNumSymTable _base16SymsL
+{-# INLINE base16SymsL #-}
+
+_base16SymsL :: NumSymbolTable
+_base16SymsL = base2Syms{ numBase = 16, numSymbolLookup = (table UVec.!) } where
+  table = mkSymCharTable 16 $ ['0' .. '9'] ++ ['a' .. 'f']
+{-# NOINLINE _base16SymsL #-}
+
+base64Syms :: NumSymbolTable
+base64Syms = publicNumSymTable _base64Syms
+{-# INLINE base64Syms #-}
+
+_base64Syms :: NumSymbolTable
+_base64Syms = base2Syms{ numBase = 64, numSymbolLookup = (table UVec.!) } where
+  table = mkSymCharTable 64 $ concat [['A'..'Z'],['a'..'z'],['0'..'9'],"+/"]
+{-# NOINLINE _base64Syms #-}
+
+_numSymCharTable :: CharVector -> NumSymbolTable
+_numSymCharTable table = base2Syms{ numBase = intSize table, numSymbolLookup = (table UVec.!) }
+
+-- not for export 
+--
+-- Create a CharVector containing the symbols that can passed to 'digitString' to map the
+-- 'digitSymbols's of a number.
+mkSymCharTable :: BaseNumber -> String -> CharVector
+mkSymCharTable base chars = UVec.create
+  (do vec <- UMVec.new base
+      mapM_ (uncurry $ UMVec.write vec) $ zip [0 ..] chars
+      return vec
+  )
+
+----------------------------------------------------------------------------------------------------
 
 enableTrace :: Bool
 enableTrace = False
