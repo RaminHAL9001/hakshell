@@ -24,6 +24,7 @@ module Hakshell.String
 
 import           Hakshell.Struct
 
+import           Data.Maybe
 import           Data.String
 import qualified Data.ByteString.Char8          as Strict
 import qualified Data.ByteString.Lazy.Char8     as Lazy
@@ -173,8 +174,8 @@ data PatternMatch
   deriving (Eq, Ord, Show)
 
 data Captured
-  = Captured{ capturedSlice :: !StringSlice}
-  | CapturedNamed{ capturedLabel :: !Label , capturedSlice :: !StringSlice}
+  = Captured{ capturedSlice :: !StringSlice }
+  | CapturedNamed{ capturedLabel :: !Label , capturedSlice :: !StringSlice }
   deriving (Eq, Ord, Show)
 
 -- | An index into a 'StrictBytes' string. This data type is usually the result of a pattern match.
@@ -188,6 +189,42 @@ data StringSlice
       -- ^ The string into which the 'sliceStart' and 'sliceEnd' are pointing.
     }
   deriving (Eq, Ord, Show, Typeable)
+
+instance Structured PatternMatch where
+  toStruct = \ case
+    PatternNoMatch   -> ObjFalse
+    PatternMatch vec -> if Vec.null vec then ObjTrue else ObjList $ toStruct <$> vec
+  parseStruct = \ case
+    ObjFalse    -> PatternNoMatch
+    ObjTrue     -> PatternMatch Vec.empty
+    ObjList vec -> parseListWith vec $ scanElems (MVec.new (intSize vec)) $ \ vec i o ->
+      vec >>= \ v -> MVec.write v i o >> return (i + 1, v)
+    _           -> empty
+
+instance Structured Captured where
+  toStruct = ObjList . Vec.fromList . \ case
+    Captured          slice -> capturedSliceToList slice
+    CapturedNamed lbl slice -> ObjString lbl : capturedSliceToList slice
+  fromStruct = parseList $ do
+    lbl <- optional $ takeString pure
+    off <- takeInt pure
+    str <- takeString pure
+    let slice = StringSlice
+          { sliceOffset = off
+          , sliceLength = Strict.length str
+          , sliceString = str
+          }
+    maybe (Captured slice) (flip CapturedName slice) lbl
+
+capturedSliceToList :: StringSlice -> [Struct]
+capturedSliceToList s = let off = sliceOffset s in
+  [ ObjInt off
+  , ObjString $ Strict.take (sliceLength s) $ Strict.drop off $ sliceString s
+  ]
+
+instance Structured SliceString where
+  toStruct s = ObjList $ Vec.fromList
+    [ObjInt $ sliceLength s, ObjString $ sliceString]
 
 instance ToStrictBytes StringSlice where
   toStrictBytes s = Strict.take (sliceLength s) $ Strict.drop (sliceOffset s) $ sliceString s
@@ -244,6 +281,13 @@ instance Monoid       ExactString where
   mempty  = ExactString mempty
   mappend = (<>)
   mconcat = ExactString . mconcat . fmap (\ (ExactString a) -> a)
+
+instance Structured ExactString where
+  toStruct (ExactString str) = ObjList $ Vec.fromList
+    [ObjAtom fromJust (toAtom "exact"), ObjString str]
+  fromStruct = parseList $ do
+    takeAtom (\ a -> guard (fromJust (toAtom "exact") == a) >> pure a)
+    takeString (pure . ExactString)
 
 instance StringPattern ExactString where
   smallestMatch = intSize

@@ -4,18 +4,31 @@
 -- be converted to and parsed from Lisp-like code.
 module Hakshell.Struct
   ( -- * The Struct Data Type
-    StructIndex(..), Struct(..),
+    Struct(..), StructIndex(..), structIndex,
     -- * The Class of 'Structured' Data Types
     Structured(..), LispPrim, toLispPrim, fromLispPrim,
     strToLispExpr, strFromLispExpr, fromStruct, objString, objAtom,
-    objList, objSizedList, objAccumDict,
+    objList, objSizedList,
+    -- ** Dictionary structures
+    Dictionary,
     -- * The 'Atom' data type
-    Atom, toAtom, atomToText, isAtomChar,
+    Atom, toAtom, atomToText, isAtomChar, atomHead,
     -- * Haskell Data to/from a 'Struct'
-    ParseStruct, runParseStruct, 
-    StructParserError(..),
+    ParseStruct, runParseStruct, structRequire,
+    StructParseError(..), NonUniqueKeyError(..),
     Control.Monad.Except.throwError,
     Control.Monad.Except.catchError,
+    -- * Haskell Data to/from a list of 'Struct's
+    ParseListStruct, parseList, parseListWith,
+    getStructLength, getStructIndex, putStructIndex, getStructVector, putStructVector,
+    takeList, takeStruct, takeElem, scanElems,
+    takeAtom, takeBool, takeInt, takeFloat, takeString, takeEndOfList,
+    -- ** Slices of Lists
+    ListSlice, takeSlice, takeSliceToEnd,
+    -- * Dictionaries
+    ParseDictStruct, parseDictionary, takeKey, takeUnique, takeKeyAll,
+    -- ** Data structures
+    parseData, takeKeyAtom, scanUntilKeyAtom, listToDictionary,
     -- * Lisp Expressions
     FromLispPrim(..), forceFromLispExpr, lispYieldedValue,
   ) where
@@ -24,6 +37,7 @@ import           Prelude              hiding (fail)
 
 import           Control.Applicative
 import           Control.Arrow
+import           Control.Lens
 import           Control.Monad.Except hiding (fail)
 import           Control.Monad.Fail
 import           Control.Monad.State  hiding (fail)
@@ -32,10 +46,10 @@ import           Control.Monad.ST
 import           Data.Bits
 import           Data.Char
 import           Data.List                   (partition)
+import qualified Data.List.NonEmpty          as NE
 import qualified Data.Map                    as Map
 import qualified Data.ByteString.Char8       as Strict
 import qualified Data.ByteString.UTF8        as UTF8
-import           Data.Typeable
 import qualified Data.Vector                 as Vec
 import qualified Data.Vector.Unboxed         as UVec
 import qualified Data.Vector.Mutable         as MVec
@@ -70,6 +84,10 @@ isAtomChar :: Char -> Bool
 isAtomChar = (`divMod` _cellSize) . ord >>> \ (i, b) ->
   maybe False (`testBit` b) (_charTable UVec.!? i)
 
+-- | Get the first character of an 'Atom'.
+atomHead :: Atom -> Char
+atomHead (Atom str) = maybe '\0' fst $ UTF8.decode str
+
 type BitMapCell = Word32
 
 _initWord :: BitMapCell
@@ -99,25 +117,45 @@ _charTable = UVec.create
 -- For those familiary with JavaScript or JSON, an object assigned to a variable @obj@ may be
 -- accessed with square-bracket notation like so: @obj[0]["dict key"][1]...@ and so on, this data
 -- structure behaves as the sequence of square-bracketed indicies.
-data StructIndex
-  = StructLeaf
-  | StructIndexList Int               StructIndex
-  | StructIndexDict Strict.ByteString StructIndex
-  deriving (Eq, Typeable)
+data StructIndexElem = StructIndexList Int | StructIndexDict Atom
+  deriving (Eq, Ord)
+
+newtype StructIndex = StructIndex (Vec.Vector StructIndexElem)
+  deriving (Eq, Ord)
+
+instance Semigroup StructIndex where { (StructIndex a) <> (StructIndex b) = StructIndex (a <> b); }
+instance Monoid    StructIndex where { mappend = (<>); mempty = StructIndex Vec.empty; }
+
+-- | Construct a 'StructIndex' value, you must provide the length of the path. The given list is
+-- reversed before being entered into the vector.
+structIndex :: Int -> [StructIndexElem] -> StructIndex
+structIndex n path = StructIndex $ Vec.create
+  (do vec <- MVec.new n
+      mapM_ (uncurry $ MVec.write vec) $ flip zip path $
+        takeWhile (>= 0) $ iterate (subtract 1) (n - 1)
+      return vec
+  )
+
+structPathFromParseState :: ParseStructState -> StructIndex
+structPathFromParseState st = structIndex (theStructParserDepth st) (theStructParserPath st)
+
+nullStructIndex :: StructIndex -> Bool
+nullStructIndex (StructIndex idx) = Vec.null idx
 
 -- | A simple data type for structured data, which can be both parsed and printed to/from JSON,
 -- Lisp-like S-Expressions, or XML.
 data Struct
   = ObjFalse
   | ObjTrue
-  | ObjInt    !Int
+  | ObjInt    !Integer
   | ObjChar   !Char
   | ObjFloat  !Double
   | ObjString !Strict.ByteString
   | ObjAtom   !Atom
     -- ^ same as 'ObjString' but is known to contain no whitespace in the string
   | ObjList   !(Vec.Vector Struct)
-  | ObjDict   !(Map.Map Strict.ByteString Struct)
+  | ObjQuoted !Struct
+  | ObjHashed !Struct
   deriving (Eq, Ord)
 
 -- | The class of data types that can be converted to and from a 'Struct' (a Lisp AST).
@@ -134,7 +172,7 @@ instance Structured Bool   where
     ObjTrue  -> return True
     _        -> mzero
 
-instance Structured Int where
+instance Structured Integer where
   toStruct    = ObjInt
   parseStruct = \ case { ObjInt a -> return a; _ -> mzero; }
 
@@ -154,37 +192,48 @@ instance Structured Strict.ByteString where
   toStruct    = ObjString
   parseStruct = \ case { ObjString a -> return a; _ -> mzero; }
 
+instance Structured Atom where
+  toStruct = ObjAtom
+  parseStruct = \ case { ObjAtom a -> return a; _ -> mzero; }
+
 instance Structured a => Structured (Vec.Vector a) where
   toStruct    = ObjList . fmap toStruct
   parseStruct = \ case
     ObjList a -> objSizedVector (Vec.length a) <$> mapM parseStruct (Vec.toList a)
     _         -> mzero
 
-instance Structured a => Structured (Map.Map Strict.ByteString a) where
-  toStruct    = ObjDict . fmap toStruct
+instance Structured Dictionary where
+  toStruct (Dictionary map) = ObjList $ Vec.fromList $ do
+    (key, v NE.:| vx) <- Map.assocs map
+    (ObjAtom key : (ObjList . theListSliceVector <$> (v : vx)))
+  parseStruct = parseList listToDictionary
+
+instance Structured StructIndexElem where
+  toStruct = \ case
+    StructIndexList i -> ObjInt (toInteger i)
+    StructIndexDict i -> ObjAtom i
   parseStruct = \ case
-    ObjDict a -> Map.fromList <$> forM (Map.assocs a) (\ (key, val) -> (,) key <$> parseStruct val)
+    ObjInt  o -> pure $ StructIndexList (fromIntegral o)
+    ObjAtom o -> pure $ StructIndexDict o
     _         -> mzero
 
 instance Structured StructIndex where
-  toStruct =
-    let loop stack item size = seq size $! case item of
-          StructIndexList int more -> loop (ObjInt    int : stack) more $! size + 1
-          StructIndexDict str more -> loop (ObjString str : stack) more $! size + 1
-          StructLeaf               ->
-            flip objSizedList (objAtom "index" : stack) $! negate (size + 1)
-    in  flip (loop []) 0
-  parseStruct = \ case
-    ObjList list -> case Vec.toList list of
-      a:ax | a == objAtom "index" -> do
-        let loop = \ case
-              []               -> pure StructLeaf
-              (ObjInt    i):ax -> StructIndexList i <$> loop ax
-              (ObjString i):ax -> StructIndexDict i <$> loop ax
-              _                -> fail "index contains non-int/string element"
-        loop ax
-      _                           -> mzero
-    _                           -> mzero
+  toStruct (StructIndex vec) = ObjList $ toStruct <$> vec
+  parseStruct = parseList $ do
+    takeAtom $ guard . (== _lbl_index)
+    len <- getStructLength
+    fmap (StructIndex . Vec.fromListN (len - 1) . ($ [])) $ scanElems id $ \ fifo i ->
+      fmap (\ elem -> (Just (i + 1), fifo . (elem :))) .
+      annotateParse "index" .
+      structRequire "int or string value" parseStruct
+
+_lbl_index :: Atom
+_lbl_index = read "index"
+
+-- | Takes any value in the 'Integral' typeclass and converts it to a 'Struct' using the 'ObjInt'
+-- constructor.
+objInt :: Integral i => i -> Struct
+objInt = ObjInt . fromIntegral
 
 -- | A synonym for the 'ObjString' constructor, provided for consistent naming with the other
 -- function names starting with @obj...@.
@@ -218,71 +267,216 @@ objSizedVector size elems = Vec.create list where
     mapM_ (uncurry (MVec.write mvec)) $ zip indicies elems
     return mvec
 
--- | Construct a dictionary from a list of key-value pairs. The values in each pair should be a
--- list. If the list is empty, it is not included in the dictionary, if the dictionary contains only
--- one element, the element is stored as the value alone, if the dictionary contains more than one
--- element, the elements are stored into a list.
-objAccumDict :: Structured a => [(Strict.ByteString, [a])] -> Struct
-objAccumDict = ObjDict . fmap (\ case { [a] -> a; lst -> objList lst; }) .
-  Map.fromListWith (++) . fmap (fmap (fmap toStruct)) . filter (not . null . snd)
+----------------------------------------------------------------------------------------------------
+
+-- not for export
+class (Monad m, MonadPlus m, MonadError StructParseError m) => StructParser m where
+  getParseState :: m ParseStructState
+  putParseState :: ParseStructState -> m ()
+  modifyParseState :: (ParseStructState -> ParseStructState) -> m ()
+
+data StructParseError
+  = StructParseBacktrack
+  | StructParseError
+    { structParseErrorType      :: !StructParseErrorType
+      -- ^ Set by the 'annotateParse' function.
+    , structParseErrorInfo      :: !StructParseErrorInfo
+      -- ^ This field is set when the 'fail' function is used to throw the error. It is also set by
+      -- 'structRequire' with a generic error message.
+    , structParseErrorValue     :: Maybe Struct
+      -- ^ This field is set by 'structRequire' with the actual value that did not meet the
+      -- requirements, and will set to 'Nothing' in the case that the 'getStructIndex' has moved
+      -- beyond the final element in the list.
+    , structParseErrorPath      :: !StructIndex
+      -- ^ This field is set automatically by all error throwing functions, including 'throwError',
+      -- 'fail', and 'structRequire'.
+    , structParseErrorNonUnique :: Maybe NonUniqueKeyError
+      -- ^ Set by the 'takeUnique' function.
+    }
+
+data NonUniqueKeyError
+  = NonUniqueKeyError
+    { theOffendingKeyName      :: !Atom
+    , theOffendingKeyInstances :: [ListSlice]
+    }
+
+type StructParseErrorType = Strict.ByteString
+type StructParseErrorInfo = Strict.ByteString
+
+instance Structured StructParseError where
+  toStruct = \ case
+    StructParseBacktrack    -> objList [ObjAtom _key_backtracked]
+    StructParseError
+      {structParseErrorType=typ
+      ,structParseErrorInfo=info
+      ,structParseErrorValue=badval
+      ,structParseErrorPath=path
+      ,structParseErrorNonUnique=nonuniq
+      } -> objList $ [ObjAtom _key_error] ++
+        (if Strict.null typ  then [] else [ObjAtom _key_error_on_type, objString typ]) ++
+        (if Strict.null info then [] else [ObjAtom _key_error_info, objString info]) ++
+        maybe [] (\ val -> [ObjAtom _key_error_wrong_value, val]) badval ++
+        maybe [] (\ val -> [ObjAtom _non_unique_key, toStruct val]) nonuniq ++
+        (if nullStructIndex path then [] else  [ObjAtom _key_error_path, toStruct path])
+  parseStruct = parseList $ annotateParse "error-message" $ parseData _key_error $ \ opts -> do
+    structRequire "no options" (const $ guard $ null opts) (ObjList opts)
+    typ     <- maybe   ""   id <$> optional (takeUnique _key_error_on_type parseStruct)
+    info    <- maybe   ""   id <$> optional (takeUnique _key_error_info    parseStruct)
+    path    <- takeUnique _key_error_wrong_value parseStruct
+    badval  <- optional $ takeUnique _key_error_path parseStruct
+    nonuniq <- optional $ takeUnique _non_unique_key parseStruct
+    return StructParseError
+      { structParseErrorType      = typ
+      , structParseErrorInfo      = info
+      , structParseErrorValue     = badval
+      , structParseErrorPath      = path
+      , structParseErrorNonUnique = nonuniq
+      }
+
+instance Structured NonUniqueKeyError where
+  toStruct (NonUniqueKeyError{theOffendingKeyName=key,theOffendingKeyInstances=slices}) =
+    ObjList $ Vec.fromList $ ObjAtom _non_unique_key : ObjAtom key : (toStruct <$> slices)
+  parseStruct = parseList $ annotateParse "non-unique-key-error" $ do
+    takeAtom $ guard . (_non_unique_key ==)
+    offkey  <- takeAtom pure
+    instncs <- many $ takeElem pure
+    takeEndOfList
+    return NonUniqueKeyError
+      { theOffendingKeyName      = offkey
+      , theOffendingKeyInstances = instncs
+      }
+
+instance LispPrim StructParseError where
+  toLispPrim   = structuredToLisp
+  fromLispPrim = structuredFromLisp
+
+instance Show StructParseError where { showsPrec _ = toLispPrim . toStruct; }
+instance Read StructParseError where
+  readsPrec p = fromLispPrim p >=> \ (a, str) -> case a of
+    LispPrimSyntax err -> fail (UTF8.toString err)
+    LispPrimBad      _ -> fail "Failed to parse StructParseError"
+    LispWaitInput{}    -> fail "Parser for 'StructParseError' failed, input string incomplete"
+    LispYield        a -> [(a, str)]
+
+_non_unique_key :: Atom
+_non_unique_key = read "non-unique-key"
+
+parseStepIn :: StructParser m => StructIndexElem -> m a -> m a
+parseStepIn idx f = do
+  modifyParseState $ (structParserDepth +~ 1) . (structParserPath  %~ (idx :))
+  let restore = modifyParseState $ (structParserDepth -~ 1) . (structParserPath %~ tail)
+  catchError (f <* restore) $ (restore >>) . throwError
+
+-- | Store some information about the type of parse being run into the parser state, so if an error
+-- occurs, this information can be written into a record of the error message.
+annotateParse :: StructParser m => StructParseErrorType -> m a -> m a
+annotateParse typ f = do
+  modifyParseState $ structParserType %~ (typ :)
+  let restore = modifyParseState $ structParserType %~ tail
+  catchError (f <* restore) $ (restore >>) . throwError
+
+-- not for export
+parseThrowError
+  :: StructParser m
+  => Maybe Struct -> Maybe NonUniqueKeyError -> StructParseErrorInfo -> m void
+parseThrowError badvalue nonunique info = do
+  st <- getParseState
+  throwError $ StructParseError
+    { structParseErrorType      = case st ^. structParserType of { [] -> ""; a:_ -> a; }
+    , structParseErrorInfo      = info
+    , structParseErrorPath      = structPathFromParseState st
+    , structParseErrorValue     = badvalue
+    , structParseErrorNonUnique = nonunique
+    }
 
 ----------------------------------------------------------------------------------------------------
 
-newtype ParseStruct a = ParseStruct (ExceptT StructParserError (State StructParserState) a)
+-- Helpers for defining state monad transformers which do not instantiate MonadState. Basically all
+-- three of the struct parsing types, 'ParseStruct', 'ParseListStruct', and 'ParseDictStruct', all
+-- behave the in the exact same way for the instances of 'fail', 'throwError', 'catchError',
+-- 'mzero', and 'mplus', but they behave in ways that cannot be derived. So I've defined a set of
+-- types and functions for copying this behavior into all of the instances without having to
+-- actually copy and paste code.
+
+data ParseStructState
+  = ParseStructState
+    { theStructParserDepth :: !Int
+    , theStructParserPath  :: [StructIndexElem]
+    , theStructParserType  :: [Strict.ByteString]
+    }
+
+type ParserWrapper st outer a f =
+  (ExceptT StructParseError (State st) a -> outer a) ->
+  (outer a -> ExceptT StructParseError (State st) a) -> f
+
+wrappedThrowError :: ParserWrapper st outer void (StructParseError -> outer void)
+wrappedThrowError wrap _unwrap = wrap . throwError
+
+wrappedCatchError
+  :: ParserWrapper st outer a (outer a -> (StructParseError -> outer a) -> outer a)
+wrappedCatchError wrap unwrap try catch = wrap $ lift get >>= \ st -> 
+  catchError (unwrap try) $ ((lift $ put st) >>) . unwrap . catch
+
+wrappedMPlus :: ParserWrapper st outer a (outer a -> outer a -> outer a)
+wrappedMPlus wrap unwrap a b = wrap $ catchError (unwrap a) $ \ case
+  StructParseBacktrack -> unwrap b
+  err                  -> throwError err
+
+wrappedMZero :: ParserWrapper st outer void (outer void)
+wrappedMZero wrap _unwrap = wrap $ throwError StructParseBacktrack
+
+wrappedMFail :: StructParser m => String -> m void
+wrappedMFail = parseThrowError Nothing Nothing . Strict.pack
+
+----------------------------------------------------------------------------------------------------
+
+newtype ParseStruct a
+  = ParseStruct
+    { unwrapParseStruct :: ExceptT StructParseError (State ParseStructState) a }
   deriving (Functor, Applicative, Monad)
 
+wrapParseStruct :: ParserWrapper ParseStructState ParseStruct a f -> f
+wrapParseStruct w = w ParseStruct unwrapParseStruct
+
 instance Alternative ParseStruct where
-  empty = ParseStruct $ throwError StructParserBacktrack
-  (ParseStruct a) <|> (ParseStruct b) = ParseStruct $ catchError a $ \ case
-    StructParserBacktrack -> b
-    a                     -> throwError a
+  empty = wrapParseStruct wrappedMZero
+  (<|>) = wrapParseStruct wrappedMPlus
 
 instance MonadPlus ParseStruct where { mzero = empty; mplus = (<|>); }
 
-instance MonadState StructParserState ParseStruct where { state = ParseStruct . state; }
+instance MonadError StructParseError ParseStruct where
+  throwError = wrapParseStruct wrappedThrowError
+  catchError = wrapParseStruct wrappedCatchError
 
-instance MonadError StructParserError ParseStruct where
-  throwError = ParseStruct . throwError
-  catchError (ParseStruct try) catch = ParseStruct $
-    catchError try $ (\ (ParseStruct o) -> o) . catch
-
-instance MonadFail ParseStruct where
-  fail msg = get >>= \ st -> throwError StructParserError
-    { structParserErrorInfo = Strict.pack msg
-    , structParserErrorPath = theStructParserPath st
-    }
+instance MonadFail ParseStruct where { fail = wrappedMFail; }
 
 instance Semigroup a => Semigroup (ParseStruct a) where { a <> b = (<>) <$> a <*> b; }
 
-data StructParserError
-  = StructParserBacktrack
-  | StructParserError
-    { structParserErrorInfo :: !Strict.ByteString
-    , structParserErrorPath :: !StructIndex
-    }
+instance StructParser ParseStruct where
+  getParseState    = ParseStruct $ lift get
+  putParseState    = ParseStruct . lift . put
+  modifyParseState = ParseStruct . lift . modify
 
-_key_backtracked :: Strict.ByteString
-_key_backtracked = "backtracked"
+_key_backtracked :: Atom
+_key_backtracked = read "backtracked"
 
-_key_error :: Strict.ByteString
-_key_error = "error"
+_key_error :: Atom
+_key_error = read "error"
 
-instance Structured StructParserError where
-  toStruct = \ case
-    StructParserBacktrack     -> objList [objAtom _key_backtracked]
-    StructParserError txt idx -> objList [objAtom _key_error, objString txt, toStruct idx]
-  parseStruct struct = do
-    lst <- parseStruct struct
-    key <- parseStruct $ lst Vec.! 0
-    if key == _key_backtracked then guard (Vec.length lst == 1) >> return StructParserBacktrack else
-      if key == _key_error
-       then guard (Vec.length lst == 3) >>
-        StructParserError <$> parseStruct (lst Vec.! 1) <*> parseStruct (lst Vec.! 2)
-       else empty
+_key_error_on_type :: Atom
+_key_error_on_type = read ":parsing"
 
-instance LispPrim StructParserError where
-  toLispPrim   = structuredToLisp
-  fromLispPrim = structuredFromLisp
+_key_error_info :: Atom
+_key_error_info = read ":because"
+
+_key_error_path :: Atom
+_key_error_path = read ":at-index"
+
+_key_error_wrong_value :: Atom
+_key_error_wrong_value = read ":wrong-value"
+
+_key_error_non_unique :: Atom
+_key_error_non_unique = read ":non-unique-key"
 
 structuredToLisp :: Structured a => a -> String -> String
 structuredToLisp = toLispPrim . toStruct
@@ -297,31 +491,422 @@ structuredFromLisp p = fromLispPrim p >=> loop where
       Left err -> [(LispPrimBad err, rem)]
       Right  a -> [(LispYield   a  , rem)]
 
-instance Show StructParserError where { showsPrec _ = toLispPrim . toStruct; }
-instance Read StructParserError where
-  readsPrec p = fromLispPrim p >=> \ (a, str) -> case a of
-    LispPrimSyntax err -> fail (UTF8.toString err)
-    LispPrimBad      _ -> fail "Failed to parse StructParseError"
-    LispWaitInput{}    -> fail "Parser for 'StructParseError' failed, input string incomplete"
-    LispYield        a -> [(a, str)]
+structParserDepth :: Lens' ParseStructState Int
+structParserDepth = lens theStructParserDepth $ \ a b -> a{ theStructParserDepth = b }
 
-data StructParserState
-  = StructParserState
-    { theStructParserDepth :: !Int
-    , theStructParserPath  :: !StructIndex
-    }
+structParserPath :: Lens' ParseStructState [StructIndexElem]
+structParserPath = lens theStructParserPath $ \ a b -> a{ theStructParserPath = b }
 
-initStructParserState :: StructParserState
-initStructParserState = StructParserState
+structParserType :: Lens' ParseStructState [Strict.ByteString]
+structParserType = lens theStructParserType $ \ a b -> a{ theStructParserType = b }
+
+initParseStructState :: ParseStructState
+initParseStructState = ParseStructState
   { theStructParserDepth = 0
-  , theStructParserPath  = StructLeaf
+  , theStructParserPath  = []
+  , theStructParserType  = []
   }
 
-runParseStruct :: ParseStruct a -> Either StructParserError a
-runParseStruct (ParseStruct f) = evalState (runExceptT f) initStructParserState
+runParseStruct
+  :: MonadError StructParseError m
+  => ParseStruct a -> ParseStructState -> m a
+runParseStruct (ParseStruct f) = (throwError ||| return) . evalState (runExceptT f)
 
-fromStruct :: Structured a => Struct -> Either StructParserError a
-fromStruct = runParseStruct . parseStruct
+-- | Evaluate 'parseStruct' on some 'Struct' to produce a value of type @a@.
+fromStruct :: Structured a => Struct -> Either StructParseError a
+fromStruct = flip runParseStruct initParseStructState . parseStruct
+
+-- | Run a 'ParseStruct' function and throw an exception if it backtracks.
+structRequire
+  :: StructParser m
+  => StructParseErrorInfo -> (Struct -> m a) -> Struct -> m a
+structRequire info f o = mplus (f o) $ parseThrowError (Just o) Nothing ("require " <> info)
+
+----------------------------------------------------------------------------------------------------
+
+-- | Like 'ParseStruct' but has combinators designed specifically for inspecting lists.
+newtype ParseListStruct a
+  = ParseListStruct
+    { unwrapParseListStruct :: ExceptT StructParseError (State ParseListStructState) a }
+  deriving (Functor, Applicative, Monad)
+
+data ParseListStructState
+  = ParseListStructState
+    { theListContext :: !ParseStructState
+    , theListVector  :: !(Vec.Vector Struct)
+    , theListIndex   :: !Int
+    }
+
+wrapParseListStruct :: ParserWrapper ParseListStructState ParseListStruct a f -> f
+wrapParseListStruct w = w ParseListStruct unwrapParseListStruct
+
+instance Alternative ParseListStruct where
+  empty = wrapParseListStruct wrappedMZero
+  (<|>) = wrapParseListStruct wrappedMPlus
+
+instance MonadPlus ParseListStruct where { mzero = empty; mplus = (<|>); }
+
+instance MonadError StructParseError ParseListStruct where
+  throwError = wrapParseListStruct wrappedThrowError
+  catchError = wrapParseListStruct wrappedCatchError
+
+instance MonadFail ParseListStruct where { fail = wrappedMFail; }
+
+instance Semigroup a => Semigroup (ParseListStruct a) where { a <> b = (<>) <$> a <*> b; }
+
+instance StructParser ParseListStruct where
+  getParseState    = view listContext <$> parseListGetState
+  putParseState    = parseListModifyState . (listContext .~)
+  modifyParseState = parseListModifyState . (listContext %~)
+
+parseListGetState    :: ParseListStruct ParseListStructState
+parseListGetState    = ParseListStruct $ lift get
+
+parseListModifyState :: (ParseListStructState -> ParseListStructState) -> ParseListStruct ()
+parseListModifyState = ParseListStruct . lift . modify
+
+listContext :: Lens' ParseListStructState ParseStructState
+listContext = lens theListContext $ \ a b -> a{ theListContext = b }
+
+listIndex :: Lens' ParseListStructState Int
+listIndex = lens theListIndex $ \ a b -> a{ theListIndex = b }
+
+listVector :: Lens' ParseListStructState (Vec.Vector Struct)
+listVector = lens theListVector $ \ a b -> a{ theListVector = b }
+
+getStructVector :: ParseListStruct (Vec.Vector Struct)
+getStructVector = theListVector <$> parseListGetState
+
+putStructVector :: Vec.Vector Struct -> ParseListStruct ()
+putStructVector = parseListModifyState . (listVector .~)
+
+getStructIndex :: ParseListStruct Int
+getStructIndex = view listIndex <$> parseListGetState
+
+putStructIndex :: Int -> ParseListStruct ()
+putStructIndex = parseListModifyState . (listIndex .~)
+
+getStructLength :: ParseListStruct Int
+getStructLength = Vec.length <$> getStructVector
+
+-- | Begin parsing over a list 'Struct'. This function immediately evaluates to 'empty' if the given
+-- 'Struct' is not a list. Consider this the entry point for the 'ParseListStruct' function type,
+-- the 'ParseListStruct' analogue of 'runState'.
+parseList :: ParseListStruct a -> Struct -> ParseStruct a
+parseList f = \ case
+  ObjList vec -> parseListWith vec f
+  _           -> empty
+
+-- | Like 'parseList', but more useful in a @case@ statement over 'Struct's because you can evaluate
+-- it with the value of an 'ObjList' constructor.
+parseListWith :: Vec.Vector Struct -> ParseListStruct a -> ParseStruct a
+parseListWith vec (ParseListStruct f) = do
+  st <- getParseState
+  (result, st) <- pure $ fmap theListContext $ runState (runExceptT f) $ ParseListStructState
+    { theListContext = st & structParserDepth +~ 1
+    , theListVector  = vec
+    , theListIndex   = 0
+    }
+  putParseState (st & structParserDepth -~ 1)
+  (throwError ||| return) result
+
+-- | Take the next element in the list, without regard for it's type.
+takeStruct :: (Struct -> ParseStruct a) -> ParseListStruct a
+takeStruct f = do
+  i   <- getStructIndex
+  len <- getStructLength
+  vec <- getStructVector
+  if not $ 0 <= i && i < len then mzero else parseStepIn (StructIndexList i) $ do
+    st <- getParseState
+    (runParseStruct $ f $ vec Vec.! i) $
+      (st & (structParserDepth +~ 1) . (structParserPath %~ ((StructIndexList i) :)))
+
+-- | Evaluates 'takeStruct' with the 'parseStruct' instance function for the type @elem@, and then
+-- evaluates a continuation on that @elem@ value.
+takeElem :: Structured elem => (elem -> ParseStruct a) -> ParseListStruct a
+takeElem = takeStruct . (parseStruct >=>)
+
+-- | Succeeds if 'getStructIndex' is out of bounds (less then zero or greater than
+-- 'getStructLength'), fails if the index is in bounds.
+takeEndOfList :: ParseListStruct ()
+takeEndOfList = do
+  i   <- getStructIndex
+  len <- getStructLength
+  guard (i >= len || i < 0)
+
+-- | Within a list parser, step into a list element
+takeList :: ParseListStruct a ->  ParseListStruct a
+takeList = takeStruct . parseList
+
+-- | 'takeElem' specialized for an 'Atom' type.
+takeAtom :: (Atom -> ParseStruct a) -> ParseListStruct a
+takeAtom = takeElem
+
+-- | 'takeElem' specialized for a 'Bool' type.
+takeBool :: (Bool -> ParseStruct a) -> ParseListStruct a
+takeBool = takeElem
+
+-- | 'takeElem' specialized for an 'Integer' type.
+takeInt :: (Integer -> ParseStruct a) -> ParseListStruct a
+takeInt = takeElem
+
+-- | 'takeElem' specialized for a 'Double' type.
+takeFloat :: (Double -> ParseStruct a) -> ParseListStruct a
+takeFloat = takeElem
+
+-- | 'takeElem' specialized for a string type.
+takeString :: (Strict.ByteString -> ParseStruct a) -> ParseListStruct a
+takeString = takeElem
+
+-- | Iterate over elements in a list, folding each each element into a value with a given
+-- continuation function. The continuation also receives the index of the 'Struct' element. The
+-- continuation must return the updated folded value, and may return the next index to scan. If the
+-- index returned is out of bounds, or if 'Nothing' is returned instead of an next index to scan,
+-- then looping ends and the @fold@ result is returned. If the continuation function backtracks, the
+-- entire scan operation backtracks and no @fold@ result is returned.
+scanElems
+  :: fold -- ^ the value to fold as the scan procedes,
+  -> (fold -> Int -> Struct -> ParseStruct (Maybe Int, fold))
+    -- ^ the action to perform on each scanned element. Return the updated index and the @fold@
+    -- values. If the returned index is out of bounds, the loop halts.
+  -> ParseListStruct fold
+scanElems fold f = loop fold where
+  loop fold = do
+    i <- getStructIndex
+    (i, fold) <- takeStruct $ f fold i
+    case i of
+      Nothing -> return fold
+      Just  i -> do
+        putStructIndex i
+        len <- getStructLength
+        if 0 <= i || i < len then loop fold else return fold
+
+-- | Take a slice of the list over which this function is parsing, starting from the index @here@
+-- given by 'getStructIndex' and ending at the index @to@ given to this function. The two indicies
+-- @here@ and @to@ are used to create a slice of the vector that stores the elements of the list,
+-- regardless of whether @here@ is greater than @to@. The lesser index of @here@ and @to@ is the
+-- start of the slice, and the element at that index is always included in the slice. The greater of
+-- @here@ and @to@ is the end of the slice, and the element at that index is never included in the
+-- slice.
+--
+-- This function does not modify the index given by 'getStructIndex'.
+takeSlice :: Int -> ParseListStruct (Vec.Vector Struct)
+takeSlice to = do
+  len  <- getStructLength
+  here <- getStructIndex
+  when (not $ 0 <= here && here < len) empty
+  let (lo, hi) = (min here to, max here to)
+  Vec.slice lo (hi - lo) <$> getStructVector
+
+-- | Take a slice of the list over which this function is parsing, starting from the index given by
+-- 'getStructIndex' and going forward to the end of the list. Unlike 'takeSlice', this function does
+-- alter the index given by 'getStructIndex', in fact the index is moved past the end of the vector
+-- that stores the elements of the list. Therefore, after 'takeSliceToEnd' is evaluated, the
+-- function 'takeEndOfList' will succeed to parse, while any other 'ParseListStruct' type of
+-- function will evaluate to 'empty' after 'takeSliceToEnd' is evaluated, unless you evaluate
+-- 'putStructIndex' to place the current index back in bounds.
+takeSliceToEnd :: ParseListStruct (Vec.Vector Struct)
+takeSliceToEnd = do
+  len  <- getStructLength
+  here <- getStructIndex
+  when (not $ 0 <= here && here < len) empty
+  Vec.slice here (len - here) <$> getStructVector <* putStructIndex len
+
+----------------------------------------------------------------------------------------------------
+
+-- | Note that a 'ListSlice' is usually created by the 'listToDictionary' function. However, this
+-- data type does instantiate the 'Structured' class and has it's own structured form.
+data ListSlice
+  = ListSlice
+    { theListSliceIndex  :: !Int
+      -- ^ The index within the parent list where this slice begins
+    , theListSliceVector :: !(Vec.Vector Struct)
+    }
+  deriving (Eq, Ord)
+
+instance Structured ListSlice where
+  toStruct (ListSlice{theListSliceIndex=i,theListSliceVector=vec}) =
+    ObjList $ Vec.fromListN (2 + Vec.length vec) $
+    [ObjAtom _list_slice, objInt i] ++ Vec.toList vec
+  parseStruct = parseList $ do
+    takeAtom $ guard . (== _list_slice)
+    i   <- takeInt (pure . fromInteger)
+    vec <- takeSliceToEnd
+    return ListSlice{ theListSliceIndex = i, theListSliceVector = vec }
+
+-- | The 'ListSlice' is usually used in the context of parsing a 'Dictionary' literal from a list
+-- data structure, meaning the slice is usually a number of elements after a dictionary key and
+-- before another key. The 'ListSlice' contains a list that is a slice of a larger list, and this
+-- slice may contain zero or more elements. Usually, when defining a 'Dictionary' literal, it is
+-- expected that there is only 1 element after a key. But the way 'listToDictionary' works, it
+-- always provides a 'Vec.Vector' of elements, even when there is only 1 element after a key.
+--
+-- This function allows you to check the 'Vec.Vector' created by 'listToDictionary', if there is
+-- only 1 element after a key, that element is extracted from the vector and returned as it is. If
+-- there are 0 elements after a key, 'ObjTrue' is returned (the existence of the key indicates that
+-- a flag has been set). If there are more than 1 elements after a key, the elements are returned as
+-- a list.
+listSliceItem :: ListSlice -> Struct
+listSliceItem s = let vec = theListSliceVector s in case Vec.length vec of
+  0 -> ObjTrue
+  1 -> vec Vec.! 0
+  _ -> ObjList vec
+
+_list_slice :: Atom
+_list_slice = read "list-slice"
+
+----------------------------------------------------------------------------------------------------
+
+-- | There are a few ways to create a 'Dictionary', but one way is to create one from a bunch of
+-- slices of a 'Vec.Vector', where each slice starts with an 'Atom' who's first character is a
+-- colon.
+newtype Dictionary = Dictionary (Map.Map Atom DictionaryEntry) deriving Eq
+
+type DictionaryEntry = NE.NonEmpty ListSlice
+
+instance Monoid Dictionary where { mempty = Dictionary mempty; mappend = (<>); }
+
+instance Semigroup Dictionary where
+  (Dictionary a) <> (Dictionary b) = Dictionary $ Map.unionWith (<>) a b
+
+dictLookup :: Atom -> Dictionary -> Maybe DictionaryEntry
+dictLookup a (Dictionary dict) = Map.lookup a dict
+
+dictInsertWith
+  :: (DictionaryEntry -> DictionaryEntry -> DictionaryEntry)
+  -> Atom -> DictionaryEntry -> Dictionary -> Dictionary
+dictInsertWith f a o (Dictionary dict) = Dictionary $ Map.insertWith f a o dict
+
+dictDelete :: Atom -> Dictionary -> Dictionary
+dictDelete a (Dictionary map) = Dictionary $ Map.delete a map
+
+-- | Data structures can be represented by an atom followed by an association list. This is a
+-- function for parsing data in this form.
+parseData
+  :: Atom
+  -> (Vec.Vector Struct -- ^ this is a list of options after the head and before the first atom
+      -> ParseDictStruct a)
+  -> ParseListStruct a
+parseData atom f = do
+  takeAtom $ guard . (== atom)
+  scanUntilKeyAtom >>= parseDictionary . f
+
+-- | Takes an atom only if the atom begins with a colon (@':'@) character.
+takeKeyAtom :: ParseListStruct Atom
+takeKeyAtom = takeAtom $ \ a -> guard (':' == atomHead a) >> return a
+
+-- | Gathers all elements in the list up until a key atom (according to 'takeKeyAtom') is returned.
+scanUntilKeyAtom :: ParseListStruct (Vec.Vector Struct)
+scanUntilKeyAtom = do
+  optsStart <- getStructIndex
+  optsLen   <- scanElems 0 $ \ optsLen i -> \ case
+    ObjAtom a | atomHead a == ':' -> return (Nothing, optsLen)
+    _                             -> return (Just (i + 1), optsLen + 1)
+  Vec.slice optsStart optsLen <$> getStructVector
+
+-- | Parse a list structure as a 'Dictionary', with keys deonted as 'Atom's starting with colon
+-- characters, and values being anything between keys. The current element must be a key atom,
+-- otherwise this function fails. The entire remainder of the list will be consumed after this
+-- function is evaluated.
+listToDictionary :: ParseListStruct Dictionary
+listToDictionary = getKey >>= loop mempty where
+  getKey = (,) <$> getStructIndex <*> takeKeyAtom
+  loop map (i, key) = do
+    elems <- scanUntilKeyAtom
+    map   <- pure $ dictInsertWith (flip (<>)) key (ListSlice i elems NE.:| []) map
+    mplus (takeEndOfList >> return map) $ getKey >>= loop map
+
+----------------------------------------------------------------------------------------------------
+
+newtype ParseDictStruct a
+  = ParseDictStruct
+    { unwrapParseDictStruct :: ExceptT StructParseError (State ParseDictStructState) a }
+  deriving (Functor, Applicative, Monad)
+
+wrapParseDictStruct :: ParserWrapper ParseDictStructState ParseDictStruct a f -> f
+wrapParseDictStruct w = w ParseDictStruct unwrapParseDictStruct
+
+data ParseDictStructState
+  = ParseDictStructState
+    { theDictContext :: !ParseStructState
+    , theDictSource  :: !Dictionary
+    }
+
+instance Alternative ParseDictStruct where
+  empty = wrapParseDictStruct wrappedMZero
+  (<|>) = wrapParseDictStruct wrappedMPlus
+
+instance MonadPlus ParseDictStruct where { mzero = empty; mplus = (<|>); }
+
+instance MonadError StructParseError ParseDictStruct where
+  throwError = wrapParseDictStruct wrappedThrowError
+  catchError = wrapParseDictStruct wrappedCatchError
+
+instance MonadFail ParseDictStruct where { fail = wrappedMFail; }
+
+instance StructParser ParseDictStruct where
+  getParseState    = view dictContext <$> parseDictGetState
+  putParseState    = parseDictModifyState . (dictContext .~)
+  modifyParseState = parseDictModifyState . (dictContext %~)
+
+parseDictGetState :: ParseDictStruct ParseDictStructState
+parseDictGetState = ParseDictStruct $ lift get
+
+parseDictModifyState :: (ParseDictStructState -> ParseDictStructState) -> ParseDictStruct ()
+parseDictModifyState = ParseDictStruct . lift . modify
+
+dictContext :: Lens' ParseDictStructState ParseStructState
+dictContext = lens theDictContext $ \ a b -> a{ theDictContext = b }
+
+dictSource :: Lens' ParseDictStructState Dictionary
+dictSource = lens theDictSource $ \ a b -> a{ theDictSource = b }
+
+-- | The 'parseDictionary' function is of type 'ParseListStruct' because a dictionary must first be
+-- constructed from a list data structure. This function calls 'listToDictionary' then evaluates a
+-- function of type 'ParseDictStruct'.
+parseDictionary :: ParseDictStruct a -> ParseListStruct a
+parseDictionary (ParseDictStruct f) =
+  ParseDictStructState <$> (theListContext <$> parseListGetState) <*> listToDictionary >>=
+  (throwError ||| return) . evalState (runExceptT f)
+
+-- | Lookup a key in a 'Dictionary' and run a parser continuation on it.
+--
+-- Note that this function will remove the key (if it exists) from the dictionary, so evaluating
+-- this function twice for the same key will fail on the second evaluation.
+takeKeyAll :: Atom -> (NE.NonEmpty ListSlice -> ParseStruct a) -> ParseDictStruct a
+takeKeyAll key f = do
+  parseDictModifyState $ dictContext . structParserPath %~ ((StructIndexDict key) :)
+  dictLookup key . theDictSource <$> parseDictGetState >>= \ case
+    Nothing    -> mzero
+    Just items -> do
+      parseDictModifyState $ dictSource %~ dictDelete key
+      getParseState >>= runParseStruct (f items)
+
+-- | Lookup a key in a 'Dictionary' and run a parser on all items associated with this key.
+--
+-- Note that this function will remote the key (if it exists) from the dictionary, so evaluating
+-- this function twice for the same key will fail on the second evaluation.
+takeKey :: Atom -> (Int -> Struct -> ParseStruct a) -> ParseDictStruct (NE.NonEmpty a)
+takeKey key f = takeKeyAll key $ mapM $ \ s -> f (theListSliceIndex s) (listSliceItem s)
+
+-- | Lookup a key in a 'Dictionary' and run a parser on all items associated with this key. If there
+-- is more than one item associated with this key, an exception is thrown.
+--
+-- Note that this function will remote the key (if it exists) from the dictionary, so evaluating
+-- this function twice for the same key will fail on the second evaluation.
+takeUnique :: Atom -> (Struct -> ParseStruct a) -> ParseDictStruct a
+takeUnique key f = takeKeyAll key $ \ case
+  a NE.:| [] -> getParseState >>= runParseStruct (f $ listSliceItem a)
+  a NE.:| ax -> throwError $ StructParseError
+    { structParseErrorType      = ""
+    , structParseErrorInfo      = "key should be unique"
+    , structParseErrorPath      = mempty
+    , structParseErrorValue     = Nothing
+    , structParseErrorNonUnique = Just $ NonUniqueKeyError
+        { theOffendingKeyName      = key
+        , theOffendingKeyInstances = a:ax
+        }
+    }
 
 ----------------------------------------------------------------------------------------------------
 
@@ -330,7 +915,7 @@ data FromLispPrim a
   | LispWaitInput  (String -> [(FromLispPrim a, String)])
   | LispPrimSyntax !Strict.ByteString
     -- ^ Thrown when the string is invalid Lisp syntax.
-  | LispPrimBad    !StructParserError
+  | LispPrimBad    !StructParseError
     -- ^ Thrown when the string is valid syntax but cannot be constructed by 'fromStruct'.
   deriving Functor
 
@@ -387,11 +972,11 @@ readsPrecLisp p = readsPrec p >=> \ (a, rem) -> [(LispYield a, rem)]
 
 -- Since I'm not using a proper parser function, I'll need a map-like function for the 'ReadS' data
 -- type.
-rmap :: (a -> b) -> ReadS a -> ReadS b
-rmap f m str = (\ (a, rem) -> (f a, rem)) <$> m str
+readsMap :: (a -> b) -> ReadS a -> ReadS b
+readsMap f m str = (\ (a, rem) -> (f a, rem)) <$> m str
 
 rfmap :: Functor f => (a -> b) -> ReadS (f a) -> ReadS (f b)
-rfmap f = rmap (fmap f)
+rfmap f = readsMap (fmap f)
 
 -- | The 'Prelude.String' type cannot instantiate the 'LispPrim' type because it overlaps
 -- instances with the list type. You can use the 'LispPrim' instance for 'Strict.ByteString',
@@ -426,9 +1011,6 @@ seqFromLisp open close constr parse p = \ case { c:str | c == open -> loop id st
     c:str | c == close -> [(LispYield $ constr $ stk [], sp str)]
     str -> parse p str >>= next stk
 
-colon :: Char
-colon = ':'
-
 sp :: String -> String
 sp = dropWhile isSpace
 
@@ -445,7 +1027,7 @@ instance LispPrim Bool        where
       [(LispYield $ if tf == 't' then True else False, str)]
     _ -> []
 
-instance LispPrim Int         where
+instance LispPrim Integer     where
   toLispPrim   = shows
   fromLispPrim = readsPrecLisp
 
@@ -492,28 +1074,6 @@ instance Structured a => LispPrim (Vec.Vector a) where
   toLispPrim   = toLispPrim . Vec.toList
   fromLispPrim = rfmap Vec.fromList . fromLispPrim
 
-instance Structured a => LispPrim (Map.Map Strict.ByteString a) where
-  toLispPrim   = seqToLisp   '{' '}' Map.assocs $ \ (key, a) ->
-    shows (UTF8.toString key) . (colon :) . toLispPrim (toStruct a)
-  fromLispPrim = seqFromLisp '{' '}' (Map.fromListWith (flip const)) $ \ p -> sp >>> \ case
-    c:str | c == colon -> do
-      (key, str) <-
-        rmap ObjAtom (readsPrec p) <> rmap (ObjString . UTF8.fromString) (readsPrec p) $ sp str
-      key <- case key of
-        ObjAtom (Atom key) -> [key]
-        ObjString     key  -> [key]
-        obj                -> error $ "internal: cannot be used as key: " ++
-          toLispPrim obj "\nbefore string: " ++ show (take 20 str)
-      let next (a, str) = case a of
-            LispYield        a -> case fromStruct a of
-                             Right  a -> [(LispYield (key, a), str)]
-                             Left err -> [(LispPrimBad  err, str)]
-            LispWaitInput cont -> [(LispWaitInput $ cont >=> next, str)]
-            LispPrimBad    err -> [(LispPrimBad    err, str)]
-            LispPrimSyntax err -> [(LispPrimSyntax err, str)]
-      fromLispPrim p str >>= next
-    _ -> []
-
 instance LispPrim Struct      where
   toLispPrim = \ case
     ObjFalse    -> toLispPrim False
@@ -524,7 +1084,8 @@ instance LispPrim Struct      where
     ObjString o -> toLispPrim o
     ObjAtom   o -> toLispPrim o
     ObjList   o -> toLispPrim o
-    ObjDict   o -> toLispPrim o
+    ObjQuoted o -> ('\'' :) . toLispPrim o
+    ObjHashed o -> ('#' :) . toLispPrim o
   fromLispPrim = rfmap (\ true -> if true then ObjTrue else ObjFalse) . fromLispPrim
       <> rfmap ObjInt    . fromLispPrim
       <> rfmap ObjChar   . fromLispPrim
@@ -532,4 +1093,3 @@ instance LispPrim Struct      where
       <> rfmap ObjString . fromLispPrim
       <> rfmap ObjAtom   . fromLispPrim
       <> rfmap ObjList   . fromLispPrim
-      <> rfmap ObjDict   . fromLispPrim
