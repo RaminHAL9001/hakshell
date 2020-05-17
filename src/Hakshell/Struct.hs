@@ -7,15 +7,16 @@ module Hakshell.Struct
     Struct(..), StructIndex(..), structIndex,
     -- * The Class of 'Structured' Data Types
     Structured(..), LispPrim, toLispPrim, fromLispPrim,
-    strToLispExpr, strFromLispExpr, fromStruct, objString, objAtom,
+    strToLispExpr, strFromLispExpr, fromStruct, objInt, objString, objAtom,
     objList, objSizedList,
     -- ** Dictionary structures
     Dictionary,
     -- * The 'Atom' data type
     Atom, toAtom, atomToText, isAtomChar, atomHead,
     -- * Haskell Data to/from a 'Struct'
-    ParseStruct, runParseStruct, structRequire,
+    ParseStruct, runParseStruct,
     StructParseError(..), NonUniqueKeyError(..),
+    annotateParse, structRequire,
     Control.Monad.Except.throwError,
     Control.Monad.Except.catchError,
     -- * Haskell Data to/from a list of 'Struct's
@@ -171,6 +172,12 @@ instance Structured Bool   where
     ObjFalse -> return False
     ObjTrue  -> return True
     _        -> mzero
+
+instance Structured Int where
+  toStruct = ObjInt . fromIntegral
+  parseStruct = \ case
+    ObjInt a | a <= fromIntegral (maxBound :: Int) -> return $ fromInteger a
+    _ -> mzero
 
 instance Structured Integer where
   toStruct    = ObjInt
@@ -681,36 +688,54 @@ scanElems fold f = loop fold where
         len <- getStructLength
         if 0 <= i || i < len then loop fold else return fold
 
--- | Take a slice of the list over which this function is parsing, starting from the index @here@
--- given by 'getStructIndex' and ending at the index @to@ given to this function. The two indicies
--- @here@ and @to@ are used to create a slice of the vector that stores the elements of the list,
--- regardless of whether @here@ is greater than @to@. The lesser index of @here@ and @to@ is the
--- start of the slice, and the element at that index is always included in the slice. The greater of
--- @here@ and @to@ is the end of the slice, and the element at that index is never included in the
--- slice.
+-- not for export
 --
--- This function does not modify the index given by 'getStructIndex'.
-takeSlice :: Int -> ParseListStruct (Vec.Vector Struct)
-takeSlice to = do
-  len  <- getStructLength
-  here <- getStructIndex
-  when (not $ 0 <= here && here < len) empty
-  let (lo, hi) = (min here to, max here to)
-  Vec.slice lo (hi - lo) <$> getStructVector
+-- Parse over a vector that has been extracted from the current list, restore the state on failure.
+parseSubVector
+  :: ParseListStruct a
+  -> Vec.Vector Struct
+  -> ParseListStruct a
+parseSubVector (ParseListStruct (ExceptT parse)) subvec = do
+  st <- parseListGetState
+  case runState parse $ listVector .~ subvec $ listIndex .~ 0 $ st of
+    (result, st) -> case result of
+      Left  err    -> parseListModifyState (const st) >> throwError err
+      Right result -> return result
 
--- | Take a slice of the list over which this function is parsing, starting from the index given by
--- 'getStructIndex' and going forward to the end of the list. Unlike 'takeSlice', this function does
--- alter the index given by 'getStructIndex', in fact the index is moved past the end of the vector
--- that stores the elements of the list. Therefore, after 'takeSliceToEnd' is evaluated, the
--- function 'takeEndOfList' will succeed to parse, while any other 'ParseListStruct' type of
--- function will evaluate to 'empty' after 'takeSliceToEnd' is evaluated, unless you evaluate
--- 'putStructIndex' to place the current index back in bounds.
-takeSliceToEnd :: ParseListStruct (Vec.Vector Struct)
-takeSliceToEnd = do
+-- | Take a slice of the list over which this function is parsing, starting from the index @here@
+-- given by 'getStructIndex' taking an integer number @many@ elements as the argument given to this
+-- function. Like the 
+--
+-- A slice of the array starting from @here@ and containing @many@ elements is created from the
+-- vector that stores the elements of the list, and @many@ may be a negative number in which case
+-- elements before @here@ are taken (but the order of elements taken are not reversed in the case of
+-- a negative @many@ value). This semantics is similar to the 'Data.List.take' function from
+-- "Data.List", although if @many@ is zero this function evaluates to 'empty'.
+--
+-- Once the slice is selected, it is used to evaluate the given 'ParseListStruct' continuation
+-- function. This continuation sees the slice as a new vector, and will observe that the element at
+-- the @here@ position is element zero. The depth of the struct parse is not incremented as we are
+-- still in the same list of elements as the calling context.
+--
+-- This function does not modify the index given by 'getStructIndex' unless the given continuation
+-- succeeds.
+takeSlice :: Int -> ParseListStruct a -> ParseListStruct a
+takeSlice len parse = if len == 0 then empty else do
+  len  <- getStructLength
+  here <- getStructIndex
+  let to = here + len
+  when (not $ 0 <= here && here < len && 0 <= to && to < len) empty
+  let (lo, hi) = (min here to, max here to)
+  (Vec.slice lo (hi - lo) <$> getStructVector >>= parseSubVector parse) <* putStructIndex hi
+
+-- | Like 'takeSlice' but takes all elements from the current position to the end of the current
+-- list.
+takeSliceToEnd :: ParseListStruct a -> ParseListStruct a
+takeSliceToEnd parse = do
   len  <- getStructLength
   here <- getStructIndex
   when (not $ 0 <= here && here < len) empty
-  Vec.slice here (len - here) <$> getStructVector <* putStructIndex len
+  (Vec.slice here (len - here) <$> getStructVector >>= parseSubVector parse) <* putStructIndex len
 
 ----------------------------------------------------------------------------------------------------
 
@@ -730,9 +755,10 @@ instance Structured ListSlice where
     [ObjAtom _list_slice, objInt i] ++ Vec.toList vec
   parseStruct = parseList $ do
     takeAtom $ guard . (== _list_slice)
-    i   <- takeInt (pure . fromInteger)
-    vec <- takeSliceToEnd
-    return ListSlice{ theListSliceIndex = i, theListSliceVector = vec }
+    i <- takeElem pure
+    takeSliceToEnd $ do
+      vec <- theListVector <$> parseListGetState -- TODO: copy the vector here?
+      return ListSlice{ theListSliceIndex = i, theListSliceVector = vec }
 
 -- | The 'ListSlice' is usually used in the context of parsing a 'Dictionary' literal from a list
 -- data structure, meaning the slice is usually a number of elements after a dictionary key and

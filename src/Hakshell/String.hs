@@ -24,8 +24,10 @@ module Hakshell.String
 
 import           Hakshell.Struct
 
+import           Control.Applicative
+import           Control.Monad
+
 import           Data.Maybe
-import           Data.String
 import qualified Data.ByteString.Char8          as Strict
 import qualified Data.ByteString.Lazy.Char8     as Lazy
 import qualified Data.ByteString.Builder        as Build
@@ -34,6 +36,7 @@ import qualified Data.ByteString.UTF8           as StrictUTF8
 import qualified Data.ByteString.Lazy.UTF8      as LazyUTF8
 import qualified Data.IntMap                    as IMap
 import           Data.Semigroup
+import           Data.String
 import           Data.Typeable
 import qualified Data.Vector                    as Vec
 import qualified Data.Vector.Unboxed            as UVec
@@ -134,10 +137,12 @@ findSubstring cap pat = findSubstringFrom cap pat 0
 -- assoication list indexed by the 'sliceOffset' of the 'StringSlice' of each 'Captured' item.
 splitByPatternFrom
   :: StringPattern pat
-  => StrictBytes -> pat -> Offset -> StrictBytes -> IMap.IntMap Captured
-splitByPatternFrom str pat = loop id where
-  loop stk offset str = case findSubstringFrom Capture pat offset str of
-    _ -> error "TODO: splitBy"
+  => pat -> Offset -> StrictBytes -> IMap.IntMap (Vec.Vector Captured)
+splitByPatternFrom pat offset str = loop IMap.empty offset where
+  loop map offset = case findSubstringFrom Capture pat offset str of
+    PatternNoMatch skip -> loop map $ offset + max 1 skip
+    PatternMatch    vec -> loop (IMap.insert offset vec map) $ offset +
+      maximum (1 : (intSize . capturedSlice <$> Vec.toList vec))
 
 ----------------------------------------------------------------------------------------------------
 
@@ -169,13 +174,17 @@ data Capture
 -- instantiates 'Data.Semigroup.Semigroup' and 'Data.Monoid.Monoid', so you can append multiple
 -- matches from multiple patterns sequential matched against a string input.
 data PatternMatch
-  = PatternNoMatch
+  = PatternNoMatch !Int
+    -- ^ The integer value is used when trying to match a pattern anywhere in a target string, it
+    -- should indicate how many characters indicies @i@ you can skip over because it is
+    -- mathematically impossible to match the pattern anywhere between the current index and
+    -- anywhere within @n@ indicies before.
   | PatternMatch (Vec.Vector Captured)
   deriving (Eq, Ord, Show)
 
 data Captured
   = Captured{ capturedSlice :: !StringSlice }
-  | CapturedNamed{ capturedLabel :: !Label , capturedSlice :: !StringSlice }
+  | CapturedNamed{ capturedLabel :: !Label, capturedSlice :: !StringSlice }
   deriving (Eq, Ord, Show)
 
 -- | An index into a 'StrictBytes' string. This data type is usually the result of a pattern match.
@@ -190,41 +199,70 @@ data StringSlice
     }
   deriving (Eq, Ord, Show, Typeable)
 
+instance IntSized StringSlice where { intSize = sliceLength; }
+
 instance Structured PatternMatch where
   toStruct = \ case
-    PatternNoMatch   -> ObjFalse
-    PatternMatch vec -> if Vec.null vec then ObjTrue else ObjList $ toStruct <$> vec
-  parseStruct = \ case
-    ObjFalse    -> PatternNoMatch
-    ObjTrue     -> PatternMatch Vec.empty
-    ObjList vec -> parseListWith vec $ scanElems (MVec.new (intSize vec)) $ \ vec i o ->
-      vec >>= \ v -> MVec.write v i o >> return (i + 1, v)
-    _           -> empty
+    PatternNoMatch i -> ObjList $ Vec.fromListN 3
+      [ObjAtom _pat_match, ObjFalse, ObjInt $ toInteger i]
+    PatternMatch vec -> ObjList $ Vec.fromListN (2 + Vec.length vec) $
+      [ObjAtom _pat_match, ObjTrue] ++ (toStruct <$> Vec.toList vec)
+  parseStruct = parseList $ annotateParse "pattern-match-result" $ do
+    takeAtom $ guard . (== _pat_match)
+    bool <- takeStruct $ structRequire "boolean indicating whether pattern matched" parseStruct
+    if bool then takeSliceToEnd $ do
+        n <- getStructLength
+        PatternMatch . Vec.fromListN n <$> many (takeElem pure)
+      else do
+        skip <- takeStruct $
+          structRequire "integer indicating number of characters to skip" parseStruct
+        (takeEndOfList >> return (PatternNoMatch skip)) <|>
+          fail "too many items for (matched? false ...) constructor"
+
+_pat_match :: Atom
+_pat_match = read "matched?"
 
 instance Structured Captured where
   toStruct = ObjList . Vec.fromList . \ case
     Captured          slice -> capturedSliceToList slice
     CapturedNamed lbl slice -> ObjString lbl : capturedSliceToList slice
-  fromStruct = parseList $ do
+  parseStruct = parseList $ do
     lbl <- optional $ takeString pure
-    off <- takeInt pure
+    off <- takeInt $ pure . fromInteger
     str <- takeString pure
     let slice = StringSlice
           { sliceOffset = off
           , sliceLength = Strict.length str
           , sliceString = str
           }
-    maybe (Captured slice) (flip CapturedName slice) lbl
+    return $ maybe (Captured slice) (flip CapturedNamed slice) lbl
 
 capturedSliceToList :: StringSlice -> [Struct]
 capturedSliceToList s = let off = sliceOffset s in
-  [ ObjInt off
+  [ ObjInt $ toInteger off
   , ObjString $ Strict.take (sliceLength s) $ Strict.drop off $ sliceString s
   ]
 
-instance Structured SliceString where
+instance Structured StringSlice where
   toStruct s = ObjList $ Vec.fromList
-    [ObjInt $ sliceLength s, ObjString $ sliceString]
+    [ ObjAtom _str_slice
+    , objInt $ sliceOffset s
+    , objInt $ sliceLength s
+    , objString $ sliceString s
+    ]
+  parseStruct = parseList $ do
+    takeAtom $ guard . (== _str_slice)
+    off <- takeElem pure
+    len <- takeElem pure
+    str <- takeElem pure
+    return StringSlice
+      { sliceOffset = off
+      , sliceLength = len
+      , sliceString = str
+      }
+
+_str_slice :: Atom
+_str_slice = read "slice"
 
 instance ToStrictBytes StringSlice where
   toStrictBytes s = Strict.take (sliceLength s) $ Strict.drop (sliceOffset s) $ sliceString s
@@ -233,8 +271,8 @@ instance ToStrictBytes Captured where { toStrictBytes = toStrictBytes . captured
 
 instance Semigroup PatternMatch where
   a <> b = case (a, b) of
-    (PatternNoMatch, PatternNoMatch) -> PatternNoMatch
-    _                                -> PatternMatch $ matchVector a <> matchVector b
+    (PatternNoMatch a, PatternNoMatch b) -> PatternNoMatch $ max a b
+    _                                    -> PatternMatch $ matchVector a <> matchVector b
   sconcat = PatternMatch . sconcat . fmap matchVector
 
 instance Monoid PatternMatch where
@@ -246,7 +284,7 @@ instance Monoid PatternMatch where
 matchVector :: PatternMatch -> Vec.Vector Captured
 matchVector = \ case
   PatternMatch vec -> vec
-  PatternNoMatch   -> Vec.empty
+  PatternNoMatch{} -> Vec.empty
 
 ----------------------------------------------------------------------------------------------------
 
@@ -284,8 +322,8 @@ instance Monoid       ExactString where
 
 instance Structured ExactString where
   toStruct (ExactString str) = ObjList $ Vec.fromList
-    [ObjAtom fromJust (toAtom "exact"), ObjString str]
-  fromStruct = parseList $ do
+    [ObjAtom $ fromJust $ toAtom "exact", ObjString str]
+  parseStruct = parseList $ do
     takeAtom (\ a -> guard (fromJust (toAtom "exact") == a) >> pure a)
     takeString (pure . ExactString)
 
@@ -299,10 +337,10 @@ instance StringPattern ExactString where
             Match              -> PatternMatch mempty
             Capture            -> match Captured
             CaptureNamed label -> match $ CapturedNamed label
-            _                  -> PatternNoMatch
+            _                  -> PatternNoMatch (error "TODO: how many things to skip")
     else  case capt of
             NoMatch            -> PatternMatch mempty
-            _                  -> PatternNoMatch
+            _                  -> PatternNoMatch (error "TODO: how many things to skip")
   findSubstringFrom = findExactSubstringFrom
 
 ----------------------------------------------------------------------------------------------------
@@ -496,7 +534,7 @@ cmp (cmpstr, cmp) lblA a lblB b = " (" ++
 -- table.
 findExactSubstringFrom :: Capture -> ExactString -> Offset -> StrictBytes -> PatternMatch
 findExactSubstringFrom capt (ExactString pat) offset str =
-  if offset < 0 then noMatch else loop offset where
+  if offset < 0 then noMatch (abs offset) else loop offset where
     --index  = Strict.unsafeIndex else Strict.index
     index  = Strict.index
     strlen = Strict.length str
@@ -517,21 +555,21 @@ findExactSubstringFrom capt (ExactString pat) offset str =
       let { s = s0 - 1; p = p0 - 1; cS = index str s; cP = index pat p } in
       tr ("suffix:" ++ cmp eq ("str["++show s++"]") cS ("pat["++show p++"]") cP) $
       if cP == cS then suffix offset p s else Left $ shift p cS p
-    noMatch          = case capt of
+    noMatch minoffset = case capt of
       NoMatch                  -> PatternMatch mempty
       CaptureNoMatch           -> strmatch Captured offset
       CaptureNamedNoMatch name -> strmatch (CapturedNamed name) offset
-      _                        -> PatternNoMatch
+      _                        -> PatternNoMatch minoffset
     loop      offset =
       let strtop = offset + patlen in
       tr ("loop" ++ val "offset" offset ++ cmp gt "strtop" strtop "strlen" strlen) $
-      if strtop > strlen then noMatch else case suffix offset patlen strtop of
+      if strtop > strlen then noMatch strlen else case suffix offset patlen strtop of
         Left  i  -> tr ("loop <- Left "++show i) $ loop $ offset + i
         Right () -> case capt of
           Match             -> PatternMatch mempty
           Capture           -> strmatch Captured offset
           CaptureNamed name -> strmatch (CapturedNamed name) offset
-          _                 -> PatternNoMatch
+          _                 -> PatternNoMatch 1
 
 -- | Temporary test.
 tempTest :: IO ()
@@ -545,17 +583,17 @@ tempTest = mapM_ check tests where
       "in "++show haystack++" find "++show needle++" -> "++
       if pass then "OK" else
       "FAIL\nexpected = "++show expected++"\n  result = "++show result
-  noMatch _str _pat = PatternNoMatch
+  noMatch i _str _pat = PatternNoMatch i
   match i str pat = PatternMatch $ Vec.singleton $ Captured (StringSlice i (Strict.length pat) str)
   tests =
     [ ("", "", match 0)
     , ("a", "a", match 0)
-    , ("a", "b", noMatch)
+    , ("a", "b", noMatch 1)
     , ("a", "", match 0)
-    , ("", "a", noMatch)
+    , ("", "a", noMatch 0)
     , ("ab", "a", match 0)
     , ("ab", "b", match 1)
-    , ("ab", "c", noMatch)
+    , ("ab", "c", noMatch 1)
     , ("ab", "", match 0)
     , ("abc", "a", match 0)
     , ("abc", "b", match 1)
@@ -563,12 +601,12 @@ tempTest = mapM_ check tests where
     , ("abc", "ab", match 0)
     , ("abc", "bc", match 1)
     , ("abc", "abc", match 0)
-    , ("abc", "xbc", noMatch)
-    , ("abc", "abx", noMatch)
-    , ("abc", "ax", noMatch)
-    , ("abc", "xb", noMatch)
-    , ("abc", "xc", noMatch)
-    , ("abc", "x", noMatch)
+    , ("abc", "xbc", noMatch 3)
+    , ("abc", "abx", noMatch 1)
+    , ("abc", "ax", noMatch 1)
+    , ("abc", "xb", noMatch 2)
+    , ("abc", "xc", noMatch 2)
+    , ("abc", "x", noMatch 1)
     , ("aaaabaaa", "abaaa", match 3)
     , ("abcdefghijklmno", "hijkl", match 7)
     , ("abcdeabcdeabcdef", "abcdef", match 10)
