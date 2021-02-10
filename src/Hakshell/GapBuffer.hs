@@ -16,6 +16,7 @@ module Hakshell.GapBuffer
     UnsafeSlice, readSlice, writeSlice, safeFreeze, safeClone, mutableCopy, safeCopy,
     sliceSize, sliceIndiciesReverse, sliceIndiciesForward,
     withFullSlices, withRegion, withNewVector, copyRegion,
+    insertAtEnd, insertElemAtEnd, deleteFromEnd,
     putElemIndex, putElem, getElem, delElem,
     pushElem, pushElemVec, pushSlice, popElem,
     moveCursorBy, moveCursorTo, moveCursorNear,
@@ -283,16 +284,35 @@ newtype UnsafeSlice vec = UnsafeSlice { unwrapUnsafeSlice :: vec }
 sliceSize :: (vec -> Int) -> UnsafeSlice vec -> VecLength
 sliceSize length (UnsafeSlice vec) = VecLength $ length vec
 
+-- | Return a list of indicies that can be used to iterate over each index of the 'UnsafeSlice' from
+-- the __first__ index to the __last__.
 sliceIndiciesForward :: (UnsafeSlice vec -> VecLength) -> UnsafeSlice vec -> [VecIndex]
 sliceIndiciesForward sliceSize vec = [0 .. indexAtRangeEnd 0 (sliceSize vec)]
 
+-- | Return a list of indicies that can be used to iterate over each index of the 'UnsafeSlice' from
+-- the __last__ index to the __first__.
 sliceIndiciesReverse :: (UnsafeSlice vec -> VecLength) -> UnsafeSlice vec -> [VecIndex]
 sliceIndiciesReverse sliceSize vec = takeWhile (>= 0) $
   iterate (subtract 1) (indexAtRangeEnd 0 $ sliceSize vec)
 
+-- | Slice an 'UnsafeSlice' even further by trimming elements from the beginning of the slice (if
+-- the argument is positive) or from the end of the slice (if the argument is negative). The trimmed
+-- slice is __not__ cloned. Bounds are __not__ checked.
+trimSlice
+  :: GMVec.MVector mvec elem
+  => VecLength
+  -> UnsafeSlice (mvec st elem)
+  -> UnsafeSlice (mvec st elem)
+trimSlice (VecLength size) (UnsafeSlice mvec) =
+  UnsafeSlice $
+  ( if size < 0 then GMVec.unsafeSlice 0
+    else if size > 0 then GMVec.unsafeSlice size
+    else flip const
+  ) (GMVec.length mvec - abs size) mvec
+
 safeFreeze
-  :: (PrimMonad m, GVec.Vector vec elem)
-  => UnsafeSlice (GVec.Mutable vec (PrimState m) elem) -> m (vec elem)
+  :: (PrimMonad m, PrimState m ~ st, GVec.Vector vec elem)
+  => UnsafeSlice (GVec.Mutable vec st elem) -> m (vec elem)
 safeFreeze (UnsafeSlice vec) = GVec.freeze vec
 
 readSlice
@@ -376,7 +396,7 @@ class Monad m => MonadVectorCursor vec m | m -> vec where
   modCount  :: RelativeToCursor -> (VecLength -> VecLength) -> m VecLength
   -- | Isolate a sub-vector within the current vector using 'GMVec.slice' or 'GVec.slice'.
   sliceVector
-    :: (vec -> UnsafeSlice vec)
+    :: (vec -> UnsafeSlice vec) -- TODO: if class only used internally, this arg isn't needed
     -> VecIndex -> VecLength
     -> m (UnsafeSlice vec)
   -- | Create a deep-copy of the @vec@. This function should just point to one of the various
@@ -384,7 +404,9 @@ class Monad m => MonadVectorCursor vec m | m -> vec where
   cloneVector :: vec -> m vec
   -- | Create a new vector and copy each of the given slices to the new vector, one after the other.
   appendVectors :: vec -> vec -> m vec
+  -- | Throw an exception indicating that a pop or cursor motion has gone past the end of the array.
   throwLimitErr :: RelativeToCursor -> m void
+  -- | Get the element at the given index.
   getElemIndex :: VecIndex -> m (ReadVecElem vec)
   -- | Move the cursor, In the case of 'GapBuffer', which instantiates this typeclass, elements in
   -- the vector are shifted around the vector using an algorithm of O(n) steps, where @n@ is the
@@ -552,22 +574,28 @@ getVoid = do
 
 -- | Make a slice of elements relative to the current cursor. A negative argument will take elements
 -- before and up-to the cursor, a positive argument will take that many elements starting from
--- 'getLineAfterCur'. Pass a boolean value indicating whether or not you would like to perform
+-- 'indexAfterRange'. Pass a boolean value indicating whether or not you would like to perform
 -- bounds checking, if so an exception will be raised if the line index goes out of bounds.
 sliceFromCursor
   :: MonadVectorCursor vec m
   => VecLength -> m (UnsafeSlice vec)
 sliceFromCursor count =
-  if count < 0 then writingIndex Before >>=
-    flip sliceVectorSafe (abs count) . flip indexAfterRange count
-  else if count > 0 then writingIndex After >>= flip sliceVectorSafe count
-  else sliceVectorSafe 0 0
+  if count < 0 then
+    writingIndex Before >>=
+    flip sliceVectorSafe (abs count) .
+    flip indexAfterRange count
+  else if count > 0 then
+    writingIndex After >>=
+    flip sliceVectorSafe count
+  else
+    sliceVectorSafe 0 0
 
 -- | Create a slice between two indicies, creating a clone array with the content of the slice. The
 -- slice is never empty because if both indicies are the same, a vector containing that single
 -- element at that index is returned.
 sliceBetween :: MonadVectorCursor vec (GapBuffer vec m) => VecIndex -> VecIndex -> GapBuffer vec m vec
-sliceBetween from = sliceVectorSafe from . indexRange from >=>
+sliceBetween from =
+  sliceVectorSafe from . indexRange from >=>
   cloneVector . unwrapUnsafeSlice
 
 -- | Like 'sliceBetween' but does not create a clone of the vector, so the returned vector is unsafe
@@ -587,12 +615,19 @@ withVoidSlice
   => VecLength
   -> (UnsafeSlice vec -> m ())
   -> m Bool
-withVoidSlice count f = getVoid >>= maybe (pure False) cont where
-  cont (lo, hi) = do
-    if count >= 0 then sliceVectorSafe lo count >>= f else
-      sliceVectorSafe (indexAfterRange hi count) (negate count) >>= f
-    return True
+withVoidSlice count f =
+  getVoid >>=
+  maybe (pure False)
+  ( fmap (const True) . \ (lo, hi) ->
+    uncurry sliceVectorSafe
+    ( if count >= 0
+      then (lo, count)
+      else (indexAfterRange hi count, negate count)
+    ) >>= f
+  )
 
+-- | Convert a 'RelativeToCursor' argument into a slice of the current vector containing all
+-- elements that are either 'Before' or 'After' the cursor.
 getSlice
   :: (PrimMonad m, MonadVectorCursor vec (GapBuffer vec m))
   => RelativeToCursor -> GapBuffer vec m (UnsafeSlice vec)
@@ -605,20 +640,21 @@ getLoSlice
   => m (UnsafeSlice vec)
 getLoSlice = modCount Before id >>= sliceFromCursor . negate
 
--- | Obtain a slice (using 'sliceFromCursorM') for the portion of the vector containing elements
+-- | Obtain a slice (using 'sliceFromCursor') for the portion of the vector containing elements
 -- after the current cursor.
 getHiSlice
   :: MonadVectorCursor vec m
   => m (UnsafeSlice vec)
 getHiSlice = modCount After id >>= sliceFromCursor
 
--- | Given a region, slice the vector to the region and evaluate one of two given continuations with
--- the slice. If the region spans the gap in the buffer, the first continuation is called. If the
--- region is fully contained to within either sub region on either side of the gap, then the second
--- continuation function is called.
+-- | Given a region, cut two slices from the current vector: first the elements starting from the
+-- first index argument up to the cursor, and second, the elements after the cursor and up to the
+-- second index argument. If both the first and second index arguments are __before__ the cursor,
+-- the second slice is empty. If both the first and second index arguments are __after__ the cursor,
+-- the first slice is empty. Then, evaluate the given continuations with both slices.
 --
--- Note that it is assumed the given 'VecIndex' values are already bounds checked absolute indicies
--- into the index. If these values are wrong, you may receive slices with undefined elements.
+-- __WARNING:__ no bounds checking is performed by this function, it is to be called only by other
+-- functions that have performed bounds checking.
 withRegion
   :: MonadVectorCursor vec m
   => VecIndex -> VecIndex
@@ -636,7 +672,11 @@ withRegion from0 to0 f =
     aft <- writingIndex After
     safeSliceBetween from bef $ safeSliceBetween aft to . f
 
--- | Similar to 'withRegion' but operates on the entire defined region of the buffer.
+-- | Construct two slices, one for each end of the current 'GapBuffer', and then evaluate the
+-- continuation with both slices. The first slice is all elements up to just before the cursor, the
+-- second slice is all elements from the end of the buffer containing the number of defined elements
+-- after the cursor. This is equivalent to evaluating @'join' $ f <$> 'getLoSlice' <*> 'getHiSlice'@
+-- where 'f' is the continuation.
 withFullSlices
   :: MonadVectorCursor vec m
   => (UnsafeSlice vec -> UnsafeSlice vec -> m a)
@@ -664,6 +704,93 @@ withNewVector size f = do
   modCount After  (const after )
   modVector (const oldvec)
   return newvec
+
+-- | Shift the elements from one far end of the 'GapBuffer' toward the gap such that space is opened
+-- up at the far end of the buffer (reallocate the buffer as needed), and slice the 'GapBuffer' at
+-- the far end where there is now space available and evaluate the given continuation with that
+-- slice of the buffer.
+insertAtEndWith
+  :: (PrimMonad m, PrimState m ~ st, GMVec.MVector mvec elem,
+      HasNullValue elem, MonadVectorCursor (mvec st elem) (GapBuffer (mvec st elem) m)
+     )
+  => VecLength -> (UnsafeSlice (mvec st elem) -> m ()) -> GapBuffer (mvec st elem) m ()
+insertAtEndWith size write =
+  countUndefined >>= \ available ->
+  when (abs size > available) (growVector $ abs size - available) >>
+  if size < 0 then do
+    src <- getHiSlice
+    modCount After (+ (negate size))
+    targ <- getHiSlice
+    lift $ do
+      mutableMove (trimSlice size targ) src
+      write $ trimSlice (sliceSize GMVec.length src) targ
+  else if size > 0 then do
+    src <- getLoSlice
+    modCount Before (+ size)
+    targ <- getLoSlice
+    lift $ do
+      mutableMove (trimSlice size targ) src
+      write $ trimSlice (negate $ sliceSize GMVec.length src) targ
+  else
+    return ()
+
+-- | Copy an immutable vector to a space opened up at either end of the 'GapBuffer'. This does shift
+-- elements toward the gap and is generally much less inefficient than using the cursor properly,
+-- and so this function should be avoided. The reason it exists is that to implement this operation,
+-- a naive solution would be to shift the cursor around twice: shift the cursor to the end, then
+-- copy the elements, and then shift back to where it was. The algorithm implemented by this
+-- function requires only one shift operation and does not move the cursor. Therefore, although this
+-- operation should generally be avoided, it might still end up being used often enough that the
+-- time saved becomes significant.
+insertAtEnd
+  :: (PrimMonad m, PrimState m ~ st,
+      GVec.Vector vec elem, GMVec.MVector mvec elem, GVec.Mutable vec ~ mvec,
+      HasNullValue elem, MonadVectorCursor (mvec st elem) (GapBuffer (mvec st elem) m)
+     )
+  => RelativeToCursor -> vec elem -> GapBuffer (mvec st elem) m ()
+insertAtEnd rel src =
+  insertAtEndWith
+  ((case rel of { Before -> id; After -> negate; }) $ VecLength $ GVec.length src)
+  (flip safeCopy $ UnsafeSlice src)
+
+-- | Like 'insertAtEnd' but only for a single element.
+insertElemAtEnd
+  :: (PrimMonad m, PrimState m ~ st,
+      GVec.Vector vec elem, GMVec.MVector mvec elem, GVec.Mutable vec ~ mvec,
+      HasNullValue elem, MonadVectorCursor (mvec st elem) (GapBuffer (mvec st elem) m)
+     )
+  => RelativeToCursor -> elem -> GapBuffer (mvec st elem) m ()
+insertElemAtEnd rel elem =
+  insertAtEndWith
+  (case rel of { Before -> 1; After -> -1; })
+  (\ (UnsafeSlice targ) -> GMVec.write targ 0 elem)
+
+-- | Delete a number of elements from the one of the ends of the buffer. Negative indicates deleting
+-- from the upper end of the buffer, positive indicates deleting from the lower end of the buffer.
+deleteFromEnd
+  :: (PrimMonad m, PrimState m ~ st, GMVec.MVector mvec elem,
+      MonadVectorCursor (mvec st elem) (GapBuffer (mvec st elem) m)
+     )
+  => VecLength -> GapBuffer (mvec st elem) m ()
+deleteFromEnd size =
+  if size < 0 then
+    getHiSlice >>= \ big ->
+    if sliceSize GMVec.length big < size then
+      writingIndex After >>=
+      throwError .
+      flip BufferIndexRange size
+    else
+      lift $ mutableMove (trimSlice size big) (trimSlice (negate size) big)
+  else if size > 0 then
+    getLoSlice >>= \ big ->
+    if sliceSize GMVec.length big < size then
+      writingIndex Before >>=
+      throwError .
+      flip BufferIndexRange (negate size)
+    else
+      lift $ mutableMove (trimSlice (negate size) big) (trimSlice size big)
+  else
+    return ()
 
 -- | Select a region of valid elements given an index and size values, taking into account the
 -- position of the cursor, and copy the region into a new contiguous mutable vector that contains no

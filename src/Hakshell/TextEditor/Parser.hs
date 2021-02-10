@@ -108,58 +108,72 @@ module Hakshell.TextEditor.Parser
     module Text.Parser.Token
   ) where
 
-import           Hakshell.String
+import           Hakshell.String (StrictBytes, pack)
 import           Hakshell.TextEditor
+                 ( TextLocation, TextLine, EditText, TextBuffer, currentBuffer,
+                   StreamCursor, theStreamLocation, theStreamEndpoint, theStreamCache,
+                   newStreamCursorRange, streamCommitTags, streamResetCache, streamResetEndpoint,
+                   streamTags, streamStep, streamLook, streamGoto, streamIsEOL, streamIsEOF
+                 )
 
-import           Control.Applicative
-import           Control.Lens
-import           Control.Monad.Except
-import           Control.Monad.Fail
-import           Control.Monad.State
+import           Control.Applicative (Applicative((<*>), pure), Alternative((<|>), empty))
+import           Control.Lens ((&), (%~), (.~), (^.), (.=), Lens', lens, use, assign)
+import           Control.Monad ((>=>), MonadPlus(mplus, mzero), when)
+import           Control.Monad.Error.Class (MonadError(throwError, catchError))
+import           Control.Monad.Fail (MonadFail(fail))
+import           Control.Monad.Primitive (PrimMonad)
+import           Control.Monad.State (StateT(runStateT), gets, modify)
+import           Control.Monad.State.Class (MonadState(state, get))
+import           Control.Monad.Trans.Class (MonadTrans(lift))
 
-import           Text.Parser.Char
-import           Text.Parser.Combinators
-import           Text.Parser.LookAhead
-import           Text.Parser.Token
+import           Text.Parser.Char (CharParsing(satisfy, anyChar))
+import           Text.Parser.Combinators (Parsing((<?>), try, unexpected, notFollowedBy, eof))
+import           Text.Parser.LookAhead (LookAheadParsing(lookAhead))
+import           Text.Parser.Token (TokenParsing())
 
 ----------------------------------------------------------------------------------------------------
 
 -- | This is the data type containing the context of all functions of type 'Parser'. Although you
 -- cannot inspect or modify this data type directly, you can do so indirectly by using 'parserGet',
 -- 'parserUse', or 'parserModify' along with functions like 'thePosition', 'theCurrentLine', or
--- 'currentTags'.
-data ParserState mvar tags fold
+-- 'currentTags'. The 'ParserState' contains a 'TextBuffer', so the type variables @m@ and @tags@
+-- are passed to the 'TextBuffer' data type. There is also a @fold@ type variable which you can
+-- instantiate with any type at all, but it is typically used to hold stateful information specific
+-- to a 'Parser' that might be necessary for defining a parsing function for a programming language.
+data ParserState m tags fold
   = ParserState
-    { theParBuffer    :: !(TextBuffer mvar tags)
+    { theParBuffer    :: !(TextBuffer m tags)
     , theParStream    :: !(StreamCursor tags)
     , theParName      :: !StrictBytes
     , theParUserState :: !fold
     }
+  deriving Functor
 
---parserBuffer :: Lens' (ParserState tags fold) (TextBuffer tags)
+
+--parserBuffer :: Lens' (ParserState m tags fold) (TextBuffer m tags)
 --parserBuffer = lens theParBuffer $ \ a b -> a{ theParBuffer = b }
 
-parserStream :: Lens' (ParserState tags fold) (StreamCursor tags)
+parserStream :: Lens' (ParserState m tags fold) (StreamCursor tags)
 parserStream = lens theParStream $ \ a b -> a{ theParStream = b }
 
-parserUserState :: Lens' (ParserState tags fold) fold
+parserUserState :: Lens' (ParserState m tags fold) fold
 parserUserState = lens theParUserState $ \ a b -> a{ theParUserState = b }
 
-parserName :: Lens' (ParserState tags fold) StrictBytes
+parserName :: Lens' (ParserState m tags fold) StrictBytes
 parserName = lens theParName $ \ a b -> a{ theParName = b }
 
 ----------------------------------------------------------------------------------------------------
 
 -- | This is the internal control structure for a 'Parser' function type. After evaluating a
 -- 'Parser' function, the result of parsing is expressed as a value of this type.
-data ParStep tags fold m a
+data ParStep fold tags m a
   = Backtrack
   | ParSuccess a
-  | ParWaiting !(ParserState tags fold) (Parser tags fold m a)
-  | ParError   !(ParserState tags fold) !StrictBytes
+  | ParWaiting !(ParserState m tags fold) (Parser fold tags m a)
+  | ParError   !(ParserState m tags fold) !StrictBytes
   deriving Functor
 
-instance Monad m => Applicative (ParStep tags fold m) where
+instance Monad m => Applicative (ParStep fold tags m) where
   pure = ParSuccess
   a <*> b = case a of
     Backtrack                 -> Backtrack
@@ -171,11 +185,11 @@ instance Monad m => Applicative (ParStep tags fold m) where
     ParWaiting st0 (Parser a) -> ParWaiting st0 $ Parser $ (<*> b) <$> a
     ParError   err  msg       -> ParError err msg
 
-instance Monad m => Alternative (ParStep tags fold m) where
+instance Monad m => Alternative (ParStep fold tags m) where
   empty = Backtrack
   a <|> b = case a of { Backtrack -> b; a -> a; }
 
-instance Monad m => Monad (ParStep tags fold m) where
+instance Monad m => Monad (ParStep fold tags m) where
   return = pure
   (>>=) = \ case
     Backtrack                 -> const Backtrack
@@ -183,7 +197,7 @@ instance Monad m => Monad (ParStep tags fold m) where
     ParWaiting  st (Parser a) -> \ f -> ParWaiting st $ Parser $ (>>= f) <$> a
     ParError    err      msg  -> const $ ParError err msg
 
-instance Monad m => MonadPlus (ParStep tags fold m) where { mzero = empty; mplus = (<|>); }
+instance Monad m => MonadPlus (ParStep fold tags m) where { mzero = empty; mplus = (<|>); }
 
 ----------------------------------------------------------------------------------------------------
 
@@ -192,21 +206,21 @@ instance Monad m => MonadPlus (ParStep tags fold m) where { mzero = empty; mplus
 -- instantiates the 'Parsing' typeclass, so you should define parsers using the 'Parsing' typeclass
 -- APIs, and then evaluate these parsers on a 'TextBuffer' to extract information about the text in
 -- the 'TextBuffer' using the 'execParser' function.
-newtype Parser tags fold m a
+newtype Parser fold tags m a
   = Parser
-    { unwrapParser :: StateT (ParserState tags fold) (EditText tags m) (ParStep tags fold m a)
+    { unwrapParser :: StateT (ParserState m tags fold) (EditText tags m) (ParStep fold tags m a)
     }
   deriving Functor
 
-instance Monad m => Applicative (Parser tags fold m) where
+instance Monad m => Applicative (Parser fold tags m) where
   pure = Parser . return . pure
   (Parser a) <*> (Parser b) = Parser $ (<*>) <$> a <*> b
 
-instance Monad m => Alternative (Parser tags fold m) where
+instance Monad m => Alternative (Parser fold tags m) where
   empty = Parser $ return empty
   (Parser a) <|> (Parser b) = Parser $ (<|>) <$> a <*> b
 
-instance Monad m => Monad (Parser tags fold m) where
+instance Monad m => Monad (Parser fold tags m) where
   return = pure
   (Parser a) >>= f = Parser $ a >>= \ case
     Backtrack        -> return Backtrack
@@ -214,9 +228,9 @@ instance Monad m => Monad (Parser tags fold m) where
     ParWaiting  st a -> return $ ParWaiting st $ a >>= f
     ParError err msg -> return $ ParError err msg
 
-instance Monad m => MonadPlus (Parser tags fold m) where { mzero = empty; mplus = (<|>); }
+instance Monad m => MonadPlus (Parser fold tags m) where { mzero = empty; mplus = (<|>); }
 
-instance Monad m => MonadError StrictBytes (Parser tags fold m) where
+instance Monad m => MonadError StrictBytes (Parser fold tags m) where
   throwError msg = Parser $ flip ParError msg <$> get
   catchError (Parser try) catch = Parser $ try >>= \ case
     Backtrack       -> return Backtrack
@@ -224,10 +238,10 @@ instance Monad m => MonadError StrictBytes (Parser tags fold m) where
     ParWaiting st a -> return $ ParWaiting st $ catchError a catch
     ParError  _ msg -> unwrapParser $ catch msg
 
-instance Monad m => MonadFail (Parser tags fold m) where
+instance Monad m => MonadFail (Parser fold tags m) where
   fail = throwError . pack
 
-instance Monad m => MonadState fold (Parser tags fold m) where
+instance Monad m => MonadState fold (Parser fold tags m) where
   state f = Parser $ state $ \ st ->
     let (a, ust) = f (st ^. parserUserState) in (ParSuccess a, st & parserUserState .~ ust)
 
@@ -235,10 +249,10 @@ instance Monad m => MonadState fold (Parser tags fold m) where
 -- EOF is set to the second 'TextLocation'. Note that this function must be evaluated within an
 -- 'EditText' type of function.
 newParserStateRange
-  :: (MonadIO m
+  :: (PrimMonad m
      , Show tags --DEBUG
      )
-  => TextLocation -> TextLocation -> fold -> EditText tags m (ParserState tags fold)
+  => TextLocation -> TextLocation -> fold -> EditText tags m (ParserState m tags fold)
 newParserStateRange start end fold = do
   buf    <- currentBuffer
   stream <- newStreamCursorRange start end
@@ -252,10 +266,10 @@ newParserStateRange start end fold = do
 -- | Similar to 'newParserStateRange', but conveniently passes 'minBound' and 'maxBound' as the
 -- start and end points.
 newParserState
-  :: (MonadIO m
+  :: (PrimMonad m
      , Show tags --DEBUG
      )
-  => fold -> EditText tags m (ParserState tags fold)
+  => fold -> EditText tags m (ParserState m tags fold)
 newParserState = newParserStateRange minBound maxBound
 
 -- | This function does nothing for you, apart from simply evaluating a 'Parser' function. You would
@@ -266,93 +280,100 @@ newParserState = newParserStateRange minBound maxBound
 -- Evaluates 'newParserState' and then evaluates 'resumeParser' with the new parser state and the
 -- given 'Parser' function.
 runParser
-  :: (MonadIO m
+  :: (PrimMonad m
      , Show tags --DEBUG
      )
-  => TextLocation -> TextLocation -> Parser tags fold m a -> fold
-  -> EditText tags m (ParStep tags fold m a, ParserState tags fold)
+  => TextLocation -> TextLocation -> Parser fold tags m a -> fold
+  -> EditText tags m (ParStep fold tags m a, ParserState m tags fold)
 runParser start end p = newParserStateRange start end  >=> parserResume p
 
 -- | Similar to 'runParser' but throws away the 'ParserState' and only provides the 'ParStep'
 -- result.
 evalParser 
-  :: (MonadIO m
+  :: (PrimMonad m
      , Show tags --DEBUG
      )
-  => TextLocation -> TextLocation -> Parser tags fold m a
-  -> fold -> EditText tags m (ParStep tags fold m a)
+  => TextLocation -> TextLocation -> Parser fold tags m a
+  -> fold -> EditText tags m (ParStep fold tags m a)
 evalParser start end p = fmap fst . runParser start end p
 
 -- not for export
 parseBufferRange'
-  :: (MonadIO m
+  :: (PrimMonad m
      , Show tags
      )
-  => TextLocation -> TextLocation -> Maybe (ParserState tags fold -> tags -> tags)
-  -> Parser tags fold m a -> fold
-  -> EditText tags m (ParStep tags fold m a, fold)
+  => TextLocation -> TextLocation -> Maybe (ParserState m tags fold -> tags -> tags)
+  -> Parser fold tags m a -> fold
+  -> EditText tags m (ParStep fold tags m a, fold)
 parseBufferRange' start end updateTags par fold = do
   st <- newParserStateRange start end fold
   let start = theStreamLocation $ theParStream st
   parserResume (parserGoto start >> par) st >>= fmap (fmap theParUserState) . loop
   where
-    loop result@(status, st) = let s = theParStream st in
-      if theStreamLocation s >= theStreamEndpoint s then return result else case status of
+    loop result@(status, st) =
+      let s = theParStream st in
+      if theStreamLocation s >= theStreamEndpoint s then
+        return result
+      else case status of
         ParWaiting st par ->
           ( flip parserResume st
-              (do maybe (pure ()) (\ upd -> parserModify $ currentTags %~ upd st) updateTags
-                  parserStep
-                  par
-              )
-          ) >>= loop
+            ( maybe
+              (pure ())
+              (\ upd -> parserModify $ currentTags %~ upd st)
+              updateTags >>
+              parserStep >>
+              par
+            )
+          ) >>=
+          loop
         status            -> return (status, st)
 {-# INLINE parseBufferRange' #-}
 
 parseBufferRange
-  :: (MonadIO m
+  :: (PrimMonad m
      , Show tags
      )
   => TextLocation -- ^ The point in the 'TextBuffer' at which to begin parsing
   -> TextLocation -- ^ The point in the 'TextBuffer' at which to end parsing
-  -> (ParserState tags fold -> tags -> tags) -- ^ A function to update the @tags@ with a 'ParStep'
-  -> Parser tags fold m a -- ^ The parser function to run on the above range.
+  -> (ParserState m tags fold -> tags -> tags) -- ^ A function to update the @tags@ with a 'ParStep'
+  -> Parser fold tags m a -- ^ The parser function to run on the above range.
   -> fold -- ^ An arbitrary state value that can be updated at any time during parsing.
-  -> EditText tags m (ParStep tags fold m a, fold)
+  -> EditText tags m (ParStep fold tags m a, fold)
 parseBufferRange start end updateTags = parseBufferRange' start end (Just updateTags)
 
 -- | Calls the 'parserBufferRange' function with 'minBound' and 'maxBound', effectively using the
 -- whole buffer as the range of text to parse.
 parseBuffer
-  :: (MonadIO m
+  :: (PrimMonad m
      , Show tags
      )
-  => (ParserState tags fold -> tags -> tags)
-  -> Parser tags fold m a -> fold
-  -> EditText tags m (ParStep tags fold m a, fold)
+  => (ParserState m tags fold -> tags -> tags)
+  -> Parser fold tags m a -> fold
+  -> EditText tags m (ParStep fold tags m a, fold)
 parseBuffer = parseBufferRange minBound maxBound
 
 -- | Same as 'parseBufferRange' but does not bother updating the @tags@ after parsing each
 -- 'TextLine' in the 'TextBuffer'.
 parseBufferRangeNoTags
-  :: (MonadIO m
+  :: (PrimMonad m
      , Show tags
      )
   => TextLocation -- ^ The point in the 'TextBuffer' at which to begin parsing
   -> TextLocation -- ^ The point in the 'TextBuffer' at which to end parsing
-  -> Parser tags fold m a -- ^ The parser function to run on the above range.
+  -> Parser fold tags m a -- ^ The parser function to run on the above range.
   -> fold -- ^ An arbitrary state value that can be updated at any time during parsing.
-  -> EditText tags m (ParStep tags fold m a, fold)
+  -> EditText tags m (ParStep fold tags m a, fold)
 parseBufferRangeNoTags start end = parseBufferRange' start end Nothing
 
 -- | Same as 'parseBufferRange' but does not bother updating the @tags@ after parsing each
 -- 'TextLine' in the 'TextBuffer'.
 parseBufferNoTags
-  :: (MonadIO m
+  :: (PrimMonad m
      , Show tags
      )
-  => Parser tags fold m a -- ^ The parser function to run on the above range.
+  => Parser fold tags m a -- ^ The parser function to run on the above range.
   -> fold -- ^ An arbitrary state value that can be updated at any time during parsing.
-  -> EditText tags m (ParStep tags fold m a, fold)
+  -> EditText tags m (ParStep fold tags m a, fold)
 parseBufferNoTags  = parseBufferRangeNoTags minBound maxBound
 
 ----------------------------------------------------------------------------------------------------
@@ -360,41 +381,41 @@ parseBufferNoTags  = parseBufferRangeNoTags minBound maxBound
 -- | This function takes information from the 'ParserState' internal to the 'Parser' function
 -- context. Pass functions like 'thePosition' or 'theCurrentLine' as arguments to this function to
 -- obtain information.
-parserGet :: Monad m => (ParserState tags fold -> a) -> Parser tags fold m a
+parserGet :: Monad m => (ParserState m tags fold -> a) -> Parser fold tags m a
 parserGet = Parser . fmap ParSuccess . gets
 
 -- | Same as 'parserGet' but takes a 'Lens' parameter instead of a pure function.
-parserUse :: Monad m => Lens' (ParserState tags fold) a -> Parser tags fold m a
+parserUse :: Monad m => Lens' (ParserState m tags fold) a -> Parser fold tags m a
 parserUse = Parser . fmap ParSuccess . use
 
 -- | Like 'modify' but updates part of the 'ParserState' rather than the @fold@ed value.
 parserModify
   :: Monad m
-  => (ParserState tags fold -> ParserState tags fold) -> Parser tags fold m ()
+  => (ParserState m tags fold -> ParserState m tags fold) -> Parser fold tags m ()
 parserModify = Parser . fmap ParSuccess . modify
 
 -- | Pass this function to 'parserGet' to obtain the current position of the parser within the
 -- 'TextBuffer'.
-thePosition :: ParserState tags fold -> TextLocation
+thePosition :: ParserState m tags fold -> TextLocation
 thePosition = theStreamLocation . theParStream
 
 -- | Pass this function to 'parserGet' to obtain the current line being inspected by the parser.
-theCurrentLine :: Monad m => Parser tags fold m (TextLine tags)
+theCurrentLine :: Monad m => Parser fold tags m (TextLine tags)
 theCurrentLine = Parser $ ParSuccess . theStreamCache <$> use parserStream
 
 -- | This is a lens that can be used with 'parserModify' to alter the @tags@' for the current line.
-currentTags :: Lens' (ParserState tags fold) tags
+currentTags :: Lens' (ParserState m tags fold) tags
 currentTags = parserStream . streamTags
 
 ----------------------------------------------------------------------------------------------------
 
 -- | Lift a function that modifies a 'StreamCursor' within the lifted 'EditText' function context.
 liftCursorStreamState
-  :: (MonadIO m
+  :: (PrimMonad m
      , Show tags --DEBUG
      )
   => (StreamCursor tags -> EditText tags m (a, StreamCursor tags))
-  -> Parser tags fold m a
+  -> Parser fold tags m a
 liftCursorStreamState f = Parser $ do
   (a, fold) <- use parserStream >>= lift . f
   parserStream .= fold
@@ -403,40 +424,40 @@ liftCursorStreamState f = Parser $ do
 -- | Like 'liftCursorStreamState', but the lifted function only modifies the 'StreamCursor' and
 -- doesn't return any other value.
 liftCursorStreamModify
-  :: (MonadIO m
+  :: (PrimMonad m
      , Show tags --DEBUG
      )
   => (StreamCursor tags -> EditText tags m (StreamCursor tags))
-  -> Parser tags fold m ()
+  -> Parser fold tags m ()
 liftCursorStreamModify f = Parser $ use parserStream >>= lift . f >>=
   fmap ParSuccess . assign parserStream
 
 -- | Like 'liftCursorStreamGet', but the lifted function only modifies the 'StreamCursor' and
 -- doesn't return any other value.
 liftCursorStreamGet
-  :: (MonadIO m
+  :: (PrimMonad m
      , Show tags --DEBUG
      )
   => (StreamCursor tags -> EditText tags m a)
-  -> Parser tags fold m a
+  -> Parser fold tags m a
 liftCursorStreamGet f = Parser $ use parserStream >>= fmap ParSuccess . lift . f
 
 -- | Change the current position of the parser's cursor. This function lifts 'streamGoto'.
 parserGoto
-  :: (MonadIO m
+  :: (PrimMonad m
      , Show tags --DEBUG
      )
-  => TextLocation -> Parser tags fold m ()
+  => TextLocation -> Parser fold tags m ()
 parserGoto = (>>) parserResetCache .
   liftCursorStreamModify . flip streamGoto
 
 -- | Get the character under the cursor without advancing the cursor. This function lifts
 -- 'streamLook'.
 parserLook 
-  :: (MonadIO m
+  :: (PrimMonad m
      , Show tags --DEBUG
      )
-  => Parser tags fold m Char
+  => Parser fold tags m Char
 parserLook = do
   -- The order of events here is very important. First check if we are at the end-of-line
   eol <- liftCursorStreamGet (pure . streamIsEOL)
@@ -451,37 +472,37 @@ parserLook = do
 -- line. If the cursor does advance to the next line, 'True' is returned, otherwise if the cursor
 -- remains on the current line, 'False' is returned.
 parserStep 
-  :: (MonadIO m
+  :: (PrimMonad m
      , Show tags --DEBUG
      )
-  => Parser tags fold m ()
+  => Parser fold tags m ()
 parserStep = liftCursorStreamModify streamStep
 
 -- | This function pushses the @tags@ value of the current cached 'TextLine'
 parserCommitTags
-  :: (MonadIO m, TaggedSyntax tags fold
+  :: (PrimMonad m, TaggedSyntax tags fold
      , Show tags --DEBUG
      )
-  => Parser tags fold m ()
+  => Parser fold tags m ()
 parserCommitTags = liftCursorStreamGet streamCommitTags
 
 -- | This function ensures that the cached 'TextLine' being analyzed by the parser is the same
 -- 'TextLine' that is under the parsing cursor. This function is called automatically by
 -- 'parserGoto'.
 parserResetCache
-  :: (MonadIO m
+  :: (PrimMonad m
      , Show tags --DEBUG
      )
-  => Parser tags fold m ()
+  => Parser fold tags m ()
 parserResetCache = liftCursorStreamModify streamResetCache
 
 -- | This function must be called if the 'TextBuffer' over which a parser is running is modified
 -- while the parser is paused.
 parserResetEndpoint
-  :: (MonadIO m
+  :: (PrimMonad m
      , Show tags --DEBUG
      )
-  => Parser tags fold m ()
+  => Parser fold tags m ()
 parserResetEndpoint = liftCursorStreamModify (streamResetEndpoint maxBound)
 
 ----------------------------------------------------------------------------------------------------
@@ -499,10 +520,10 @@ parserResetEndpoint = liftCursorStreamModify (streamResetEndpoint maxBound)
 -- can then evaluate 'runParser' again using the state value and continuation value once your buffer
 -- has been updated and is ready to resume parsing. See also: the 'parserPause' function.
 parserPause_thenDo
-  :: (MonadIO m
+  :: (PrimMonad m
      , Show tags --DEBUG
      )
-  => Parser tags fold m a -> Parser tags fold m a
+  => Parser fold tags m a -> Parser fold tags m a
 parserPause_thenDo = Parser . (<$> get) . flip ParWaiting
 
 -- | This function is similar to 'parserWait_thenDo', but is intended to be used more like a
@@ -510,31 +531,31 @@ parserPause_thenDo = Parser . (<$> get) . flip ParWaiting
 -- to be used when the 'Parser' is resumed, rather the entire remainder of the @do@ block that is to
 -- be executed after this "pause instruction" is treated as the continuation.
 parserPause
-  :: (MonadIO m
+  :: (PrimMonad m
      , Show tags --DEBUG
      )
-  => Parser tags fold m ()
+  => Parser fold tags m ()
 parserPause = Parser $ flip ParWaiting (pure ()) <$> get
 
 -- | Like 'parserResume' but evaluates 'parserGoto' on the given 'TextLocation' before resuming the
 -- given 'Parser'.
 parserResumeAt
-  :: (MonadIO m
+  :: (PrimMonad m
      , Show tags --DEBUG
      )
-  => Parser tags fold m a -> ParserState tags fold -> TextLocation
-  -> EditText tags m (ParStep tags fold m a, ParserState tags fold)
+  => Parser fold tags m a -> ParserState m tags fold -> TextLocation
+  -> EditText tags m (ParStep fold tags m a, ParserState m tags fold)
 parserResumeAt par st loc = parserResume (parserGoto loc >> par) st
 
 -- | Evaluates a 'Parser' using an existing 'ParserState' that has already been constructed with a
 -- call to 'newParserState'.
 parserResume
-  :: (MonadIO m
+  :: (PrimMonad m
      , Show tags --DEBUG
      )
-  => Parser tags fold m a
-  -> ParserState tags fold
-  -> EditText tags m (ParStep tags fold m a, ParserState tags fold)
+  => Parser fold tags m a
+  -> ParserState m tags fold
+  -> EditText tags m (ParStep fold tags m a, ParserState m tags fold)
 parserResume (Parser par) st = runStateT par st
 
 ----------------------------------------------------------------------------------------------------
@@ -549,14 +570,14 @@ parserResume (Parser par) st = runStateT par st
 -- typeclass for your @tags@ data type, so it is still possible to run a 'Parser' even if your
 -- @tags@ have not instantiated this typeclass.
 class TaggedSyntax tags fold | tags -> fold where
-  textLineParseResult :: MonadIO m => Lens' tags (ParStep tags fold m a)
+  textLineParseResult :: PrimMonad m => Lens' tags (ParStep fold tags m a)
 
 ----------------------------------------------------------------------------------------------------
 
 instance
-  (MonadIO m
+  (PrimMonad m
   , Show tags --DEBUG
-  ) => Parsing (Parser tags fold m) where
+  ) => Parsing (Parser fold tags m) where
 
   try f = parserGet id >>= \ st -> f <|> (parserModify (const st) >> mzero)
 
@@ -587,18 +608,18 @@ instance
 ----------------------------------------------------------------------------------------------------
 
 instance
-  (MonadIO m
+  (PrimMonad m
   , Show tags --DEBUG
-  ) => LookAheadParsing (Parser tags fold m) where
+  ) => LookAheadParsing (Parser fold tags m) where
 
   lookAhead (Parser f) = Parser $ use parserStream >>= (f <*) . assign parserStream
 
 ----------------------------------------------------------------------------------------------------
 
 instance
-  (MonadIO m
+  (PrimMonad m
   , Show tags --DEBUG
-  ) => CharParsing (Parser tags fold m) where
+  ) => CharParsing (Parser fold tags m) where
 
   satisfy check = parserLook >>= \ c -> if check c then parserStep >> return c else mzero
 
@@ -607,6 +628,6 @@ instance
 ----------------------------------------------------------------------------------------------------
 
 instance
-  (MonadIO m
+  (PrimMonad m
   , Show tags --DEBUG
-  ) => TokenParsing (Parser tags fold m) where {} -- All defaults
+  ) => TokenParsing (Parser fold tags m) where {} -- All defaults

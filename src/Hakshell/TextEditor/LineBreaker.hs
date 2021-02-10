@@ -4,7 +4,7 @@ module Hakshell.TextEditor.LineBreaker
     -- The line break behavior of the 'TextBuffer' can be programmed to behave differently from the
     -- ordinary default behavior of breaking input strings on the @'\n'@ character.
     LineBreakSymbol(..), lineBreakSize,
-    LineBreaker(..), lineBreaker, lineBreakPredicate, defaultLineBreak,
+    LineBreaker(..), lineBreaker, lineBreakPredicate, defaultLineBreakSymbol,
     lineBreakerNLCR, lineBreakerNL, lineBreakerCR, lineBreakerNUL,
   ) where
 
@@ -70,13 +70,13 @@ data LineBreaker
       -- a line of text. For each returned tuple, the first element of the tuple should be a string
       -- without line breaks, the second element should contain a string with only line breaks, or
       -- an empty string if the string was not terminated with a line break.
-    , theDefaultLineBreak :: !LineBreakSymbol
+    , theDefaultLineBreakSymbol :: !LineBreakSymbol
       -- ^ This defines the default line break to be used by the line breaking function.
     }
 
 -- | This defines the default line break to be used by the line breaking function.
-defaultLineBreak :: Lens' LineBreaker LineBreakSymbol
-defaultLineBreak = lens theDefaultLineBreak $ \ a b -> a{ theDefaultLineBreak = b }
+defaultLineBreakSymbol :: Lens' LineBreaker LineBreakSymbol
+defaultLineBreakSymbol = lens theDefaultLineBreakSymbol $ \ a b -> a{ theDefaultLineBreakSymbol = b }
 
 -- | This function is called by 'insertChar' to determine if the 'bufferLineEditor' should be
 -- terminated.
@@ -94,9 +94,9 @@ lineBreaker = lens theLineBreaker $ \ a b -> a{ theLineBreaker = b }
 -- 'lineBreakerNLCR' str) == str@ is obeyed.
 lineBreakerNLCR :: LineBreaker
 lineBreakerNLCR = LineBreaker
-  { theLineBreakPredicate = nlcr
-  , theLineBreaker        = lines
-  , theDefaultLineBreak   = LineBreakNL
+  { theLineBreakPredicate     = nlcr
+  , theLineBreaker            = lines
+  , theDefaultLineBreakSymbol = LineBreakNL
   } where
     nlcr c = c == '\n' || c == '\r'
     lines  = break nlcr >>> \ case
@@ -112,9 +112,9 @@ lineBreakerNLCR = LineBreaker
 -- Not for export
 makeLineBreaker :: LineBreakSymbol -> Char -> LineBreaker
 makeLineBreaker sym c = LineBreaker
-  { theLineBreakPredicate = (== c)
-  , theLineBreaker        = lines
-  , theDefaultLineBreak   = LineBreakNL
+  { theLineBreakPredicate     = (== c)
+  , theLineBreaker            = lines
+  , theDefaultLineBreakSymbol = LineBreakNL
   } where
   lines = break (== c) >>> \ case
     (""  , ""    ) -> []

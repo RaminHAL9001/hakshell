@@ -94,7 +94,7 @@ module Hakshell.TextEditor
     -- element after the cursror.
 
     Absolute(..),  LineIndex(..), CharIndex(..), TextLocation(..),
-    TextCursorSpan(..), CharStats(..),
+    CharCount(..), CharStats(..),
     Relative(..), RelativeToCursor(..),
     RelativeToAbsoluteCursor, -- <- does not export members
     relativeToAbsolute, relativeLine, relativeChar, lineIndex, charIndex,
@@ -111,15 +111,13 @@ module Hakshell.TextEditor
     LineEditor,
     flushRefill, refillLineEditor, refillLineEditorWith, flushLineEditor,
     lineEditorCharCount, lineEditorUnitCount, getLineCharCount, getUnitCount,
-    copyLineEditorText, clearLineEditor, resetLineEditor,
+    copyLineEditorText, clearWholeLine, resetLineEditor,
 
-    -- *** Moving by lines or by characters
+    -- *** Getting and setting the cursor position
     --
     -- These are the fundamental cursor motion functions. You must move by line and then move by
     -- character separately. There are more convenient cursor motion functinos below which allow
     -- motion to a line and character using a single 'TextLocation' value.
-    --
-    -- *** Getting and setting the cursor position
     --
     -- When moving the cursor around, some functions, like 'gotoLine' or 'moveByLine' it's contents
     -- on the current line unless you explicitly call 'flushLineEditor'. However functions like
@@ -136,7 +134,8 @@ module Hakshell.TextEditor
     -- There are situations where you may not want to use 'flushRefill' to perform a cursor motion, as
     -- in when accumulating lines into the 'LineEditor' after each cursor motion.
 
-    getLocation, saveCursorEval, shiftAbsolute, diffAbsolute, unwrapTextCursorSpan,
+    getLocation, saveCursorEval, shiftAbsolute, diffAbsolute, unwrapCharCount,
+    moveByCharWrap, spanDistance, distanceBetween, 
 
     CursorIndexedText(..), CursorIndexedLine(..), CursorIndexedBuffer(..),
 
@@ -150,7 +149,7 @@ module Hakshell.TextEditor
     -- by evaluating a function of type 'EditLine' with the 'editLine' function.
 
     TextLine, emptyTextLine, textLineBreakSymbol,
-    nullTextLine, textLineCursorSpan, textLineGetChar,
+    nullTextLine, textLineStats, textLineGetChar,
     textLineTop, textLineIsUndefined,
     textLineTags, textLineChomp, showTextLine,
 
@@ -184,10 +183,8 @@ module Hakshell.TextEditor
     -- typeclass.
 
     EditText, runEditText, runEditTextOnCopy,
-
-    insertString, lineBreak, lineBreakWith,
-    pushLine, popLine,
-    putLineIndex, withCurrentLine,
+    insertString, lineBreak, lineBreakWith, deleteCharsWrap,
+    popLine, pushLine, putLineIndex, withCurrentLine,
     bufferLineCount, bufferIsEmpty, currentBuffer,
     lineCursorIsDefined, 
 
@@ -197,10 +194,10 @@ module Hakshell.TextEditor
     -- the context of an 'EditText' function. This places a line of text into a 'LineEditor' which
     -- allows the text to be edited character-by-character.
 
-    EditLine, editLine, liftEditText, insertChar, deleteChars, lineEditorTags,
+    EditLine, editLine, liftEditText,
+    insertTextLine, insertChar, deleteChars, lineEditorTags,
     copyCharsRange, copyCharsBetween, copyChars, copyCharsToEnd,
-    charCursorIsDefined,
-    -- TODO: getCharIndex, putCharIndex,
+    charCursorIsDefined, setLineBreakSymbol,
 
     -- ** Indicies and Bounds Checking
 
@@ -223,9 +220,13 @@ module Hakshell.TextEditor
     textFrameToList, textFrameToStrings,
 
     -- *** 'TextFrame' Inspection Monad
+
     ViewText, runViewTextT, runViewText, viewLine,
 
     -- * Batch Editing
+
+    -- ** A function type for rewriting multiple lines at once
+    RewriteLines, writeBack, rewriteLines, rewriteLinesInRange, rewriteLinesInBuffer,
 
     -- ** Folding over lines of text
     --
@@ -250,6 +251,16 @@ module Hakshell.TextEditor
     FoldMapLines, foldMapLines, foldMapAllLines, foldMapLinesBetween, foldMapLinesInRange,
     runFoldMapLinesStep,
 
+    -- ** Folding and mapping over characters
+
+    FoldMapChars, foldMapChars, runFoldMapChars, execFoldMapChars,
+
+    -- ** Mapping over characters in a line of text
+    --
+    -- The 'MapChars' function type is a special case of 'FoldMapChars'.
+
+    MapChars, runMapChars,
+
     -- * Parser Stream
     --
     -- To perform parsing of text, use the "Hakshell.TextEditor.Parser" module. The 'StreamCursor'
@@ -273,24 +284,57 @@ module Hakshell.TextEditor
   ) where
 
 import           Hakshell.GapBuffer
+                 ( GapBuffer, GapBufferState, gapBufferLength, pushSlice,
+                   runGapBuffer, runGapBufferNew, cloneGapBufferState, freezeVector,
+                   gapBufferCursorIsDefined, gapBufferBeforeCursor, gapBufferAfterCursor, 
+                   IIBuffer, IIBufferState(IIBufferState, theIIBufferVector, theIIBufferCursor),
+                   runIIBuffer, iiBufferVector, iiBufferCursor, gapBufferLiftIIBuffer,
+                   VecIndex, VecLength(VecLength), indexAfterRange,
+                   Absolute(Absolute), Relative(Relative), relative, unwrapRelative,
+                   RelativeToCursor(Before, After), BufferError(..),
+                   HasOpposite(opposite), HasNullValue(..),
+                   IsIndex(fromIndex, toIndex),
+                   IsLength(fromLength, toLength), distanceFromOrigin,
+                   MonadVectorCursor(modCount, getElemIndex, shiftCursor, getAllocSize),
+                   countDefined, relativeIndex, forceCursorIndex, writingIndex,
+                   moveCursorBy, moveCursorTo, moveCursorNear,
+                   deleteFromEnd, insertElemAtEnd, putElemIndex,
+                   getElem, putElem, pushElem, popElem, pushElemVec,
+                   indexToAbsolute, absoluteIndex, testIndex, validateIndex,
+                   withFullSlices, sliceFromCursor, getSlice, copyRegion,
+                   UnsafeSlice, sliceSize, readSlice, writeSlice, withRegion,
+                   sliceIndiciesReverse, sliceIndiciesForward, safeClone, safeFreeze, safeCopy,
+                 )
 import           Hakshell.String
+                 ( IntSized(intSize), Unpackable(unpack), Packable(pack),
+                   StrictBytes, CharVector,
+                 )
 import           Hakshell.TextEditor.LineBreaker
+                 ( LineBreakSymbol(..), LineBreaker(theLineBreaker), defaultLineBreakSymbol,
+                   lineBreaker, lineBreakSize, lineBreakerNLCR, lineBreakPredicate
+                 )
 
-import           Control.Arrow
-import           Control.Lens
-import           Control.Monad.Cont
-import           Control.Monad.Cont.Class
-import           Control.Monad.Except
-import           Control.Monad.Error.Class
-import           Control.Monad.Primitive
-import           Control.Monad.Reader
-import           Control.Monad.ST
-import           Control.Monad.State
-import           Control.Monad.State.Class
+import           Control.Arrow ((|||))
+import           Control.Applicative ((<$>), (<*>), pure)
+import           Control.Lens ((<&>), (%~), (.~), (^.), (+~), (.=), (&), Lens', lens, use, assign)
+import           Control.Monad ((>=>), join, guard, when, unless, void)
+import           Control.Monad.Cont (ContT(..))
+import           Control.Monad.Cont.Class (MonadCont(..))
+import           Control.Monad.Except (ExceptT(..), runExceptT)
+import           Control.Monad.Error.Class (MonadError(..))
+import           Control.Monad.IO.Class (MonadIO(..))
+import           Control.Monad.Primitive (PrimMonad, PrimState)
+import           Control.Monad.Reader (ReaderT(runReaderT))
+import           Control.Monad.Reader.Class (MonadReader(ask))
+import           Control.Monad.ST (runST)
+import           Control.Monad.State (StateT(..), evalStateT, evalState, gets, modify)
+import           Control.Monad.State.Class (MonadState(state, get, put))
+import           Control.Monad.Trans.Class (MonadTrans(lift))
 
+import           Data.Functor.Identity (Identity(..))
+import           Data.Monoid ((<>))
 import qualified Data.Primitive.MutVar       as Var
 import qualified Data.Vector                 as Vec
---import qualified Data.Vector.Generic         as GVec
 import qualified Data.Vector.Mutable         as MVec
 import qualified Data.Vector.Unboxed         as UVec
 import qualified Data.Vector.Unboxed.Mutable as UMVec
@@ -340,7 +384,7 @@ instance IsLength (Relative CharIndex) where
 -- line breaking characters consisting of two characters are considered a single cursor location,
 -- thus the 'moveByCharWrap' or 'deleteCharsWrap' functions), you must specify the number of cursor
 -- locations to move or delete using a value of this type.
-newtype TextCursorSpan = TextCursorSpan Int
+newtype CharCount = CharCount Int
   deriving (Eq, Ord, Show, Read, Enum, Num, Bounded)
 
 -- (( Programmer notes ))
@@ -413,8 +457,8 @@ newtype TextCursorSpan = TextCursorSpan Int
 -- count, and it is easy to determine whether the element under the cursor is valid by checking as
 -- single field.
 
-unwrapTextCursorSpan :: TextCursorSpan -> Int
-unwrapTextCursorSpan (TextCursorSpan o) = o
+unwrapCharCount :: CharCount -> Int
+unwrapCharCount (CharCount o) = o
 
 -- | This data structure contains information about the number of character locations traversed
 -- during a function evaluation. Values of this type are returned by 'insertString',
@@ -438,7 +482,7 @@ data CharStats
       -- order to replicate the stateful operation. The biggest difference between this number and
       -- the 'deltaCharCount' is that line breaks are always considered a single cursor step,
       -- regardless of how many characters comprise the line break.
-    , deltaCharCount  :: !TextCursorSpan
+    , deltaCharCount  :: !CharCount
       -- ^ This is the number of UTF characters inserted\/deleted, a positive value indicates
       -- insertion, a negative value indicates deletion. Use this value if you need an accurate
       -- accounting of the amount of data has been changed.
@@ -455,6 +499,13 @@ instance Semigroup CharStats where
 instance Monoid CharStats where
   mempty = CharStats{ cursorStepCount = 0, deltaCharCount = 0 }
   mappend = (<>)
+
+instance HasOpposite CharStats where
+  opposite (CharStats{cursorStepCount=csc,deltaCharCount=dcc}) =
+    CharStats
+    { cursorStepCount = negate csc
+    , deltaCharCount  = negate dcc
+    }
 
 -- | This function is an arithmetic operation that alters an 'Absolute' index by adding a 'Relative'
 -- index to it.
@@ -632,7 +683,7 @@ nullTextLine nullTags = \ case
 textLineIsUndefined :: TextLine tags -> Bool
 textLineIsUndefined = \ case { TextLineUndefined -> True; _ -> False; }
 
--- | The 'TextCursorSpan' of a 'TextLine' is essentially the number of steps it would take for an
+-- | The 'CharCount' of a 'TextLine' is essentially the number of steps it would take for an
 -- end-user to step the cursor over every element in the 'TextLine', including an optional line
 -- break at the end which is computed as a single step regardless of how many UTF characters
 -- actually comprise the line break. Most of the time 'textLineCursorSpan' is exactly equal to the
@@ -649,10 +700,22 @@ textLineIsUndefined = \ case { TextLineUndefined -> True; _ -> False; }
 -- 'textLineCursorSpan' metric, which always treats all line breaking characters as a single unit. If
 -- there are no line breaking characters, or if there is only one line breaking character, the
 -- 'textLineCursorSpan' is identical to the value given by 'intSize'.
-textLineCursorSpan :: TextLine tags -> TextCursorSpan
-textLineCursorSpan = TextCursorSpan . \ case
+textLineCursorSpan :: TextLine tags -> CharCount
+textLineCursorSpan = CharCount . \ case
   TextLineUndefined -> error "textLineCursorSpan: undefined line"
   TextLine{theTextLineString=vec} -> UVec.length vec
+
+-- | Return 'CharStats' statistics about this 'TextLine'.
+textLineStats :: TextLine tags -> CharStats
+textLineStats = \ case
+  TextLineUndefined -> mempty
+  TextLine{theTextLineString=vec,theTextLineBreakSymbol=lbrk} ->
+    let len = UVec.length vec in
+    CharStats
+    { cursorStepCount = Relative $ CharIndex len
+    , deltaCharCount = CharCount $ len +
+        if lbrk == NoLineBreak then 0 else 1 - lineBreakSize lbrk
+    }
 
 -- | Return index of the top-most non-line-breaking character. The size of the string not including
 -- the line breaking characters is equal to the result of this function evaluated by 'charToIndex'.
@@ -698,14 +761,12 @@ viewerLine = lens theViewerLine $ \ a b -> a{ theViewerLine = b }
 
 ----------------------------------------------------------------------------------------------------
 
--- | This is a reference to the stateful data of your buffer of text. The type variable @mvar@ is
--- typically set to 'TextIORef' (a synonym of @'MutVar' IO@), 'TextSTRef' (a synonym of @'MutVar'
--- (ST s)@) or 'TextMutex' (a synonym of @'MVar' IO@). The type variable @m@ is the primitive monad
--- type (usually either @IO@ or @ST@) that depends on the @mvar@ related to @m@ by the
--- 'Control.Primitive.PrimState' type family.
+-- | This is a reference to the stateful data of your buffer of text. The type variable is a monad
+-- @m@ in which the 'TextBuffer' will be evaluated, typically set to 'IO' or 'ST', althuogh any
+-- monadic function type that instantiates the 'PrimMonad' class will work.
 --
--- You edit this text by evaluating any text editing combinators that evaluate to
--- an 'EditText' function type. Declare a new 'TextBuffer' using the 'newTextBuffer' function, then
+-- The text in the 'TextBuffer' is editable by evaluating any of the combinators that evaluate to an
+-- 'EditText' function type. Declare a new 'TextBuffer' using the 'newTextBuffer' function, then
 -- pass this 'TextBuffer' to the 'runEditText' function along with some combinator functions of type
 -- @('EditText' tags)@ or type @'MonadEditText' editor => (editor tags)@.
 --
@@ -720,16 +781,9 @@ viewerLine = lens theViewerLine $ \ a b -> a{ theViewerLine = b }
 --     'Control.Monad.return' ()
 -- @
 --
--- You may also notice some of the combinator functions in this module are of the type @(editor tags
--- a)@ (all lower-case, all type variables) such that the @editor@ type variable is an instance of
--- the 'MonadEditText' type class and @(editor tags)@ type variable is an instance of the 'Monad'
--- typeclass. Since the 'EditText' function does instantiate both the 'MonadEditText' and 'Monad'
--- typeclasss, this means it is possible to use any function which is defined be of type @(editor
--- tags a)@ type as if it were an 'EditText' function.
---
--- Just remember that you can't use an @(editor tag a@) type as though @editor@ were two different
--- function types, for example when using an 'EditText' and an 'FoldMapLines' function in the same
--- @do@ block, this will fail to pass the type-checker.
+-- There is a separate function type in this module, 'EditLine', for editing the characters on a
+-- single line of text which can be evaluated using the 'editLine' function. There are also batch
+-- edting function types such as 'RewriteLines', 'FoldLines', 'MapLines', and 'FoldMapLines'.
 newtype TextBuffer m tags = TextBuffer (Var.MutVar (PrimState m) (TextBufferState m tags))
 
 ----------------------------------------------------------------------------------------------------
@@ -750,17 +804,17 @@ newtype TextBuffer m tags = TextBuffer (Var.MutVar (PrimState m) (TextBufferStat
 -- must be a member of the typeclass 'PrimMonad'.
 data TextBufferState m tags
   = TextBufferState
-    { theBufferDefaultLine   :: !(TextLine tags)
+    { theBufferDefaultLine  :: !(TextLine tags)
       -- ^ The tag value to use when new 'TextLine's are automatically constructed after a line
       -- break character is inserted.
-    , theBufferLineBreaker   :: LineBreaker
+    , theBufferLineBreaker  :: LineBreaker
       -- ^ The function used to break strings into lines. This function is called every time a
       -- string is transferred from 'theBufferLineEditor' to to 'theLinesAbove' or 'theLinesBelow'.
-    , theTextGapBufferState  :: !(GapBufferState (MVec.MVector (PrimState m) (TextLine tags)))
+    , theTextGapBufferState :: !(GapBufferState (MVec.MVector (PrimState m) (TextLine tags)))
       -- ^ Contains the gap buffer itself, which is defined in the "Hakshell.GapBuffer" module.
-    , theBufferLineEditor    :: !(LineEditor m tags)
+    , theBufferLineEditor   :: !(LineEditor m tags)
       -- ^ A data structure for editing individual characters in a line of text.
-    , theBufferTargetCol     :: !(Absolute CharIndex)
+    , theBufferTargetCol    :: !(Absolute CharIndex)
       -- ^ When moving the cursor up and down the 'TextBuffer' (e.g. using 'gotoLocation'), the
       -- cursor should generally remain at the same character column location.
     }
@@ -784,16 +838,9 @@ textEditGapBuffer
            (GapBufferState (MVec.MVector (PrimState m) (TextLine tags)))
 textEditGapBuffer = lens theTextGapBufferState $ \ a b -> a{ theTextGapBufferState = b }
 
--- | The function used to break strings into lines. This function is called every time a string is
--- transferred from 'theBufferLineEditor' to 'theLinesAboveCursor' or 'theLinesBelow'. Note that setting
--- this function doesn't restructure the buffer, the old line breaks will still exist as they were
--- before until the entire buffer is refreshed.
---
--- If you choose to use your own 'LineBreaker' function, be sure that the function obeys this law:
---
--- @
--- 'Prelude.concat' ('lineBreakerNLCR' str) == str
--- @
+-- | The symbol used to break lines whenever the 'lineBreak' is used. Changing this value does not
+-- convert the line break symbols used anywhere else in the buffer, only the symbol that is to be
+-- used from now on.
 bufferLineBreaker :: Lens' (TextBufferState m tags) LineBreaker
 bufferLineBreaker = lens theBufferLineBreaker $ \ a b -> a{ theBufferLineBreaker = b }
 
@@ -827,68 +874,62 @@ bufferTargetCol = lens theBufferTargetCol $ \ a b -> a{ theBufferTargetCol = b }
 --
 -- The type @m@ must be the monad in which this data type has it's internal state updated, and it
 -- must be a member of the typeclass 'PrimMonad'.
-data PrimMonad m => LineEditor m tags
+data LineEditor m tags
   = LineEditor
-    { theParentTextEditor     :: TextBuffer m tags
+    { theParentTextEditor  :: TextBuffer m tags
       -- ^ A line editor can be removed from it's parent 'TextEditor'. A 'LineEditor' is defined
       -- such that it can only directly edit text in it's parent 'TextEditor'. A 'LineEditor' can
       -- indirectly edit text in any other parent, but only if a complete copy of the content of the
       -- line editor is made and passed it to some other 'TextEditor'.
     , theLineEditGapBuffer   :: !(GapBufferState (UMVec.MVector (PrimState m) Char))
       -- ^ The internal 'GapBufferState'.
-    , theLineEditorIsClean   :: !Bool
+    , theLineEditorIsClean :: !Bool
       -- ^ This is set to 'True' if 'theBufferLineEditor' is a perfect copy of the 'TextLine'
       -- currently being referred to by the 'getLineNumber'. If the content of
       -- 'theBufferLineEditor' has been modified by 'insertChar' or 'deleteChars', or if cursor has
       -- been moved to a different line, this field is set to 'False'.
-    , theCursorBreakSymbol   :: !LineBreakSymbol
-    , theLineEditorTags      :: tags
+    , theLineBreakSymbol   :: !LineBreakSymbol
+    , theLineEditorTags    :: tags
     }
 
 instance PrimMonad m => IntSized (LineEditor m tags) where { intSize = lineEditorCharCount; }
 
-parentTextEditor :: PrimMonad m => Lens' (LineEditor m tags) (TextBuffer m tags)
+parentTextEditor :: Lens' (LineEditor m tags) (TextBuffer m tags)
 parentTextEditor = lens theParentTextEditor $ \ a b -> a{ theParentTextEditor = b }
 
-lineEditGapBuffer
-  :: (PrimMonad m, st ~ PrimState m)
-  => Lens' (LineEditor m tags)
-           (GapBufferState (UMVec.MVector st Char))
+lineEditGapBuffer :: Lens' (LineEditor m tags) (GapBufferState (UMVec.MVector (PrimState m) Char))
 lineEditGapBuffer = lens theLineEditGapBuffer $ \ a b -> a{ theLineEditGapBuffer = b }
 
 -- Not for export: this gets updated when inserting or deleting characters before the cursor.
-charsBeforeCursor :: PrimMonad m => Lens' (LineEditor m tags) VecLength
+charsBeforeCursor :: Lens' (LineEditor m tags) VecLength
 charsBeforeCursor = lineEditGapBuffer . gapBufferBeforeCursor
 
 -- Not for export: this gets updated when inserting or deleting characters after the cursor.
-charsAfterCursor :: PrimMonad m => Lens' (LineEditor m tags) VecLength
+charsAfterCursor :: Lens' (LineEditor m tags) VecLength
 charsAfterCursor = lineEditGapBuffer . gapBufferAfterCursor
 
--- Not for export: controls line break information within the cursor. If this value is zero, it
--- indicates that no line breaking characters have been entered into the cursor yet. If this value
--- is non-zero, it indicates that the line breaking characters do exist after the cursor at some
--- point, and if additional line breaks are inserted the characters after the cursor need to be
--- split off into a new 'TextLine'.
-cursorBreakSymbol :: PrimMonad m => Lens' (LineEditor m tags) LineBreakSymbol
-cursorBreakSymbol = lens theCursorBreakSymbol $ \ a b -> a{ theCursorBreakSymbol = b }
+-- Not for export: this can put the 'LineEditor' into an inconsistent state. Use
+-- 'setLineBreakSymbol' instead.
+lineBreakSymbol :: Lens' (LineEditor m tags) LineBreakSymbol
+lineBreakSymbol = lens theLineBreakSymbol $ \ a b -> a{ theLineBreakSymbol = b }
 
 -- | A 'Control.Lens.Lens' to get or set tags for the line currently under the cursor. To use or
 -- modify the tags value of the line under the cursor, evaluate one of the functions 'use',
 -- 'modifying', @('Control.Lens..=')@, or @('Control.Lens.%=')@ within an 'EditText' function, or
 -- any function which instantiates 'MonadEditText'.
-lineEditorTags :: PrimMonad m => Lens' (LineEditor m tags) tags
+lineEditorTags :: Lens' (LineEditor m tags) tags
 lineEditorTags = lens theLineEditorTags $ \ a b -> a{ theLineEditorTags = b }
 
 -- | This is set to 'True' if 'theBufferLineEditor' is a perfect copy of the 'TextLine' currently
 -- being referred to by the 'getLineNumber'. If the content of 'theBufferLineEditor' has been
 -- modified by 'insertChar' or 'deleteChars', or if cursor has been moved to a different line, this
 -- field is set to 'False'.
-lineEditorIsClean :: PrimMonad m => Lens' (LineEditor m tags) Bool
+lineEditorIsClean :: Lens' (LineEditor m tags) Bool
 lineEditorIsClean = lens theLineEditorIsClean $ \ a b -> a{ theLineEditorIsClean = b }
 
 -- This is set to 'True' if the element under the cursor is defined, 'False' if the element under
 -- the cursor is undefined.
-charCursorIsDefined :: PrimMonad m => Lens' (LineEditor m tags) Bool
+charCursorIsDefined :: Lens' (LineEditor m tags) Bool
 charCursorIsDefined = lineEditGapBuffer . gapBufferCursorIsDefined
 
 ----------------------------------------------------------------------------------------------------
@@ -900,7 +941,7 @@ newtype EditText tags m a
         (ExceptT TextEditError (StateT (TextBufferState m tags) m)) a
     )
   deriving
-    ( Functor, Applicative, Monad,
+    ( Functor, Applicative, Monad, MonadIO,
       MonadError TextEditError
     )
 
@@ -1001,7 +1042,7 @@ newtype EditLine tags m a
         (StateT (LineEditor m tags) (EditText tags m)) a
     )
   deriving
-    ( Functor, Applicative, Monad,
+    ( Functor, Applicative, Monad, MonadIO,
       MonadError TextEditError
     )
   -- TODO: try lifting @m@ instead of @(EditText tags m)@
@@ -1015,6 +1056,26 @@ newtype EditLine tags m a
 
 instance MonadTrans (EditLine tags) where
   lift = EditLine . lift . lift . lift
+
+class MonadEditLine editor where
+  -- | Perform an edit on the line under the cursor. You usually call this function after
+  -- positioning the cursor within a 'TextBuffer' using a function like 'gotoLine', then edit the
+  -- characters on thatline by evaluating 'EditLine' functinos using this function 'editLine'. For
+  -- example:
+  --
+  -- >>> 'gotoLine' 4
+  --     'editLine' $ do
+  --         'gotoChar' 'maxBound'
+  --         'insertString' " This is written to the end of the line."
+  editLine
+    :: (Monad (editor m), PrimMonad m, EditorTagsType (editor m) ~ tags)
+    => EditLine tags m a -> editor m a
+
+instance MonadEditLine (EditText tags) where
+  editLine (EditLine f) = editTextState (use bufferLineEditor) >>=
+    runStateT (runExceptT f) >>= \ case
+      (Left err, _   ) -> throwError err
+      (Right  a, line) -> editTextState (bufferLineEditor .= line) >> return a
 
 editLineState
   :: PrimMonad m
@@ -1030,17 +1091,6 @@ editLineLiftGapBuffer
   => GapBuffer (UMVec.MVector st Char) m a -> EditLine tags m a
 editLineLiftGapBuffer =
   liftMutableGapBuffer lineEditGapBuffer bufferToLineEditError lift EditLine
-
--- | Perform an edit on the line under the cursor. It is usually not necessary to invoke this
--- function directly, the definition of 'liftEditLine' for the 'TextEdit' function type is this
--- function, so any function that evaluates to an @editor@ where the @editor@ is a member of the
--- 'MonadEditLine' typeclass will automatically invoke this function based on the function type of
--- the context in which it is used.
-editLine :: PrimMonad m => EditLine tags m a -> EditText tags m a
-editLine (EditLine f) = editTextState (use bufferLineEditor) >>=
-  runStateT (runExceptT f) >>= \ case
-    (Left err, _   ) -> throwError err
-    (Right  a, line) -> editTextState (bufferLineEditor .= line) >> return a
 
 ----------------------------------------------------------------------------------------------------
 
@@ -1300,15 +1350,18 @@ mapAllLines = mapLinesBetween minBound maxBound
 ----------------------------------------------------------------------------------------------------
 
 -- | A type of functions that can perform a fold (in the sense of the Haskell 'Control.Monad.foldM'
--- function) over lines of text in a 'TextBufferState' while also updating each line as they are
+-- function) over lines of text in a 'TextBuffer' while also updating each line as they are
 -- being folded. Each line of text is folded in place, and lines may not be removed or inserted (for
--- inserting or removing lines , use 'cursorLoop').
+-- inserting or removing lines , use 'cursorLoop'). This is one of two methods of performing batch
+-- operations on text, the other is 'RewriteLines'. The difference between 'FoldMapLines' functions
+-- and 'RewriteLines' functions is that 'FoldMapLines' does not change the number of lines during
+-- evaluation.
 --
 -- This function takes an arbitrary @fold@ data type which can be anything you want, and is
 -- initialized when evaluating the 'runFoldMapLines' function. The 'FoldMapLines' function type
 -- instantiates 'Control.Monad.State.Class.MonadState' over the @fold@ type, so you will use
 -- 'Control.Monad.State.state', 'Control.Monad.State.modify', 'Control.Monad.State.get', and
--- 'Control.Monad.State.Put' functions
+-- 'Control.Monad.State.put' functions.
 --
 -- Not that the term "fold" as it is used in this function's name is not to be confused with "fold"
 -- as in folding paper. "Folding" is a term that many graphical text editors use to describe a
@@ -1317,7 +1370,7 @@ mapAllLines = mapLinesBetween minBound maxBound
 -- the first line of the block of text, and once below the bottom line of the block of text, then
 -- pushing the edges of the folds of paper together to obscure the text between the folds. The
 -- 'FoldMapLines' has nothing to do with such a feature.
-newtype FoldMapLines tags fold r m a
+newtype FoldMapLines r fold tags m a
   = FoldMapLines
     { unwrapFoldMapLines :: ContT r (ExceptT TextEditError (StateT fold (EditText tags m))) a
     }
@@ -1339,14 +1392,14 @@ instance Monad m => MonadCont (FoldMapLines tags fold r m) where
 instance MonadTrans (FoldMapLines tags fold r) where
   lift = foldMapLiftEditText . lift
 
-instance (Monad m, Semigroup a) => Semigroup (FoldMapLines tags fold r m a) where
+instance (Monad m, Semigroup a) => Semigroup (FoldMapLines r fold tags m a) where
   a <> b = (<>) <$> a <*> b
 
-instance (Monad m, Monoid a) => Monoid (FoldMapLines tags fold r m a) where
+instance (Monad m, Monoid a) => Monoid (FoldMapLines r fold tags m a) where
   mappend a b = mappend <$> a <*> b
   mempty = return mempty
 
-foldMapLiftEditText :: Monad m => EditText tags m a -> FoldMapLines tags fold r m a
+foldMapLiftEditText :: Monad m => EditText tags m a -> FoldMapLines r fold tags m a
 foldMapLiftEditText = FoldMapLines . lift . lift . lift
 
 -- | Convert a 'FoldMapLines' into an 'EditText' function. This function is analogous to the
@@ -1354,7 +1407,7 @@ foldMapLiftEditText = FoldMapLines . lift . lift . lift
 -- simply unwraps the 'EditText' monad that exists within the 'FoldMapLines' monad.
 runFoldMapLinesStep
   :: Monad m
-  => FoldMapLines tags fold r m a
+  => FoldMapLines r fold tags m a
   -> (a -> EditText tags m r)
   -> fold -> EditText tags m (r, fold)
 runFoldMapLinesStep (FoldMapLines f) end =
@@ -1367,10 +1420,10 @@ foldMapLinesBetween
   => Absolute LineIndex
   -> Absolute LineIndex
   -> fold
-  -> (FoldMapLines tags fold () m void
+  -> (FoldMapLines () fold tags m void
       -> Absolute LineIndex
       -> TextLine tags
-      -> FoldMapLines tags fold () m (TextLine tags)
+      -> FoldMapLines () fold tags m (TextLine tags)
      )
   -> EditText tags m fold
 foldMapLinesBetween = gFoldMapBetween
@@ -1386,10 +1439,10 @@ foldMapLinesInRange
   => Absolute LineIndex
   -> Relative LineIndex
   -> fold
-  -> (FoldMapLines tags fold () m void
+  -> (FoldMapLines () fold tags m void
       -> Absolute LineIndex
       -> TextLine tags
-      -> FoldMapLines tags fold () m (TextLine tags)
+      -> FoldMapLines () fold tags m (TextLine tags)
      )
   -> EditText tags m fold
 foldMapLinesInRange from rel fold f = if rel == 0 then return fold else
@@ -1399,10 +1452,10 @@ foldMapLines
   :: PrimMonad m
   => Relative LineIndex
   -> fold
-  -> (FoldMapLines tags fold () m void
+  -> (FoldMapLines () fold tags m void
       -> Absolute LineIndex
       -> TextLine tags
-      -> FoldMapLines tags fold () m (TextLine tags)
+      -> FoldMapLines () fold tags m (TextLine tags)
      )
   -> EditText tags m fold
 foldMapLines rel fold f = getLineNumber >>= \ from -> foldMapLinesInRange from rel fold f
@@ -1410,13 +1463,210 @@ foldMapLines rel fold f = getLineNumber >>= \ from -> foldMapLinesInRange from r
 foldMapAllLines
   :: PrimMonad m
   => fold
-  -> (FoldMapLines tags fold () m void
+  -> (FoldMapLines () fold tags m void
       -> Absolute LineIndex
       -> TextLine tags
-      -> FoldMapLines tags fold () m (TextLine tags)
+      -> FoldMapLines () fold tags m (TextLine tags)
      )
   -> EditText tags m fold
 foldMapAllLines = foldMapLinesBetween minBound maxBound
+
+----------------------------------------------------------------------------------------------------
+
+-- | A type of functions that can perform a batch rewrite operation over lines of text in a
+-- 'TextBuffer'. Each line of text popped from the 'TextBuffer' and passed to the continuation
+-- function. Lines may be pushed back using 'writeBack', and you can push back as many lines as you
+-- choose -- not calling 'writeBack' deletes the line. This is one of two methods of performing
+-- batch operations on text, the other is 'RewriteLines'. The difference between 'FoldMapLines'
+-- functions and 'RewriteLines' functions is that 'FoldMapLines' does not change the number of lines
+-- during evaluation.
+--
+-- The 'RewriteLine' function evaluation context contains it's own 'LineEditor' which is separate
+-- from the 'LineEditor' of the 'EditText' evaluation context, so it does not interfear with the
+-- line of text currently being edited while the batch operation is running, although when the batch
+-- operation completes the text around the line being currently edited may be completely altered.
+--
+-- Like the 'FoldMapLines' function, the 'RewriteLine' function take an arbitrary @fold@ data type,
+-- which can be altered using the 'Control.Monad.State.Class.MonadState' function instances over the
+-- @fold@ type, so you will use 'Control.Monad.State.state', 'Control.Monad.State.modify',
+-- 'Control.Monad.State.get', and 'Control.Monad.State.put' functions.
+newtype RewriteLines fold tags m a
+  = RewriteLines
+    { unwrapRewriteLines ::
+      ContT fold
+      (ExceptT TextEditError
+        (StateT
+          (RewriteLinesState fold tags m)
+          (EditText tags m)
+        )
+      ) a
+    }
+  deriving (Functor, Applicative, Monad, MonadIO)
+
+type instance EditorTagsType (RewriteLines fold tags m) = tags
+
+data RewriteLinesState fold tags m
+  = RewriteLinesState
+    { theRewriteLinesDirection :: !RelativeToCursor
+    , theRewriteLinesFold :: !fold
+    , theRewriteLinesEditor :: !(LineEditor m tags)
+    }
+
+instance Monad m => MonadState fold (RewriteLines fold tags m) where
+  state f = RewriteLines $
+    lift $ lift $ state $ \ rwlst ->
+    let (a, st) = f (theRewriteLinesFold rwlst) in
+    (a, rwlst{ theRewriteLinesFold = st })
+
+instance Monad m => MonadError TextEditError (RewriteLines fold tags m) where
+  throwError = RewriteLines . lift . throwError
+  catchError (RewriteLines (ContT try)) catch =
+    RewriteLines $ ContT $ \ next ->
+    catchError (try next) $
+    flip runContT next . unwrapRewriteLines . catch
+
+instance Monad m => MonadCont (RewriteLines fold tags m) where
+  callCC f = RewriteLines $ callCC $ unwrapRewriteLines . f . fmap RewriteLines
+
+instance MonadTrans (RewriteLines fold tags) where
+  lift = RewriteLines . lift . lift . lift . lift
+
+instance MonadEditLine (RewriteLines fold tags) where
+  editLine  (EditLine f) =
+    ( RewriteLines $
+      lift $ lift $
+      gets theRewriteLinesEditor >>=
+      lift . runStateT (runExceptT f)
+    ) >>= \ case
+      (Left err, _   ) -> throwError err
+      (Right  a, line) ->
+        rewriteLinesState (rewriteLinesEditor .= line) >>
+        return a
+
+rewriteLinesEditor :: Lens' (RewriteLinesState fold tags m) (LineEditor m tags)
+rewriteLinesEditor = lens theRewriteLinesEditor $ \ a b -> a{ theRewriteLinesEditor = b }
+
+rewriteLinesLiftEditText :: Monad m => EditText tags m a -> RewriteLines fold tags m a
+rewriteLinesLiftEditText = RewriteLines . lift . lift . lift
+
+rewriteLinesState
+  :: Monad m
+  => StateT (RewriteLinesState fold tags m) (EditText tags m) a
+  -> RewriteLines fold tags m a
+rewriteLinesState = RewriteLines . lift . lift
+
+-- not for export, performs no bounds checking.
+rewriteLinesLoop
+  :: PrimMonad m
+  => fold
+  -> (RewriteLines fold tags m void
+       -> TextLine tags
+       -> RewriteLines fold tags m ()
+     )
+  -> Int -> RelativeToCursor -> EditText tags m fold
+rewriteLinesLoop fold f count direction =
+  editTextState (use bufferDefaultTags) >>=
+  lift . newLineEditor Nothing >>= \ lineEd ->
+  ( evalStateT
+    ( runExceptT $
+      runContT
+      (unwrapRewriteLines (callCC $ loop count))
+      (const $ gets theRewriteLinesFold)
+    )
+    RewriteLinesState
+    { theRewriteLinesDirection = direction
+    , theRewriteLinesFold = fold
+    , theRewriteLinesEditor = lineEd
+    }
+  ) >>=
+  (throwError ||| return)
+  where
+    loop count halt =
+      if count <= 0 then get else
+      rewriteLinesState (gets theRewriteLinesDirection) >>= \ dir ->
+      rewriteLinesLiftEditText (popLine dir) >>=
+      f (get >>= halt) >>
+      (loop $! count - 1) halt
+
+-- | The 'rewriteLines' function works by calling 'popLine' repeatedly, and passing the 'TextLine'
+-- returned by 'popLine' to the loop continuation. This essentially deletes every line in the range
+-- of lines over which the 'rewriteLines' loop is evaluated. To prevent a line from being deleted,
+-- this 'writeBack' function __must__ be evaluated before each iteration terminates. It is possible
+-- to push back any line at all, and any number of lines, this is what allows lines to be rewritten
+-- by the 'rewriteLines' loop.
+writeBack :: PrimMonad m => TextLine tags -> RewriteLines fold tags m ()
+writeBack line =
+  rewriteLinesState (gets theRewriteLinesDirection) >>=
+  rewriteLinesLiftEditText . flip pushLine line . opposite
+
+-- | This function moves the cursor to the first @'Absolute' 'LineIndex'@ parameter given, then
+-- evaluate a folding and mapping monadic function over a range of lines specified. If the first
+-- 'LineIndex' parameter is greater than the second 'LineIndex' parameter, the fold map operation
+-- evaluates in reverse line order.
+--
+-- If you do not want to lose the current cursor position, be sure to wrap the evaluation of this
+-- function in a call to the 'saveCursorEval'.
+--
+-- The 'FoldMapLines' function you pass to this function will receive every 'TextLine' on and
+-- between the two @'Absolute' 'TextIndex'@ parameters given, and can return zero or more updated
+-- 'TextLine' values to replace the 'TextLine' received at each evaluation. Return an empty list to
+-- delete the line, return the given 'TextLine' alone as a list of a single element to perform no
+-- updating action to it.
+--
+-- Remember that the 'FoldMapLines' function type instantiates 'Control.Monad.Cont.State.MonadCont',
+-- which means the 'FoldMapLines' function you pass to this function can elect to halt the fold map
+-- operation by evaluating the stop function passed to it.
+rewriteLinesInRange
+  :: (PrimMonad m
+     , Show tags --DEBUG
+     )
+  => Absolute LineIndex -> Absolute LineIndex
+  -> fold
+  -> (RewriteLines fold tags m void
+      -> TextLine tags
+      -> RewriteLines fold tags m ()
+     )
+  -> EditText tags m fold
+rewriteLinesInRange from to fold f = do
+  gotoLine from
+  rewriteLinesLoop fold f (max 1 $ abs $ fromLength $ diffAbsolute from to) $
+    if from < to then After else Before
+
+-- | Conveniently calls 'forLinesInRange' with the first two parameters as @('Absolute' 1)@ and
+-- @('Absolute' 'maxBound')@.
+rewriteLinesInBuffer
+  :: (PrimMonad m
+     , Show tags --DEBUG
+     )
+  => fold
+  -> (RewriteLines fold tags m  void
+      -> TextLine tags
+      -> RewriteLines fold tags m ()
+     )
+  -> EditText tags m fold
+rewriteLinesInBuffer = rewriteLinesInRange (Absolute 1) maxBound
+
+-- | Like 'rewriteLinesInRange', but this function takes a 'RelativeToCursor' value, iteration
+-- begins at the cursor position where the 'bufferLineEditor' is set, and if the 'RelativeToCursor'
+-- value is 'After' then iteration goes forward to the end of the buffer, whereas if the
+-- 'RelativeToCursor' value is 'Before' then iteration goes backward to the start of the buffer.
+rewriteLines
+  :: ( PrimMonad m
+     , Show tags --DEBUG
+     )
+  => RelativeToCursor
+  -> fold
+  -> (RewriteLines fold tags m void
+      -> TextLine tags
+      -> RewriteLines fold tags m ()
+     )
+  -> EditText tags m fold
+rewriteLines rel fold f = do
+  linum <- getLineNumber
+  count <- bufferLineCount
+  uncurry (rewriteLinesLoop fold f . max 1) $ case rel of
+    Before -> (fromIndex linum, Before)
+    After  -> (fromLength count - fromIndex linum, After)
 
 ----------------------------------------------------------------------------------------------------
 
@@ -1571,7 +1821,7 @@ locationIsValid = (`catchError` (const $ return Nothing)) . fmap (Just . snd) . 
 -- function on the resultant 'TextLine', and if this function evaluates to 'True' you must increment
 -- the 'lineIndex' and reset the 'charIndex' to @1@.
 indexIsOnLineBreak :: TextLine tags -> VecIndex -> Bool
-indexIsOnLineBreak line = ((unwrapTextCursorSpan $ textLineCursorSpan line) ==) . fromIndex
+indexIsOnLineBreak line = ((unwrapCharCount $ textLineCursorSpan line) ==) . fromIndex
 
 ----------------------------------------------------------------------------------------------------
 
@@ -1673,7 +1923,7 @@ lineEditorFromVector tag initBuf newBuf = do
     { theParentTextEditor  = error "internal: 'LineEditor{theParentTextEditor}' is undefined"
     , theLineEditGapBuffer = gbst
     , theLineEditorIsClean = False
-    , theCursorBreakSymbol = NoLineBreak
+    , theLineBreakSymbol = NoLineBreak
     , theLineEditorTags    = tag
     }  
 
@@ -1694,7 +1944,7 @@ lineEditorCharCount :: PrimMonad m => LineEditor m tags -> Int
 lineEditorCharCount line = fromLength count + adjust where
   buf    = line ^. lineEditGapBuffer
   count  = buf ^. gapBufferBeforeCursor + buf ^. gapBufferAfterCursor
-  adjust = case line ^. cursorBreakSymbol of
+  adjust = case line ^. lineBreakSymbol of
     NoLineBreak -> 0
     sym         -> lineBreakSize sym - 1
 
@@ -1709,6 +1959,34 @@ getLineCharCount = lineEditorCharCount <$> editTextState (use bufferLineEditor)
 -- | Gets the 'lineEditorUnitCount' value for the current 'LineEditor'.
 getUnitCount :: PrimMonad m => EditText tags m (Relative CharIndex)
 getUnitCount = lineEditorUnitCount <$> editTextState (use bufferLineEditor)
+
+-- | Change the 'LineBreakSymbol' of the current 'LineEditor'.
+setLineBreakSymbol :: PrimMonad m => LineBreakSymbol -> EditLine tags m ()
+setLineBreakSymbol lbrk =
+  getLineBreakSymbol >>= \ oldLbrk ->
+  unless (lbrk == oldLbrk) $ do
+    editLineState $ lineBreakSymbol .= lbrk
+    editLineLiftGapBuffer $ case lbrk of
+      NoLineBreak -> do
+        count <- modCount After id
+        unless (count == 0) $ deleteFromEnd (-1)
+      _ -> case oldLbrk of
+        NoLineBreak -> insertElemAtEnd After '\n'
+        _ -> pure () -- there is a '\n' symbol at the end already
+
+-- | Pop a 'TextLine' from before or after the cursor. This function does not effect the content of
+-- the 'bufferLineEditor'. If you 'popLine' from 'Before' the cursor when the 'bufferLineEditor' is
+-- at the beginning of the buffer, or if you 'popLine' from 'After' the cursor when the
+-- 'bufferLineEditor' is at the end of the buffer, this function evaluates to an 'EndOfLineBuffer'
+-- exception.
+popLine :: (PrimMonad m, st ~ PrimState m) => RelativeToCursor -> EditText tags m (TextLine tags)
+popLine = editTextLiftGapBuffer . popElem
+
+-- | Push a 'TextLine' before or after the cursor without modifying the content of the 'LineEditor'.
+pushLine
+  :: (PrimMonad m, st ~ PrimState m)
+  => RelativeToCursor -> TextLine tags -> EditText tags m ()
+pushLine rel = editTextLiftGapBuffer . pushElem rel
 
 -- TODO: uncomment this, rewrite it
 --
@@ -1751,22 +2029,39 @@ getUnitCount = lineEditorUnitCount <$> editTextState (use bufferLineEditor)
 
 ----------------------------------------------------------------------------------------------------
 
--- | Push a 'TextLine' before or after the cursor. This function does not effect the content of the
--- 'bufferLineEditor'.
-pushLine
-  :: (PrimMonad m, st ~ PrimState m)
-  => RelativeToCursor -> TextLine tags -> EditText tags m ()
-pushLine rel = editTextLiftGapBuffer . pushElem rel
-
--- | Pop a 'TextLine' from before or after the cursor. This function does not effect the content of
--- the 'bufferLineEditor'. If you 'popLine' from 'Before' the cursor when the 'bufferLineEditor' is
--- at the beginning of the buffer, or if you 'popLine' from 'After' the cursor when the
--- 'bufferLineEditor' is at the end of the buffer, this function evaluates to an 'EndOfLineBuffer'
--- exception.
-popLine :: (PrimMonad m, st ~ PrimState m) => RelativeToCursor -> EditText tags m (TextLine tags)
-popLine = editTextLiftGapBuffer . popElem
-
-----------------------------------------------------------------------------------------------------
+-- | Insert a 'TextLine' into the current 'LineEditor'. If the 'TextLine' is not terminated with a
+-- line breaking symbol (the 'textLineBreakSymbol' is 'NoLineBreak') the content of the given
+-- 'TextLine' is simply copied to the current 'LineEditor', then the content of the 'TextLine' is
+-- placed 'Before' or 'After' the cursor.
+--
+-- If the 'textLineBreakSymbol' is not 'NoLineBreak', then the 'RelativeToCursor' parameter is
+-- ignored, the content of the 'TextLine' is appended to the content in the 'LineEditor' that exists
+-- before the cursor, then the resultant 'TextLine' is pushed to the 'TextBuffer' before the cursor,
+-- leaving the cursor at the start of the line.
+insertTextLine :: PrimMonad m => RelativeToCursor -> TextLine tags -> EditText tags m ()
+insertTextLine rel = \ case
+  TextLineUndefined -> error $
+    "internal error: evaluated (insertTextLine TextLineUndefined)"
+  line              -> case line ^. textLineBreakSymbol of
+    NoLineBreak       ->
+      editLine $
+      editLineLiftGapBuffer $
+      pushElemVec rel $
+      theTextLineString line
+    lbrk              ->
+      ( editLine $
+        editLineState (use lineEditorTags) >>= \ tags ->
+        editLineLiftGapBuffer $ do
+          pushElemVec Before $ theTextLineString line
+          vec <- withFullSlices $ \ before _after -> safeFreeze before
+          modCount Before $ const 0
+          return TextLine
+            { theTextLineString = vec
+            , theTextLineBreakSymbol = lbrk
+            , theTextLineTags = tags
+            }
+      ) >>=
+      editTextLiftGapBuffer . pushElem Before
 
 -- Not for export: I don't want to encourage the use of a self-reference within an 'EditText'
 -- function. It is already easy enough to cause a deadlock by evaluating 'runEditText' with 'liftIO'
@@ -1780,7 +2075,7 @@ thisTextBuffer = EditText ask
 copyLineEditorText :: (PrimMonad m, st ~ PrimState m) => EditLine tags m (TextLine tags)
 copyLineEditorText = TextLine
   <$> editLineLiftGapBuffer freezeVector
-  <*> editLineState (use cursorBreakSymbol)
+  <*> editLineState (use lineBreakSymbol)
   <*> editLineState (use lineEditorTags)
 
 -- TODO: make this more abstract, make it callable from within any 'CursorIndexedLine' monad.
@@ -1793,7 +2088,7 @@ makeLineWithSlice
   :: PrimMonad m
   => (LineBreakSymbol -> LineBreakSymbol) -> CharVector -> EditLine tags m (TextLine tags)
 makeLineWithSlice onLbrk slice = do
-  lbrk  <- editLineState $ use cursorBreakSymbol
+  lbrk  <- editLineState $ use lineBreakSymbol
   tags  <- editLineState $ use lineEditorTags
   return $ textLineBreakSymbol %~ onLbrk $ TextLine
     { theTextLineString      = slice
@@ -1808,8 +2103,8 @@ copyChars rel = do
   editLineLiftGapBuffer (sliceFromCursor (unwrapRelative rel) >>= safeFreeze) >>=
     makeLineWithSlice (if break then id else const NoLineBreak)
 
--- | Calls 'copyChars' with a @'Relative' 'CharIndex'@ value equal to the number of characters
--- 'Before' or 'After' the cursor on the current line.
+-- | Copy the current line 'Before' or 'After' the cursor into a 'TextLine'. The content of the line
+-- editor is not changed.
 copyCharsToEnd
   :: (PrimMonad m, st ~ PrimState m)
   => RelativeToCursor -> EditLine tags m (TextLine tags)
@@ -1854,13 +2149,22 @@ putLineIndex
 putLineIndex i line = editTextLiftGapBuffer $
   validateIndex i >>= absoluteIndex >>= flip putElemIndex line
 
--- | Replace the content in the 'bufferLineEditor' with the content in the given 'TextLine'. Pass
--- an integer value indicating where the cursor location should be set. This function does not
--- re-allocate the current line editor buffer unless it is too small to hold all of the characters
--- in the given 'TextLine', meaning this function only grows the buffer memory allocation, it never
--- shrinks the memory allocation.
+-- | Replace the content in the 'bufferLineEditor' with the content in the given 'TextLine'. This
+-- function does not re-allocate the current line editor buffer unless it is too small to hold all
+-- of the characters in the given 'TextLine', meaning this function only grows the buffer memory
+-- allocation, it never shrinks the memory allocation.
 refillLineEditor :: PrimMonad m => EditText tags m ()
-refillLineEditor = editTextLiftGapBuffer (getElem Before) >>= refillLineEditorWith
+refillLineEditor =
+  let getCount = flip modCount id in
+  ( 
+    editTextLiftGapBuffer (getCount Before) >>= \ count ->
+    if count >= 0 then editTextLiftGapBuffer $ popElem Before else
+    editTextLiftGapBuffer (getCount After) >>= \ count ->
+    if count >= 0 then editTextLiftGapBuffer $ popElem After else
+    emptyTextLine <$>
+    editLine (editLineState $ use lineEditorTags)
+  ) >>=
+  refillLineEditorWith
 
 -- | Like 'refillLineEditor', but replaces the content in the 'bufferLineEditor' with the content in
 -- a given 'TextLine', rather the content of the current line.
@@ -1881,9 +2185,9 @@ refillLineEditorWith = \ case
 -- | Delete the content of the 'bufferLineEditor' except for the line breaking characters (if any)
 -- at the end of the line. This function does not change the memory allocation for the 'LineEditor',
 -- it simply sets the character count to zero. Tags on this line are not effected.
-clearLineEditor :: (PrimMonad m, st ~ PrimState m) => EditLine tags m ()
-clearLineEditor = do
-  sym <- editLineState $ use cursorBreakSymbol
+clearWholeLine :: (PrimMonad m, st ~ PrimState m) => EditLine tags m ()
+clearWholeLine = do
+  sym <- editLineState $ use lineBreakSymbol
   editLineLiftGapBuffer $ do
     modCount Before $ const 0
     modCount After  $ const $ case sym of { NoLineBreak -> 0; _ -> 1; }
@@ -1892,7 +2196,7 @@ clearLineEditor = do
 liftEditText :: Monad m => EditText tags m a -> EditLine tags m a
 liftEditText = EditLine . lift . lift
 
--- | Like 'clearLineEditor', this function deletes the content of the 'bufferLineEditor', and tags
+-- | Like 'clearWholeLine', this function deletes the content of the 'bufferLineEditor', and tags
 -- on this line are not effected. The difference is that this function replaces the
 -- 'bufferLineEditor' with a new empty line, resetting the line editor buffer to the default
 -- allocation size and allowing the garbage collector to delete the previous allocation. This means
@@ -1903,9 +2207,11 @@ resetLineEditor = editTextState (use $ bufferLineEditor . lineEditorTags) >>=
 
 -- | This function copies the current 'LineEditor' state back to the 'TextBuffer', and sets a flag
 -- indicating that the content of the 'LineEditor' and the content of the current line are identical
--- so as to prevent further copying. Note that this function is called automatically by
--- 'flushRefill'. Ordinarily, you would call 'flushRefill', especially when calling the 'moveByLine'
--- or 'gotoLine' functions, rather of using this function directly.
+-- so as to prevent further copying. It also returns a copy of the 'TextLine' that was pushed to the
+-- 'TextBuffer'. If the 'lineEditorIsClean' flag is 'True', this function does nothing. Note that
+-- this function is called automatically by 'flushRefill'. Ordinarily, you would call 'flushRefill',
+-- especially when calling the 'moveByLine' or 'gotoLine' functions, rather of using this function
+-- directly.
 --
 -- In situations where you would /not/ evaluate 'moveByLine' or 'gotoLine' with the 'flushRefill'
 -- function, you can choose when to copy the content of the 'LineEditor' back to the buffer after
@@ -1913,12 +2219,28 @@ resetLineEditor = editTextState (use $ bufferLineEditor . lineEditorTags) >>=
 -- 'LineEditor', and then move the content back into the 'TextBuffer' at a different location after
 -- changing location. This can also be useful after accumulating the content of several lines of
 -- text into the 'LineEditor'.
-flushLineEditor :: (PrimMonad m, st ~ PrimState m) => EditText tags m (TextLine tags)
+flushLineEditor :: PrimMonad m => EditText tags m (TextLine tags)
 flushLineEditor = do
   clean <- editTextState $ use $ bufferLineEditor . lineEditorIsClean
   if clean then editTextLiftGapBuffer $ getElem Before else do
-    line <- editLine copyLineEditorText
+    let loop = -- pop all lines after this one that don't have a line breaking symbol
+          countLines After >>= \ count ->
+          -- check if we are at the end of the buffer
+          if count <= 0 then editLine copyLineEditorText else do
+            line <- popLine After
+            let lbrk = line ^. textLineBreakSymbol
+            editLine $ do
+              moveByChar maxBound -- cursor over to end of buffer
+              editLineLiftGapBuffer $ pushElemVec Before $ line ^. textLineString
+              editLineState $ lineBreakSymbol .= lbrk
+            if lbrk == NoLineBreak then loop else editLine copyLineEditorText
+    lbrk <- editLine $ editLineState $ use lineBreakSymbol
+     -- check the current line editor for a line break
+    line <- if lbrk == NoLineBreak then loop else editLine copyLineEditorText
     editTextLiftGapBuffer $ putElem Before line
+    editLine $ editLineLiftGapBuffer $ do
+      count <- modCount After id
+      when (count <= 0) $ shiftCursor (-1)
     editTextState $ bufferLineEditor . lineEditorIsClean .= True
     return line
 
@@ -1962,7 +2284,7 @@ currentBuffer = editTextState $ use $ bufferLineEditor . parentTextEditor
 --  => (Absolute CharIndex -> Absolute CharIndex -> Relative CharIndex)
 --  -> EditLine tags m (Absolute CharIndex)
 --modifyColumn f = do
---  lbrksym <- editLineState $ use cursorBreakSymbol
+--  lbrksym <- editLineState $ use lineBreakSymbol
 --  editLineLiftGapBuffer $ do
 --    oldch  <- cursorIndex >>= indexToAbsolute
 --    weight <- countDefined
@@ -1983,55 +2305,35 @@ currentBuffer = editTextState $ use $ bufferLineEditor . parentTextEditor
 -- usually evaluates a cursor motion), but before it does, it evaluate 'flushLineEditor', and after
 -- evaluating 'flushRefill' it evaluates 'refillLineEditor'.
 flushRefill :: PrimMonad m => EditText tags m a -> EditText tags m a
-flushRefill motion = flushLineEditor >> motion <* refillLineEditor
+flushRefill motion =
+  editLine (editLineState $ use lineEditorIsClean) >>= \ clean ->
+  if clean then motion else
+  flushLineEditor >>
+  motion <*
+  refillLineEditor
 
 ----------------------------------------------------------------------------------------------------
 
 -- | Insert a single character. If the 'lineBreakPredicate' function evaluates to 'Prelude.True',
 -- meaning the given character is a line breaking character, this function does nothing. To insert
 -- line breaks, using 'insertString'. Returns the number of characters added to the buffer.
+--
+-- __NOTE__ that this function does not keep track of whether you are inserting line breaks with
+-- multiple characters such as the very common @"\CR\LF"@ character sequence. If you call
+-- 'insertChar' with a @'\CR'@ and then a @'\LF'@ (for example: @'sequence' 'insertChar' "\CR\LF"@)
+-- this will insert a line break ending with @'\CR'@, then it will insert an empty line with @'\LF'@
+-- as a line break. Use the 'insertString' function to properly handle line breaks with multiple
+-- characters.
 insertChar
   :: (PrimMonad m, st ~ PrimState m)
   => RelativeToCursor -> Char
-  -> EditText tags m TextCursorSpan
-insertChar rel c = TextCursorSpan <$> do
+  -> EditText tags m CharCount
+insertChar rel c = CharCount <$> do
   isBreak <- editTextState $ use $ bufferLineBreaker . lineBreakPredicate
   if isBreak c then return 0 else do
     editLine $ editLineLiftGapBuffer $ pushElem rel c
     editTextState $ bufferLineEditor . lineEditorIsClean .= False
     return 1
-
--- | This function only deletes characters on the current line, if the cursor is at the start of the
--- line and you evaluate @'deleteChars' 'Before'@, this function does nothing. The sign of the
--- 'CharIndex' given will determine the direction of travel for the deletion -- negative will delete
--- moving toward the beginning of the line, positive will delete moving toward the end of the
--- line. This function never deletes line breaking characters, even if you delete toward the end of
--- the line. This function returns the number of characters actually deleted as a negative number
--- (or zero), indicating a change in the number of characters in the buffer.
-deleteChars
-  :: (PrimMonad m, st ~ PrimState m)
-  => Relative CharIndex -> EditLine tags m CharStats
-deleteChars req@(Relative (CharIndex curspan0)) = do
-  let curspan = VecLength curspan0
-  let done count = return (count, editLineState $ when (count /= 0) $ lineEditorIsClean .= False)
-  sym <- editLineState $ use cursorBreakSymbol
-  (VecLength count, setUncleanFlag) <- editLineLiftGapBuffer $
-    if      req < 0 then do
-      count <- validateLength curspan
-      modCount Before (+ count) >> done count
-    else if req > 0 then do
-      let adjust n = when (sym == NoLineBreak) $ void $ modCount After (+ n)
-      adjust (-1)
-      count <- validateLength curspan
-      modCount After $ subtract count
-      adjust 1
-      done count
-    else return (0, pure ())
-  setUncleanFlag
-  return CharStats
-    { cursorStepCount = signum req * TextCursorSpan count
-    , deltaCharCount  = Relative $ CharIndex $ negate count
-    }
 
 -- | This function evaluates the 'lineBreaker' function on the given string, and beginning from the
 -- current cursor location, begins inserting all the lines of text produced by the 'lineBreaker'
@@ -2046,13 +2348,15 @@ insertString str = do
   let writeLine (str, lbrk) = do
         strlen <- writeStr (str ++ "\n")
         line   <- editLine $ do
-          editLineState $ cursorBreakSymbol .= lbrk
+          editLineState $ lineBreakSymbol .= lbrk
           copyLineEditorText <* editLineState (charsBeforeCursor .= 0 >> charsAfterCursor .= 0)
         when (lbrk /= NoLineBreak) $ editTextLiftGapBuffer $ pushElem Before line
         editTextState $ bufferLineEditor . lineEditorIsClean .= (lbrk /= NoLineBreak)
         return CharStats
-          { cursorStepCount = strlen + if lbrk == NoLineBreak then 0 else 1
-          , deltaCharCount  = toLength (unwrapTextCursorSpan strlen) + lineBreakSize lbrk
+          { cursorStepCount =
+            toLength (unwrapCharCount strlen) +
+            if lbrk == NoLineBreak then 0 else 1
+          , deltaCharCount = strlen + lineBreakSize lbrk
           }
   let loop count = seq count . \ case
         []        -> return count
@@ -2065,7 +2369,7 @@ lineBreak
   :: (PrimMonad m, st ~ PrimState m)
   => RelativeToCursor -> EditText tags m ()
 lineBreak rel =
-  editTextState (use $ bufferLineBreaker . defaultLineBreak) >>= flip lineBreakWith rel
+  editTextState (use $ bufferLineBreaker . defaultLineBreakSymbol) >>= flip lineBreakWith rel
 
 -- | Breaks the current line editor either 'Before' or 'After' the cursor using the given
 -- 'LineBreakSymbol', creating a new 'TextLine' and pushing it to the 'TextBuffer' either 'Before'
@@ -2076,7 +2380,7 @@ lineBreakWith
   -> EditText tags m ()
 lineBreakWith newlbrk rel = join $ editLine $ do
   tags    <- editLineState $ use lineEditorTags
-  oldlbrk <- editLineState $ use cursorBreakSymbol
+  oldlbrk <- editLineState $ use lineBreakSymbol
   editLineLiftGapBuffer $ case rel of
     Before -> do
       pushElem Before '\n'
@@ -2097,6 +2401,151 @@ lineBreakWith newlbrk rel = join $ editLine $ do
           , theTextLineString      = hi
           , theTextLineBreakSymbol = newlbrk
           }
+
+-- | Delete the given number of characters within the line without traveling past the end of the
+-- line. No error is thrown if the given number of characters is larger than the number of
+-- characters available. The sign of the @'Relative' 'CharIndex'@ argument will determine the
+-- direction of travel for the deletion -- negative will delete moving toward the beginning of the
+-- line, positive will delete moving toward the end of the line. This function only deletes
+-- characters on the current line, if the cursor is at the start of the line and you pass
+-- @'minBound'@ as the second argument, this function does nothing.
+--
+-- The 'Bool' argument instructs 'deleteChars' whether or not to delete the 'lineBreakSymbol' from
+-- this line as well if the @'Relative'@ number of characters requested is a positive 'CharIndex'
+-- value larger than the number of characters available in the current 'LineEditor'.  Passing
+-- 'False' as the 'Bool' argument will never delete the 'LineBreakSymbol' for this line regardless
+-- of the @'Relative' 'CharIndex'@ value given as the second argument. Passing 'True' will delete
+-- the 'lineBreakSymbol'.
+--
+-- __NOTE__ that passing 'True' and remvoing the line breaking symbol from the line editor will
+-- change the behavior that happens when 'flushLineEditor' is used. Unless (before calling
+-- 'flushLineEditor') a new line breaking symbol other than 'NoLineBreak' is set using
+-- 'setLineBreakSymbol', flushing the characters will evaluate @'popLine' 'After'@ and append the
+-- next line to the current line editor before flushing to ensure that a 'TextLine' with a proper
+-- line break symbol is being pushed into the buffer. The only time this does not happen is if the
+-- cursor is at the end of the 'TextBuffer', where it is OK to have exactly one 'TextLine' that does
+-- not have a line break symbol.
+deleteChars
+  :: (PrimMonad m, st ~ PrimState m)
+  => Bool -> Relative CharIndex -> EditLine tags m CharStats
+deleteChars delBreak req@(Relative (CharIndex curspan0)) = do
+  let curspan = VecLength $ abs curspan0
+  lbrk <- editLineState $ use lineBreakSymbol
+  let noChange = pure (0, 0, False, lbrk)
+  (VecLength steps, VecLength chars, changed, lbrk) <- editLineLiftGapBuffer $
+    if req < 0 then -- deleting before the cursor
+      modCount Before id >>= \ count ->
+      if count <= 0 then noChange else do
+        let actual = negate $ min curspan count
+        modCount Before (+ actual)
+        return (actual, actual, True, lbrk)
+    else if req > 0 then -- deleting after the cursror
+      modCount After id >>= \ count ->
+      if count <= 0 then noChange else
+      if curspan < count || lbrk == NoLineBreak then do -- no need to worry about line break
+        after <- modCount After $ subtract $ min curspan count
+        let actual = after - count 
+        return (actual, actual, True, lbrk)
+      else do -- do need to worry about line break
+        after <- modCount After $ const $ if delBreak then 0 else 1
+        let actual = after - count
+        return $ if delBreak then (actual, actual, True, lbrk) else 
+          (actual, actual - lineBreakSize lbrk, True, NoLineBreak)
+    else noChange
+  editLineState $ do
+    when changed $ lineEditorIsClean .= False
+    lineBreakSymbol .= lbrk
+  return CharStats
+    { cursorStepCount = Relative $ CharIndex steps
+    , deltaCharCount  = CharCount chars
+    }
+
+-- | This function deletes the given number of characters starting from the cursor and returns the
+-- exact number of characters deleted, and if the number of characters to be deleted exceeds the
+-- number of characters in the current line, characters are deleted from adjacent lines such that
+-- the travel of deletion wraps to the end of the prior line or the beginning of the next line,
+-- depending on the direction of travel. The direction of travel is determined by the sign of the
+-- 'CharIndex' -- negative to delete moving toward the beginning, positive to delete moving toward
+-- the end. The number of actual characters deleted is always positive.
+--
+-- __WARNING__: this function will __NOT__ call 'flushLineEditor', because we cannot assume that
+-- committing the 'LineEditor' changes immediately is necessary or desireable, there may be more
+-- edits to be done to the line after the deletion.
+deleteCharsWrap
+  :: forall m tags
+   . ( PrimMonad m
+     , Show tags --DEBUG
+     )
+  => Relative CharIndex -> EditText tags m CharStats
+  -- TODO: rewrite this to make use of the new pushLine/popLine behavior, it can be made much, much
+  -- more elegant.
+deleteCharsWrap request0 =
+  if request0 == 0 then return mempty else
+  let request = abs request0 in
+  let (direction, sign) = if request < 0 then (Before, negate) else (After, id) in
+  flushRefill (pure ()) >>
+  editLine (deleteChars True request) >>= \ st ->
+  if abs (cursorStepCount st) >= request then return st else
+  rewriteLines direction (pure st, st)
+  (\ halt line ->
+    gets snd >>= \ st0 ->
+    if abs (cursorStepCount st0) >= request then halt else
+    let st = st0 <> opposite (textLineStats line) in
+    let count = abs $ cursorStepCount st in
+    if count > request then
+      put (mappend st0 <$> editLine (deleteChars True $ sign $ request - count), st0) >>
+      halt
+    else
+      put (pure st, st)
+  ) >>=
+  fst
+
+---- TODO: uncomment this, write functions that actually make use of it.
+----
+---- Not for export, because this function does not return a proper accounting of the characters it
+---- deletes, it is expected that 'CharStats' accounting will be done by the functions which call this
+---- one.
+----
+---- This function overwites all text before or after the cursor with a 'TextLine'. If 'Before', the
+---- line breaking characters from the given 'TextLine' are ignored, if 'After', the line breaking
+---- characters for the current line are overwritten with the line breaking characters of the given
+---- 'TextLine'. Pass a function of two arguments which combines the tags from (1) the current line
+---- editor and (2) the given 'TextLine'.
+--overwriteAtCursor
+--  :: forall m st tags . (MonadIO m, PrimMonad m, st ~ PrimState m)
+--  => RelativeToCursor
+--  -> (tags -> tags -> tags)
+--  -> TextLine tags
+--  -> EditLine tags m ()
+--overwriteAtCursor rel concatTags line = case line of
+--  TextLineUndefined ->
+--    error $ "overwriteAtCursor "++show rel++": received undefined TextLine"
+--  TextLine
+--   { theTextLineString      = line
+--   , theTextLineBreakSymbol = lbrk
+--   , theTextLineTags        = tagsB
+--   } -> do
+--    editLineLiftGapBuffer $ do
+--      modCount rel $ const 0 -- this "deletes" the chars Before/After the cursor
+--      count <- countDefined
+--      alloc <- getAllocSize
+--      let linelen  = VecLength $ UVec.length line
+--      let adjusted = linelen - case rel of { Before -> lineBreakSize lbrk; After -> 0; }
+--      let diffsize = adjusted + count - alloc
+--      when (diffsize > 0) $ growVector diffsize -- resize line editor buffer
+--      buf   <- use gapBufferVector
+--      alloc <- getAllocSize -- new (resized) allocation value
+--      lift $ case rel of
+--        Before -> UVec.copy
+--          (UMVec.slice 0 (fromLength adjusted) buf)
+--          (UVec.slice 0 (fromLength adjusted) line)
+--        After  -> UVec.copy
+--          (UMVec.slice (fromLength $ alloc - adjusted) (fromLength adjusted) buf)
+--          line
+--    EditLine $ do
+--      lineBreakSymbol .= lbrk
+--      lineEditorIsClean .= False
+--      lineEditorTags %= (`concatTags` tagsB)
 
 ----------------------------------------------------------------------------------------------------
 
@@ -2123,6 +2572,8 @@ instance Show TextLocation where
                    else show i
              in  "TextLocation "++sh line++' ':sh char
 
+instance Semigroup TextLocation where { (<>) = sumTextLocation; }
+
 -- | Compute the difference between two 'TextLocations', works just like vector arithmetic.
 diffTextLocation :: TextLocation -> TextLocation -> TextLocation
 diffTextLocation a b = TextLocation
@@ -2130,23 +2581,30 @@ diffTextLocation a b = TextLocation
   , theLocationCharIndex = theLocationCharIndex a - theLocationCharIndex b
   }
 
+-- | Vector sum of two 'TextLocation' values, works just like vector arithmetic.
 sumTextLocation :: TextLocation -> TextLocation -> TextLocation
 sumTextLocation a b = TextLocation
   { theLocationLineIndex = theLocationLineIndex a + theLocationLineIndex b
   , theLocationCharIndex = theLocationCharIndex a + theLocationCharIndex b
   }
 
+-- | Construct a @'Relative' 'LineIndex'@ given a 'Before' of 'After' value and an integer number of
+-- lines.
 relativeLine :: RelativeToCursor -> Int -> Relative LineIndex
 relativeChar :: RelativeToCursor -> Int -> Relative CharIndex
 (relativeLine, relativeChar) = (f LineIndex, f CharIndex) where
   f constr = ((Relative . constr) .) . \ case { Before -> negate; After -> id; }
 
+-- | Obtain the @'Absolute' 'LineIndex'@ from a 'TextLocation' value.
 lineIndex :: Lens' TextLocation (Absolute LineIndex)
 lineIndex = lens theLocationLineIndex $ \ a b -> a{ theLocationLineIndex = b }
 
+-- | Obtain the @'Absolute' 'CharIndex'@ from a 'TextLocation' value.
 charIndex :: Lens' TextLocation (Absolute CharIndex)
 charIndex = lens theLocationCharIndex $ \ a b -> a{ theLocationCharIndex = b }
 
+-- | A class of vales that can produce an 'Absolute' index from a 'Relative' index within the
+-- context of an @editor@ with a cursor.
 class RelativeToAbsoluteCursor index editor | editor -> index where
   -- | Convert a 'Relative' index (either a 'LineIndex' or 'CharIndex') to an 'Absolute' index.
   relativeToAbsolute :: Relative index -> editor (Absolute index)
@@ -2473,6 +2931,9 @@ class Monad editor => CursorIndexedText editor where
   -- 'gotoLine' has moved the cursor.
   goNearLine :: Absolute LineIndex -> editor (Absolute LineIndex)
 
+  -- | Returns the number of lines there are 'Before' or 'After' the cursor.
+  countLines :: RelativeToCursor -> editor (Relative LineIndex)
+
 instance PrimMonad m => CursorIndexedText (EditText tags m) where
   getLineNumber = editTextLiftGapBuffer $ writingIndex Before >>= indexToAbsolute
   getLineAt     = editTextLiftGapBuffer . (validateIndex >=> absoluteIndex >=> getElemIndex)
@@ -2480,6 +2941,7 @@ instance PrimMonad m => CursorIndexedText (EditText tags m) where
   moveByLine    = editTextLiftGapBuffer . moveCursorBy
   gotoLine      = editTextLiftGapBuffer . moveCursorTo
   goNearLine    = editTextLiftGapBuffer . moveCursorNear
+  countLines    = editTextLiftGapBuffer . fmap (toLength . fromLength) . flip modCount id
 
 instance Monad m => CursorIndexedText (ViewText tags m) where
   getLineNumber = viewTextLiftIIBuffer $ writingIndex Before >>= indexToAbsolute
@@ -2488,6 +2950,7 @@ instance Monad m => CursorIndexedText (ViewText tags m) where
   moveByLine    = viewTextLiftIIBuffer . moveCursorBy
   gotoLine      = viewTextLiftIIBuffer . moveCursorTo
   goNearLine    = viewTextLiftIIBuffer . moveCursorNear
+  countLines    = viewTextLiftIIBuffer . fmap (toLength . fromLength) . flip modCount id
 
 ----------------------------------------------------------------------------------------------------
 
@@ -2529,13 +2992,17 @@ class Monad editor => CursorIndexedLine editor where
   -- This function __DOES NOT__ evaluate 'flushLineEditor' or 'refillLineEditor'.
   goNearChar :: Absolute CharIndex -> editor (Absolute CharIndex)
 
+  -- | Returns the number of chars there are 'Before' or 'After' the cursor.
+  countChars :: RelativeToCursor -> editor (Relative CharIndex)
+
 instance PrimMonad m => CursorIndexedLine (EditLine tags m) where
   getColumnNumber    = editLineLiftGapBuffer $ writingIndex Before >>= indexToAbsolute
-  getLineBreakSymbol = editLineState (use cursorBreakSymbol)
+  getLineBreakSymbol = editLineState (use lineBreakSymbol)
   getLineAllocation  = editLineLiftGapBuffer getAllocSize
   moveByChar         = editLineLiftGapBuffer . moveCursorBy
   gotoChar           = editLineLiftGapBuffer . moveCursorTo
   goNearChar         = editLineLiftGapBuffer . moveCursorNear
+  countChars         = editLineLiftGapBuffer . fmap (toLength . fromLength) . flip modCount id
 
 instance PrimMonad m => CursorIndexedLine (EditText tags m) where
   getColumnNumber    = editLine getColumnNumber
@@ -2544,6 +3011,7 @@ instance PrimMonad m => CursorIndexedLine (EditText tags m) where
   moveByChar         = editLine . moveByChar
   gotoChar           = editLine . gotoChar
   goNearChar         = editLine . goNearChar
+  countChars         = editLine . countChars
 
 instance Monad m => CursorIndexedLine (ViewLine tags m) where
   getColumnNumber    = viewLineLiftIIBuffer $ writingIndex Before >>= indexToAbsolute
@@ -2552,6 +3020,7 @@ instance Monad m => CursorIndexedLine (ViewLine tags m) where
   moveByChar         = viewLineLiftIIBuffer . moveCursorBy
   gotoChar           = viewLineLiftIIBuffer . moveCursorTo
   goNearChar         = viewLineLiftIIBuffer . moveCursorNear
+  countChars         = viewLineLiftIIBuffer . fmap (toLength . fromLength) . flip modCount id
 
 instance Monad m => CursorIndexedLine (ViewText tags m) where
   getColumnNumber    = viewLine getColumnNumber
@@ -2560,6 +3029,7 @@ instance Monad m => CursorIndexedLine (ViewText tags m) where
   moveByChar         = viewLine . moveByChar
   gotoChar           = viewLine . gotoChar
   goNearChar         = viewLine . viewLineLiftIIBuffer . moveCursorNear
+  countChars         = viewLine . countChars
 
 getLineBreakSize :: CursorIndexedLine editor => editor VecLength
 getLineBreakSize = lineBreakSize <$> getLineBreakSymbol
@@ -2638,6 +3108,164 @@ saveCursorEval :: CursorIndexedBuffer editor => editor a -> editor a
 saveCursorEval f = do
   (cur, a) <- (,) <$> getLocation <*> f
   goNearLocation cur >> return a
+
+-- | Compute the @'Relative' 'CharIndex'@ between two 'TextLocation's. The @'Relative' 'CharIndex'@
+-- is the number of steps the text cursor must take to get from point @a@ to point @b@. For the most
+-- part, this is equal to the number of characters that exist between point @a@ and point @b@,
+-- except when line break characters consist of two characters (like the @'\\r\\n'@ combination)
+-- and, only in this case, two characters are treated as one cursor step.
+--
+-- This function __DOES_NOT__ evlauate 'flushLineEditor', so you may get a results you are not
+-- expecting if the text between the two given 'TextLocation's contains the line currently being
+-- edited by the 'LineEditor'. If you want to make sure text in the 'LineEditor' is properly
+-- accounted for in the result of this function, be sure to evaluate 'flushLineEditor' before
+-- evaluating this function.
+distanceBetween
+  :: (PrimMonad m
+     , Show tags --DEBUG
+     )
+  => TextLocation -> TextLocation -> EditText tags m (Relative CharIndex)
+distanceBetween a0 b0 = do
+  (a, lineA) <- validateLocation a0
+  (b, lineB) <- validateLocation b0
+  let forward = a <= b
+  let ci = theLocationCharIndex
+  let li = theLocationLineIndex
+  let (liA, liB) = (li a, li b)
+  let (sp, tcs) = (cursorStepCount . textLineStats, Relative . CharIndex)
+  let edge line a b = sp line - tcs (fromIndex $ ci a) + tcs (fromIndex $ ci b)
+  let edgeSize = if forward then edge lineA a b else edge lineB b a
+  let (nextA, prevB) = if forward then (liA + 1, liB - 1) else (liA - 1, liB + 1)
+  (if forward then id else negate) <$>
+    if liA == liB then return $ tcs $ fromIndex (ci b) - fromIndex (ci a)
+    else if nextA == liB || prevB == liA then return edgeSize
+    else foldLinesBetween nextA prevB edgeSize (\ _halt _i -> modify . (+) . sp)
+
+-- | Compute the 'TextLocation' where the cursor would end up if you were to count a given number of
+-- cursor steps (a value given by @'Relative' 'CharIndex'@) from an initial 'TextLocation'. Also
+-- returns the number of characters that were actually spanned, which may be less than the requested
+-- number.
+--
+-- This function __DOES_NOT__ evlauate 'flushLineEditor', so you may get a results you are not
+-- expecting if the text between the two given 'TextLocation's contains the line currently being
+-- edited by the 'LineEditor'. If you want to make sure text in the 'LineEditor' is properly
+-- accounted for in the result of this function, be sure to evaluate 'flushLineEditor' before
+-- evaluating this function.
+spanDistance
+  :: (PrimMonad m
+     , Show tags --DEBUG
+     )
+  => TextLocation -> Relative CharIndex -> EditText tags m (TextLocation, Relative CharIndex)
+spanDistance a dist = do
+  let absDist = abs dist
+  let forward = dist >= 0
+  let constr size ln ch = flip (,) size $ TextLocation
+        { theLocationLineIndex = ln
+        , theLocationCharIndex = ch
+        }
+  let foldTo = if forward then maxBound else minBound
+  foldLinesInRange (theLocationLineIndex a) foldTo (a, 0) $ \ halt i line -> do
+    let lineSize = cursorStepCount $ textLineStats line
+    oldCount <- gets snd
+    let newCount = oldCount + lineSize
+    let update = put $ constr newCount (if forward then i + 1 else i) 1
+    if newCount == absDist then update >> halt
+    else if newCount > absDist then do
+      put $ constr absDist i $ toIndex $ fromLength $
+        if forward then absDist - oldCount else newCount - absDist
+      halt
+    else update
+
+-- | Like 'moveByChar' but will wrap up to the previous line and continue moving on the
+-- previous/next line if the value is large enough to move the cursor past the start\/end of the
+-- line.
+moveByCharWrap
+  :: (PrimMonad m
+     , Show tags --DEBUG
+     )
+  => Relative CharIndex -> EditText tags m TextLocation
+moveByCharWrap dist = getLocation >>= flip spanDistance dist >>= gotoLocation . fst
+
+----------------------------------------------------------------------------------------------------
+
+-- | Functions of this type operate on a single 'TextLine', and can perform a fold over characters
+-- in the line. This function type is polymorphic over 4 type variables
+--
+-- * @a@ is the monadic return type
+--
+-- * @tags@ is the @tags@ type of the 'TextBuffer' you are working on
+--
+-- * @fold@ is a value of your choosing that accumulates information, you can modify this value
+--          using the 'Control.Monad.State.get' and 'Control.Monad.State.put' functions.
+--
+-- * @r@ the continuation return type (from a lifted continuation monad within 'FoldMapChars').
+--       This simply means you can evaluate the 'Control.Monad.Cont.callCC' function to produce a
+--       breaking function. Then within the folding/mapping function you may evaluate the breaking
+--       function to halt and return from the fold or map operation immediately. The only
+--       restriction on the type @r@ is that when you evaluate 'runFoldMapChars', @r@ must be the
+--       same as the type @a@ of the function that was called with 'runFoldMapLines' function.
+newtype FoldMapChars r fold tags m a
+  = FoldMapChars
+    { unwrapFoldMapChars :: ContT r (ExceptT TextEditError (StateT fold (EditLine tags m))) a
+    }
+  deriving (Functor, Applicative, Monad, MonadIO)
+
+instance Monad m => MonadState fold (FoldMapChars r fold tags m) where
+  state = FoldMapChars . lift . state
+
+instance Monad m => MonadError TextEditError (FoldMapChars r fold tags m) where
+  throwError = FoldMapChars . lift . throwError
+  catchError (FoldMapChars try) catch = FoldMapChars $ ContT $ \ next ->
+    catchError (runContT try next) $ flip runContT next . unwrapFoldMapChars . catch
+
+instance Monad m => MonadCont (FoldMapChars r fold tags m) where
+  callCC f = FoldMapChars $ callCC $ unwrapFoldMapChars . f . (FoldMapChars .)
+
+-- | Convert a 'FoldMapChars' into an 'FoldMapLine' function. This function is analogous to the
+-- 'runStateT' function.
+runFoldMapChars
+  :: Monad m
+  => FoldMapChars a fold tags m a -> fold -> EditLine tags m (a, fold)
+runFoldMapChars (FoldMapChars f) = runStateT (runExceptT $ runContT f return) >=> \ case
+  (Left err, _   ) -> throwError err
+  (Right  a, fold) -> return (a, fold)
+
+-- | Like 'runFoldMapChars' but only returns the @fold@ result. This function is analogous to the
+-- 'execStateT' function.
+execFoldMapChars
+  :: Monad m
+  => FoldMapChars fold fold tags m a -> fold -> EditLine tags m fold
+execFoldMapChars (FoldMapChars f) = runStateT (runExceptT $ runContT f $ const get) >=> \ case
+  (Left err, _   ) -> throwError err
+  (Right  _, fold) -> return fold
+
+-- | Like 'runFoldMapChars' but ignores the @fold@ result. This function is analogous to the
+-- 'evalStateT' function.
+evalFoldMapChars
+  :: Monad m
+  => FoldMapChars a fold tags m a -> fold -> EditLine tags m a
+evalFoldMapChars = fmap (fmap fst) . runFoldMapChars
+
+-- | Evaluate a 'FoldMapChars' function within a 'FoldMapLines' function, using the same @fold@
+-- value from the 'FodlMapLines' state as the @fold@ value seen from within the 'FoldMapChars'
+-- state. It is usually not necessary to invoke this function directly, the definition of
+-- 'liftEditLine' for the 'FoldMapLines' function type is this function, so any function that
+-- evaluates to an @editor@ where the @editor@ is a member of the 'MonadEditLine' typeclass will
+-- automatically invoke this function based on the function type of the context in which it is used.
+foldMapChars
+  :: (PrimMonad m
+     , Show tags
+     ) => FoldMapChars a fold tags m a -> FoldMapLines r fold tags m a
+foldMapChars f = get >>= foldMapLiftEditText . editLine . runFoldMapChars f >>= state . const
+
+----------------------------------------------------------------------------------------------------
+
+-- | A type synonym for a 'FoldMapLines' function in which the folded type is the unit @()@ value.
+type MapChars r = FoldMapChars r ()
+
+-- | Evaluate a 'MapChars' using 'evalFoldMapChars'.
+runMapChars :: Monad m => MapChars a tags m a -> EditLine tags m a
+runMapChars = flip evalFoldMapChars ()
 
 ----------------------------------------------------------------------------------------------------
 
@@ -2824,3 +3452,78 @@ streamCommitTags
   :: (PrimMonad m, st ~ PrimState m)
   => StreamCursor tags -> EditText tags m ()
 streamCommitTags s = putLineIndex (s ^. streamLocation . lineIndex) (s ^. streamCache)
+
+----------------------------------------------------------------------------------------------------
+
+--ralign :: Int -> String
+--ralign n = case abs n of
+--  i | i < 10 -> "      " ++ show i
+--  i | i < 100 -> "     " ++ show i
+--  i | i < 1000 -> "    " ++ show i
+--  i | i < 10000 -> "   " ++ show i
+--  i | i < 100000 -> "  " ++ show i
+--  i | i < 1000000 -> " " ++ show i
+--  i                ->       show i
+
+---- | Print debugger information about the structured data that forms the 'TextFrame' to standard
+---- output. __WARNING:__ this print's every line of text in the view, so if your text view has
+---- thousands of lines of text, there will be a lot of output.
+--debugPrintView :: MonadIO m => (tags -> String) -> (String -> IO ()) -> TextFrame tags -> m ()
+--debugPrintView showTags output view = do
+--  (_, errCount) <- forLinesInView view (1 :: Int, 0 :: Int) $ \ _halt line -> do
+--    lineNum <- state $ \ (lineNum, errCount) ->
+--      (lineNum, (lineNum + 1, errCount + if textLineIsUndefined line then 1 else 0))
+--    liftIO $ output $ ralign lineNum ++ ": " ++ showTextLine showTags line
+--  liftIO $ output ""
+--  when (errCount > 0) $ error $ "iterated over "++show errCount++" undefined lines"
+
+---- | Print debugger information about the structured data that forms the 'TextBuffer' to standard
+---- output. __WARNING:__ this print's every line of text in the buffer, so if your text buffer has
+---- thousands of lines of text, there will be a lot of output.
+--debugPrintBuffer
+--  :: MonadIO m
+--  => (tags -> String) -> (String -> IO ()) -> EditText tags m ()
+--debugPrintBuffer showTags output = do
+--  lineVec <- use bufferVector
+--  let len = MVec.length lineVec
+--  let printLines nullCount i = if i >= len then return () else do
+--        line <- liftIO $
+--          asrtMRead UnsafeOp "debugPrintBuffer" ("lineVec", lineVec) (asrtShow "i" i)
+--        let showLine = output $ ralign i ++ ": " ++ showTextLine showTags line
+--        if textLineIsUndefined line
+--          then do
+--            liftIO $ if nullCount < (1 :: Int) then showLine else
+--              when (nullCount < 4) $ putStrLn "...."
+--            (printLines $! nullCount + 1) $! i + 1
+--          else liftIO showLine >> (printLines 0 $! i + 1)
+--  printLines 0 0
+--  above   <- use linesAboveCursor
+--  below   <- use linesBelowCursor
+--  liftIO $ do
+--    output $ "   linesAboveCursor: " ++ show above
+--    output $ "   linesBelowCursor: " ++ show below
+--    output $ "    bufferLineCount: " ++ show (above + below)
+
+---- | The 'bufferLineEditor', which is a 'LineEditor' is a separate data structure contained within
+---- the 'TextBuffer', and it is often not necessary to know this information when debugging, so you
+---- can print debugging information about the 'LineEditor' by evaluating this function whenever it is
+---- necessary.
+--debugPrintCursor
+--  :: MonadIO m
+--  => (tags -> String) -> (String -> IO ()) -> EditText tags m ()
+--debugPrintCursor showTags output = do
+--  cur <- use bufferLineEditor
+--  let charVec    = theLineEditBuffer cur
+--  let charVecLen = UMVec.length charVec
+--  let before     = cur ^. charsBeforeCursor
+--  let after      = cur ^. charsAfterCursor
+--  liftIO $ do
+--    str <- forM [0 .. charVecLen - 1] $
+--      asrtMRead UnsafeOp "debugPrintCursor" ("charVec", charVec) . (,) "i"
+--    output $ "     bufferLineEditor: " ++ show str
+--    output $ "       lineEditorTags: " ++ showTags (cur ^. lineEditorTags)
+--    output $ " __cursorVectorLength: " ++ show charVecLen
+--    output $ "    charsBeforeCursor: " ++ show before
+--    output $ "     charsAfterCursor: " ++ show after
+--    output $ "      cursorInputSize: " ++ show (before + after)
+--    output $ "  cursorLineBreakSize: " ++ show (theCursorBreakSize cur)
